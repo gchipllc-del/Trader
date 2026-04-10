@@ -240,6 +240,14 @@ def run_monitoring_check(client: AlpacaClient) -> dict:
         summary["cash"] = account["cash"]
         summary["positions_checked"] = len(open_positions)
 
+        # Batch-fetch current option prices for early close checks
+        option_prices = {}
+        try:
+            from lib.data_pipeline import fetch_option_prices_for_positions
+            option_prices = fetch_option_prices_for_positions(client, open_positions)
+        except Exception as e:
+            log_event("monitor", "option_price_fetch_failed", {"error": str(e)})
+
         for pos in open_positions:
             ticker = pos.get("ticker", "")
 
@@ -270,9 +278,17 @@ def run_monitoring_check(client: AlpacaClient) -> dict:
                           f"Cost basis: ${pos['cost_basis']:.2f}")
                 continue
 
-            # Check early close (option price needed — placeholder)
-            # In production, fetch current option price from chain
-            # early = check_early_close(pos, current_option_price)
+            # Check early close using live option prices
+            if option_prices and ticker in option_prices:
+                early = check_early_close(pos, option_prices[ticker])
+                if early:
+                    summary["actions"].append(early)
+                    summary["alerts"].append(
+                        f"💰 {ticker}: {early['reason']}"
+                    )
+                    diary_write("strategy_agent",
+                        f"{ticker}|EARLY_CLOSE_CANDIDATE|"
+                        f"profit_{early['profit_pct']:.0%}|{early['dte']}DTE")
 
             # Check roll candidate (stock price needed)
             stock_price = None

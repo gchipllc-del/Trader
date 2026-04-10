@@ -84,6 +84,8 @@ class AlpacaClient:
 
         self._api = None
         self._trading_client = None
+        self._stock_data_client = None
+        self._option_data_client = None
 
         log_event("startup", "alpaca_client_init", {
             "base_url": self.base_url,
@@ -103,6 +105,210 @@ class AlpacaClient:
                     "Install alpaca-py: pip install alpaca-py"
                 )
         return self._trading_client
+
+    def _get_stock_data_client(self):
+        """Lazy-load the Alpaca stock historical data client."""
+        if self._stock_data_client is None:
+            from alpaca.data.historical import StockHistoricalDataClient
+            self._stock_data_client = StockHistoricalDataClient(
+                self.api_key, self.secret_key
+            )
+        return self._stock_data_client
+
+    def _get_option_data_client(self):
+        """Lazy-load the Alpaca option historical data client."""
+        if self._option_data_client is None:
+            from alpaca.data.historical import OptionHistoricalDataClient
+            self._option_data_client = OptionHistoricalDataClient(
+                self.api_key, self.secret_key
+            )
+        return self._option_data_client
+
+    def get_bars(
+        self,
+        tickers: list[str],
+        timeframe: str = "1Day",
+        limit: int = 252,
+    ) -> dict[str, "pd.DataFrame"]:
+        """
+        Fetch historical OHLCV bars for multiple tickers in one call.
+
+        Args:
+            tickers: List of stock symbols
+            timeframe: "1Day" or "1Week"
+            limit: Number of bars per ticker
+
+        Returns:
+            {ticker: DataFrame with open, high, low, close, volume}
+        """
+        import pandas as pd
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+
+        self.limiter.wait_if_needed()
+        client = self._get_stock_data_client()
+
+        tf_map = {"1Day": TimeFrame.Day, "1Week": TimeFrame.Week}
+        tf = tf_map.get(timeframe, TimeFrame.Day)
+
+        start = datetime.now(timezone.utc) - __import__("datetime").timedelta(days=400)
+
+        request = StockBarsRequest(
+            symbol_or_symbols=tickers,
+            timeframe=tf,
+            start=start,
+            limit=limit,
+        )
+
+        bars = client.get_stock_bars(request)
+
+        result = {}
+        for ticker in tickers:
+            ticker_bars = bars[ticker] if ticker in bars else []
+            if not ticker_bars:
+                continue
+            rows = []
+            for b in ticker_bars:
+                rows.append({
+                    "open": float(b.open),
+                    "high": float(b.high),
+                    "low": float(b.low),
+                    "close": float(b.close),
+                    "volume": int(b.volume),
+                    "timestamp": b.timestamp,
+                })
+            df = pd.DataFrame(rows)
+            df.index = pd.to_datetime(df["timestamp"])
+            df = df.drop(columns=["timestamp"])
+            result[ticker] = df
+
+        log_event("data", "bars_fetched", {
+            "tickers": tickers,
+            "timeframe": timeframe,
+            "bars_per_ticker": {t: len(result.get(t, [])) for t in tickers},
+        })
+
+        return result
+
+    def get_option_contracts(
+        self,
+        ticker: str,
+        expiration_gte: str,
+        expiration_lte: str,
+        option_type: str | None = None,
+        strike_price_gte: float | None = None,
+        strike_price_lte: float | None = None,
+    ) -> list[dict]:
+        """
+        Fetch available option contracts for a ticker.
+
+        Returns list of contract dicts with symbol, strike, expiration, type, etc.
+        """
+        self.limiter.wait_if_needed()
+        client = self._get_trading_client()
+
+        from alpaca.trading.requests import GetOptionContractsRequest
+
+        params = {
+            "underlying_symbols": [ticker],
+            "expiration_date_gte": expiration_gte,
+            "expiration_date_lte": expiration_lte,
+            "status": "active",
+        }
+        if option_type:
+            params["type"] = option_type
+        if strike_price_gte is not None:
+            params["strike_price_gte"] = str(strike_price_gte)
+        if strike_price_lte is not None:
+            params["strike_price_lte"] = str(strike_price_lte)
+
+        request = GetOptionContractsRequest(**params)
+        response = client.get_option_contracts(request)
+
+        contracts = []
+        for c in (response.option_contracts or []):
+            contracts.append({
+                "symbol": c.symbol,
+                "underlying": ticker,
+                "strike": float(c.strike_price),
+                "expiration": str(c.expiration_date),
+                "option_type": str(c.type).split(".")[-1].lower(),
+                "open_interest": int(c.open_interest) if c.open_interest else 0,
+                "status": str(c.status),
+            })
+
+        return contracts
+
+    def get_option_quotes(self, option_symbols: list[str]) -> dict[str, dict]:
+        """
+        Fetch latest quotes (bid/ask) for option symbols.
+
+        Args:
+            option_symbols: List of OCC option symbols
+
+        Returns:
+            {symbol: {"bid", "ask", "bid_size", "ask_size"}}
+        """
+        if not option_symbols:
+            return {}
+
+        from alpaca.data.requests import OptionLatestQuoteRequest
+
+        self.limiter.wait_if_needed()
+        client = self._get_option_data_client()
+
+        request = OptionLatestQuoteRequest(symbol_or_symbols=option_symbols)
+        quotes = client.get_option_latest_quote(request)
+
+        result = {}
+        for sym, q in quotes.items():
+            result[sym] = {
+                "bid": float(q.bid_price) if q.bid_price else 0,
+                "ask": float(q.ask_price) if q.ask_price else 0,
+                "bid_size": int(q.bid_size) if q.bid_size else 0,
+                "ask_size": int(q.ask_size) if q.ask_size else 0,
+            }
+
+        return result
+
+    def get_option_snapshots(self, option_symbols: list[str]) -> dict[str, dict]:
+        """
+        Fetch snapshots (quote + greeks) for option symbols.
+
+        Returns:
+            {symbol: {"bid", "ask", "delta", "gamma", "theta", "vega", "implied_volatility"}}
+        """
+        if not option_symbols:
+            return {}
+
+        from alpaca.data.requests import OptionSnapshotRequest
+
+        self.limiter.wait_if_needed()
+        client = self._get_option_data_client()
+
+        request = OptionSnapshotRequest(symbol_or_symbols=option_symbols)
+        snapshots = client.get_option_snapshot(request)
+
+        result = {}
+        for sym, snap in snapshots.items():
+            entry = {
+                "bid": 0, "ask": 0,
+                "delta": 0, "gamma": 0, "theta": 0, "vega": 0,
+                "implied_volatility": 0,
+            }
+            if snap.latest_quote:
+                entry["bid"] = float(snap.latest_quote.bid_price or 0)
+                entry["ask"] = float(snap.latest_quote.ask_price or 0)
+            if snap.greeks:
+                entry["delta"] = float(snap.greeks.delta or 0)
+                entry["gamma"] = float(snap.greeks.gamma or 0)
+                entry["theta"] = float(snap.greeks.theta or 0)
+                entry["vega"] = float(snap.greeks.vega or 0)
+            if snap.implied_volatility is not None:
+                entry["implied_volatility"] = float(snap.implied_volatility)
+            result[sym] = entry
+
+        return result
 
     def get_account(self) -> dict:
         """Get account info (cash, portfolio value, buying power)."""

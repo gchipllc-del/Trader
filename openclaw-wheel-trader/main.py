@@ -86,13 +86,63 @@ def cmd_status():
 
 def cmd_scan():
     """Run one CSP/CC scan cycle."""
+    from lib.alpaca_client import AlpacaClient
+    from lib.data_pipeline import fetch_all_data
+    from lib.csp_engine import run_csp_scan_and_execute
+    from lib.cc_engine import scan_for_ccs, find_assigned_positions
+
     print("🔍 Scanning for Wheel candidates...")
-    print("   This requires market data feeds — run in Claude Code")
-    print("   with Alpaca MCP connected for live data.")
-    print()
-    print("   In Claude Code, say:")
-    print('   "Scan for CSP candidates using the screener"')
-    log_event("main", "scan_invoked", {})
+    log_event("main", "scan_started", {})
+
+    try:
+        client = AlpacaClient()
+        account = client.get_account()
+        print(f"  Portfolio: ${account['portfolio_value']:,.2f}  Cash: ${account['cash']:,.2f}")
+
+        if account["portfolio_value"] <= 0 and account["cash"] <= 0:
+            print("\n  ⚠️  Paper account has $0. Reset it at https://app.alpaca.markets/paper/dashboard")
+            return
+
+        # Fetch all market data
+        print("  Fetching market data...")
+        data = fetch_all_data(client)
+
+        daily = data["daily_data"]
+        weekly = data["weekly_data"]
+        chains = data["options_chains"]
+        iv = data["iv_data"]
+
+        print(f"  Bars: {len(daily)} tickers  Options: {len(chains)} tickers  IV: {len(iv)} tickers")
+
+        # Scan for CSP candidates
+        print("\n  --- CSP Scan ---")
+        csp_results = run_csp_scan_and_execute(
+            client, daily, weekly, chains, iv, max_trades=1,
+        )
+        if csp_results:
+            for r in csp_results:
+                print(f"  ✅ Executed: {r.get('symbol')} — {r.get('status')}")
+        else:
+            print("  No CSP trades executed (either no candidates or scores below threshold)")
+
+        # Scan for CC candidates on assigned positions
+        assigned = find_assigned_positions()
+        if assigned:
+            print(f"\n  --- CC Scan ({len(assigned)} assigned positions) ---")
+            cc_candidates = scan_for_ccs(client, daily, weekly, chains, iv)
+            if cc_candidates:
+                for c in cc_candidates[:3]:
+                    print(f"  📋 CC candidate: {c.ticker} {c.strike}C exp {c.expiration} "
+                          f"score {c.composite_score}/9 ${c.premium:.2f}")
+            else:
+                print("  No CC candidates found")
+        else:
+            print("\n  No assigned positions — CC scan skipped")
+
+    except Exception as e:
+        print(f"\n  ❌ Scan failed: {e}")
+        log_event("main", "scan_failed", {"error": str(e)}, result="failed")
+        raise
 
 
 def cmd_monitor():
