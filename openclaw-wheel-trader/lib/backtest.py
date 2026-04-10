@@ -260,7 +260,7 @@ def run_monte_carlo(
     for _ in range(n_simulations):
         # Shuffle returns to break temporal dependencies
         shuffled = daily_df.copy()
-        shuffled_returns = np.random.choice(returns, size=len(returns), replace=True)
+        shuffled_returns = np.random.choice(returns, size=len(daily_df), replace=True)
         base_price = daily_df["close"].iloc[0]
         shuffled["close"] = base_price * np.cumprod(1 + shuffled_returns)
         shuffled["high"] = shuffled["close"] * (1 + abs(np.random.randn(len(shuffled))) * 0.01)
