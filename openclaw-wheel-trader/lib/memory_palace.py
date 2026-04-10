@@ -222,27 +222,33 @@ def _search_fallback(query: str, wing: str | None, n: int) -> list[dict]:
 # KNOWLEDGE GRAPH — Temporal entity-relationship triples
 # ============================================================
 
+_kg_initialized = False
+
+
 def _init_kg_db():
-    """Initialize the knowledge graph SQLite database."""
+    """Initialize the knowledge graph SQLite database (idempotent, runs schema once)."""
+    global _kg_initialized
     KG_DB.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(KG_DB))
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS triples (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            subject TEXT NOT NULL,
-            predicate TEXT NOT NULL,
-            object TEXT NOT NULL,
-            valid_from TEXT,
-            valid_to TEXT,
-            metadata TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_subject ON triples(subject)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_object ON triples(object)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_predicate ON triples(predicate)")
-    conn.commit()
-    conn.close()
+    if not _kg_initialized:
+        conn = sqlite3.connect(str(KG_DB))
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS triples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                object TEXT NOT NULL,
+                valid_from TEXT,
+                valid_to TEXT,
+                metadata TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_subject ON triples(subject)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_object ON triples(object)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_predicate ON triples(predicate)")
+        conn.commit()
+        conn.close()
+        _kg_initialized = True
 
 
 def kg_add(subject: str, predicate: str, obj: str,

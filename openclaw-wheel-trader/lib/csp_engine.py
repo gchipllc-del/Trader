@@ -132,7 +132,7 @@ def execute_csp(
 
     # Step 1: PROPOSE
     intent = OrderIntent(
-        ticker=f"{ticker}{candidate.expiration.replace('-', '')}P{int(candidate.strike * 1000):08d}",
+        ticker=ticker,
         side="sell_to_open",
         order_type="limit",
         asset_type="option",
