@@ -1,0 +1,28 @@
+# Secrets
+.env
+*.pem
+*.key
+
+# Logs (track structure, not contents)
+logs/*.jsonl
+logs/*.log
+
+# Data (track structure, not state)
+data/positions.json
+data/trade_history.json
+data/STATUS.md
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

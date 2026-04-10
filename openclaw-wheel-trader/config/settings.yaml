@@ -1,0 +1,41 @@
+# ============================================================
+# RUNTIME SETTINGS — SECURITY CRITICAL
+# ============================================================
+
+# --- Mode ---
+mode: paper              # paper | live — DO NOT CHANGE until Phase 1 criteria met
+live_migration_approved: false   # Requires manual flip + documented approval
+
+# --- Circuit Breakers ---
+circuit_breakers:
+  max_daily_loss: -500          # Dollars. Halt all trading if hit.
+  max_position_pct: 0.10        # 10% of portfolio per position
+  max_sector_pct: 0.30          # 30% of portfolio per sector
+  max_open_orders: 5            # Pending orders cap
+  max_contracts_per_order: 2    # Start small
+  cooldown_after_loss_minutes: 30  # Wait 30 min after a losing trade
+
+# --- Monitoring ---
+monitoring:
+  check_interval_seconds: 300   # 5 minutes
+  market_hours_only: true
+  missed_check_alert: 3         # Alert after 3 missed checks
+  missed_check_kill: 10         # Kill switch after 10 missed checks
+
+# --- Rate Limiting ---
+rate_limits:
+  alpaca_calls_per_minute: 120
+  backoff_base_seconds: 2
+  backoff_max_seconds: 60
+
+# --- Notifications ---
+notifications:
+  telegram_enabled: true
+  alert_on:
+    - order_filled
+    - order_rejected
+    - circuit_breaker_triggered
+    - assignment_detected
+    - kill_switch_activated
+    - daily_summary
+    - missed_monitoring_check

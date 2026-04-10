@@ -1,0 +1,74 @@
+# ============================================================
+# WHEEL STRATEGY CONFIGURATION
+# ============================================================
+
+# --- Target Universe ---
+tickers:
+  - AAPL
+  - MSFT
+  - NVDA
+  - AMD
+  - AMZN
+  - META
+  - GOOGL
+  - SPY
+
+# --- Cash-Secured Put Parameters ---
+csp:
+  delta_min: -0.35       # Most aggressive (35% chance of assignment)
+  delta_max: -0.20       # Most conservative (20% chance)
+  dte_min: 30            # Minimum days to expiration
+  dte_max: 45            # Maximum days to expiration
+  min_annualized_return: 0.12   # 12% annualized minimum premium yield
+  min_open_interest: 100        # Liquidity floor
+  max_bid_ask_spread: 0.15      # Max spread in dollars
+  strike_zone: support          # Sell puts at support zones
+
+# --- Covered Call Parameters ---
+cc:
+  delta_min: 0.20
+  delta_max: 0.35
+  dte_min: 30
+  dte_max: 45
+  min_annualized_return: 0.10   # Slightly lower bar since we already hold shares
+  min_open_interest: 100
+  max_bid_ask_spread: 0.15
+  strike_zone: resistance       # Sell calls at resistance zones
+
+# --- Management Rules ---
+management:
+  early_close_threshold: 0.80   # Close at 80% of max profit
+  early_close_min_dte: 14       # Only early close if >14 DTE remaining
+  roll_trigger_dte: 7           # Consider rolling if <7 DTE and ITM
+  roll_min_credit: 0.50         # Only roll for at least $0.50 additional credit
+
+# --- Signal Confirmation (Candlestick Bible) ---
+confirmation:
+  min_composite_score: 7        # Out of 9 (trend + level + signal)
+  required_timeframes:
+    - weekly    # Trend direction
+    - daily     # Level identification
+    - 4hour     # Entry timing
+  bullish_patterns:              # Required for CSP entry
+    - pin_bar
+    - bullish_engulfing
+    - morning_star
+    - hammer
+    - dragonfly_doji
+  bearish_patterns:              # Required for CC entry
+    - shooting_star
+    - bearish_engulfing
+    - evening_star
+    - gravestone_doji
+
+# --- Support/Resistance Zones (Naked Forex) ---
+zones:
+  min_touches: 2                 # Zone must have ≥2 price touches
+  zone_width_pct: 0.02           # Zone is ±2% of the level price
+  lookback_days: 120             # Look back 120 days for zones
+  room_to_left: true             # Require clear space to the left of the zone
+
+# --- IV Analysis ---
+iv:
+  min_iv_rank: 30                # Only sell options when IV rank > 30%
+  iv_rank_lookback: 252          # 1 year of trading days

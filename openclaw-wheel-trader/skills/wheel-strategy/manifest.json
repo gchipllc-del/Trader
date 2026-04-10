@@ -1,0 +1,28 @@
+{
+  "name": "wheel-strategy-trader",
+  "version": "0.1.0",
+  "description": "Autonomous Wheel Strategy options trader. Sells cash-secured puts at support zones, manages assignments, sells covered calls at resistance zones. Security-first with 3-agent governance, circuit breakers, and kill switch.",
+  "author": "Jesse",
+  "category": "finance",
+  "tags": ["trading", "options", "wheel-strategy", "alpaca", "autonomous"],
+  "requires": {
+    "env": [
+      "ALPACA_API_KEY",
+      "ALPACA_SECRET_KEY",
+      "TELEGRAM_BOT_TOKEN",
+      "TELEGRAM_CHAT_ID"
+    ],
+    "python_packages": [
+      "alpaca-py",
+      "pyyaml",
+      "python-dotenv",
+      "pandas",
+      "numpy"
+    ]
+  },
+  "entry_point": "CLAUDE.md",
+  "config_files": [
+    "config/settings.yaml",
+    "config/wheel_strategy.yaml"
+  ]
+}

@@ -1,0 +1,8 @@
+# Archives
+*.zip
+
+# Sprint plan (large markdown, not code)
+OPENCLAW_WHEEL_TRADER_SPRINT_PLAN.md
+
+# OS
+.DS_Store
