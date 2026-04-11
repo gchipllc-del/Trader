@@ -6,20 +6,25 @@
 # Phase 1 (stocks, <$1500 portfolio): affordable, liquid stocks
 # Phase 2 ($5k+): add CSPs on cheap underlyings
 # Phase 3 ($10k+): full Wheel on bigger tickers
-tickers_phase1:   # Stock trading — build the portfolio
-  - F             # Ford ~$12
-  - SOFI          # SoFi ~$16
-  - NIO           # NIO ~$6
-  - AAL           # American Airlines ~$11
-  - INTC          # Intel ~$62
-  - BAC           # Bank of America ~$52
-  - T             # AT&T ~$26
-  - SNAP          # Snap ~$5
-  - KO            # Coca-Cola ~$77
-  - PFE           # Pfizer ~$27
-  - RIVN          # Rivian ~$15
-  - LCID          # Lucid ~$9
-  - MARA          # Marathon Digital ~$10
+tickers_phase1:   # Stock trading — quant-screened, dynamically filtered
+  - F             # Ford — STRONG (Sharpe 1.76, -20% DD)
+  - SOFI          # SoFi — OK (Sharpe 1.70, -49% DD)
+  - NIO           # NIO — OK (Sharpe 1.56, -40% DD)
+  - AAL           # American Airlines — OK (Sharpe 0.68)
+  - INTC          # Intel — STRONG (Sharpe 3.88)
+  - BAC           # Bank of America — STRONG (Sharpe 2.05, -19% DD)
+  - T             # AT&T — OK (low vol, defensive)
+  - KO            # Coca-Cola — STRONG (Sharpe 1.79, -10% DD)
+  - PFE           # Pfizer — STRONG (Sharpe 0.63, -17% DD)
+  - RIVN          # Rivian — STRONG (Sharpe 1.95)
+  # REMOVED: SNAP (-44% 1Y, -61% DD), LCID (-59% 1Y, -72% DD), MARA (-28% 1Y, -60% DD)
+
+# --- Quant Screening Thresholds ---
+quant:
+  min_sharpe: -0.5          # Exclude deeply negative Sharpe
+  max_drawdown: -0.55       # Exclude > 55% drawdown
+  min_quant_score: 4.0      # Minimum composite quant score to trade
+  exclude_avoid: true       # Auto-remove AVOID-rated tickers
 
 tickers_phase2:   # CSPs on cheap stocks (collateral $500-1500)
   - F

@@ -7,7 +7,7 @@ import os
 import time
 from collections import deque
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import yaml
 
@@ -148,10 +148,7 @@ class AlpacaClient:
         self.limiter.wait_if_needed()
         client = self._get_stock_data_client()
 
-        tf_map = {"1Day": TimeFrame.Day, "1Week": TimeFrame.Week}
-        tf = tf_map.get(timeframe, TimeFrame.Day)
-
-        start = datetime.now(timezone.utc) - __import__("datetime").timedelta(days=400)
+        start = datetime.now(timezone.utc) - timedelta(days=400)
 
         # Fetch in batches per ticker via raw API for reliability
         import requests as _requests
@@ -161,14 +158,14 @@ class AlpacaClient:
             "APCA-API-KEY-ID": self.api_key,
             "APCA-API-SECRET-KEY": self.secret_key,
         }
-        tf_str = "1Day" if tf == TimeFrame.Day else "1Week"
+        tf_str = timeframe  # Pass through directly: "1Day" or "1Week"
 
         for ticker in tickers:
             self.limiter.wait_if_needed()
             url = f"https://data.alpaca.markets/v2/stocks/{ticker}/bars"
             params = {
                 "timeframe": tf_str,
-                "limit": limit,
+                "limit": 1000,  # Max per page
                 "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "adjustment": "split",
             }
@@ -179,7 +176,7 @@ class AlpacaClient:
                 data = resp.json()
                 all_bars = data.get("bars", [])
 
-                # Handle pagination
+                # Paginate until we have enough bars or no more pages
                 while data.get("next_page_token") and len(all_bars) < limit:
                     self.limiter.wait_if_needed()
                     params["page_token"] = data["next_page_token"]
@@ -188,6 +185,10 @@ class AlpacaClient:
                         break
                     data = resp.json()
                     all_bars.extend(data.get("bars", []))
+
+                # Keep only the last `limit` bars
+                if len(all_bars) > limit:
+                    all_bars = all_bars[-limit:]
 
                 if not all_bars:
                     continue

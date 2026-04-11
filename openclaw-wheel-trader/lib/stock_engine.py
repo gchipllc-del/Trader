@@ -25,6 +25,7 @@ from lib.candlestick import get_latest_signal, scan_patterns
 from lib.iv_rank import calculate_historical_volatility
 from lib.memory_palace import diary_write, remember_trade_decision, get_current_regime
 from lib.circuit_breaker import check_paper_mode, check_daily_loss, CircuitBreakerTripped
+from lib.quant_screener import screen_universe, print_screening_report
 
 POSITIONS_PATH = Path(__file__).parent.parent / "data" / "positions.json"
 CONFIG_PATH = Path(__file__).parent.parent / "config" / "settings.yaml"
@@ -184,13 +185,28 @@ def scan_for_stocks(
     """
     Scan tickers for stock buy candidates.
 
+    Two-gate system:
+      Gate 1: Quantitative screen (Sharpe, drawdown, volatility)
+      Gate 2: Technical screen (trend + zones + candlestick signals)
+
     Returns ranked list of tradeable candidates.
     """
     settings = _load_settings()
     max_position_pct = settings["circuit_breakers"]["max_position_pct"]
     max_position_value = portfolio_value * max_position_pct
 
-    candidates = []
+    # Gate 1: Quantitative screening
+    # max_price: we can buy at least 1 share with our position budget
+    quant_scores = screen_universe(
+        daily_data,
+        max_price=max_position_value,
+        exclude_avoid=True,
+    )
+
+    print("\n  --- Quant Screening ---")
+    print_screening_report(quant_scores)
+
+    quant_passed = {s.ticker for s in quant_scores if s.verdict != "AVOID"}
 
     # Check existing positions to avoid doubling up
     positions = _load_positions()
@@ -199,12 +215,14 @@ def scan_for_stocks(
         if p.get("status") in ("open", "assigned") and p.get("type") == "stock"
     )
 
-    for ticker, daily_df in daily_data.items():
+    # Gate 2: Technical screening (only on quant-passed tickers)
+    candidates = []
+    for ticker in quant_passed:
         if ticker in held_tickers:
-            log_event("stock_engine", "skip_held", {"ticker": ticker})
             continue
 
-        if len(daily_df) < 50:
+        daily_df = daily_data.get(ticker)
+        if daily_df is None or len(daily_df) < 50:
             continue
 
         current_price = daily_df["close"].iloc[-1]
@@ -216,16 +234,23 @@ def scan_for_stocks(
             ticker, daily_df, weekly_df, current_price, max_position_value,
         )
         if candidate and candidate["tradeable"]:
+            # Attach quant score for ranking
+            qs = next((s for s in quant_scores if s.ticker == ticker), None)
+            if qs:
+                candidate["quant_score"] = qs.quant_score
+                candidate["sharpe"] = qs.sharpe_ratio
+                candidate["max_drawdown"] = qs.max_drawdown
             candidates.append(candidate)
 
-    # Sort by composite score, then by proximity to support
+    # Sort by: quant_score first, then composite technical score
     candidates.sort(
-        key=lambda c: (c["composite_score"], c["level_score"]),
+        key=lambda c: (c.get("quant_score", 0), c["composite_score"]),
         reverse=True,
     )
 
     log_event("stock_engine", "scan_complete", {
-        "candidates": len(candidates),
+        "quant_passed": len(quant_passed),
+        "technical_passed": len(candidates),
         "top": candidates[0]["ticker"] if candidates else "none",
     })
 

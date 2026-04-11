@@ -66,8 +66,17 @@ def scan_for_csps(
     config = _load_strategy_config()
     candidates = []
 
+    # Quant screen: only sell puts on fundamentally sound underlyings
+    from lib.quant_screener import screen_universe
+    quant_scores = screen_universe(daily_data, exclude_avoid=True)
+    quant_approved = {s.ticker for s in quant_scores if s.verdict in ("STRONG", "OK")}
+
     for ticker in config.get("tickers", []):
         if ticker not in daily_data or ticker not in options_chains:
+            continue
+        if ticker not in quant_approved:
+            log_event("csp_engine", "skip_quant_fail", {"ticker": ticker})
+            continue
             continue
 
         # Check memory — any reason to skip this ticker?
