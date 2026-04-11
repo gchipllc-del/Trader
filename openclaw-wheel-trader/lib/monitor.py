@@ -248,7 +248,38 @@ def run_monitoring_check(client: AlpacaClient) -> dict:
         except Exception as e:
             log_event("monitor", "option_price_fetch_failed", {"error": str(e)})
 
-        for pos in open_positions:
+        # --- Stock position monitoring (Phase 1) ---
+        stock_positions = [p for p in open_positions if p.get("type") == "stock"]
+        if stock_positions:
+            try:
+                from lib.stock_engine import check_stock_exits, execute_stock_sell
+                from lib.data_pipeline import fetch_all_data
+                import yaml as _yaml
+
+                # Fetch daily data for stock exit checks
+                stock_tickers = list(set(p.get("ticker") for p in stock_positions if p.get("ticker")))
+                stock_daily = client.get_bars(stock_tickers, timeframe="1Day", limit=50)
+
+                exits = check_stock_exits(client, stock_daily)
+                for exit_signal in exits:
+                    t = exit_signal["ticker"]
+                    reason = exit_signal["reason"]
+                    pnl_pct = exit_signal.get("pnl_pct", 0)
+
+                    resp = execute_stock_sell(t, client, exit_signal["action"])
+                    if resp:
+                        emoji = "💰" if pnl_pct > 0 else "🔴"
+                        msg = f"{emoji} {t}: {reason} (P/L: {pnl_pct:+.1%})"
+                        summary["actions"].append(exit_signal)
+                        summary["alerts"].append(msg)
+                        diary_write("strategy_agent",
+                            f"{t}|STOCK_EXIT|{exit_signal['action']}|pnl_{pnl_pct:+.1%}")
+            except Exception as e:
+                log_event("monitor", "stock_check_failed", {"error": str(e)})
+
+        # --- Options position monitoring ---
+        option_positions = [p for p in open_positions if p.get("type") in ("csp", "cc")]
+        for pos in option_positions:
             ticker = pos.get("ticker", "")
 
             # Check assignment
@@ -348,11 +379,26 @@ def start_monitoring_loop(client: AlpacaClient):
     log_event("monitor", "loop_started", {"interval": interval})
     send_alert("🟢 Monitoring loop started")
 
+    print(f"🟢 Monitoring started — checking every {interval}s (Ctrl+C to stop)")
+    check_num = 0
+
     while True:
+        check_num += 1
         try:
             summary = run_monitoring_check(client)
+            now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+            pv = summary.get("portfolio_value", 0)
+            actions = len(summary.get("actions", []))
+            positions = summary.get("positions_checked", 0)
+            print(f"  [{now}] Check #{check_num}: "
+                  f"${pv:,.2f} portfolio, {positions} positions, {actions} actions")
+
+            for alert in summary.get("alerts", []):
+                print(f"    {alert}")
+
         except Exception as e:
             record_missed_check()
             log_event("monitor", "loop_error", {"error": str(e)})
+            print(f"  ❌ Check #{check_num} failed: {e}")
 
         time.sleep(interval)
