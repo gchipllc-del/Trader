@@ -85,64 +85,108 @@ def cmd_status():
 
 
 def cmd_scan():
-    """Run one CSP/CC scan cycle."""
+    """Run one scan cycle — auto-selects Phase 1 (stocks) or Phase 2/3 (options) based on portfolio size."""
     from lib.alpaca_client import AlpacaClient
     from lib.data_pipeline import fetch_all_data
+    from lib.stock_engine import (
+        run_stock_scan_and_execute, get_current_phase,
+        PHASE_2_THRESHOLD, PHASE_3_THRESHOLD,
+    )
     from lib.csp_engine import run_csp_scan_and_execute
     from lib.cc_engine import scan_for_ccs, find_assigned_positions
 
-    print("🔍 Scanning for Wheel candidates...")
+    import yaml
+    with open(Path(__file__).parent / "config" / "wheel_strategy.yaml") as f:
+        strategy = yaml.safe_load(f)
+
     log_event("main", "scan_started", {})
 
     try:
         client = AlpacaClient()
         account = client.get_account()
-        print(f"  Portfolio: ${account['portfolio_value']:,.2f}  Cash: ${account['cash']:,.2f}")
+        portfolio = account["portfolio_value"]
+        cash = account["cash"]
+        phase = get_current_phase(portfolio)
 
-        if account["portfolio_value"] <= 0 and account["cash"] <= 0:
+        print("=" * 55)
+        print("  OPENCLAW WHEEL TRADER — SCAN")
+        print("=" * 55)
+        print(f"  Portfolio: ${portfolio:,.2f}  Cash: ${cash:,.2f}")
+        print(f"  Phase {phase}: ", end="")
+
+        if phase == 1:
+            print(f"Stock Trading (upgrade to CSPs at ${PHASE_2_THRESHOLD:,})")
+            tickers = strategy.get("tickers_phase1", strategy.get("tickers", []))
+        elif phase == 2:
+            print(f"Stock + CSPs on cheap stocks (full Wheel at ${PHASE_3_THRESHOLD:,})")
+            tickers = strategy.get("tickers_phase1", [])
+        else:
+            print("Full Wheel Strategy")
+            tickers = strategy.get("tickers", [])
+
+        if portfolio <= 0 and cash <= 0:
             print("\n  ⚠️  Paper account has $0. Reset it at https://app.alpaca.markets/paper/dashboard")
             return
 
-        # Fetch all market data
-        print("  Fetching market data...")
-        data = fetch_all_data(client)
+        # Fetch market data for phase-appropriate tickers
+        print(f"\n  Fetching data for {len(tickers)} tickers: {', '.join(tickers)}")
+        data = fetch_all_data(client, tickers=tickers)
 
         daily = data["daily_data"]
         weekly = data["weekly_data"]
         chains = data["options_chains"]
         iv = data["iv_data"]
 
-        print(f"  Bars: {len(daily)} tickers  Options: {len(chains)} tickers  IV: {len(iv)} tickers")
+        print(f"  Bars: {len(daily)} tickers")
 
-        # Scan for CSP candidates
-        print("\n  --- CSP Scan ---")
-        csp_results = run_csp_scan_and_execute(
-            client, daily, weekly, chains, iv, max_trades=1,
-        )
-        if csp_results:
-            for r in csp_results:
-                print(f"  ✅ Executed: {r.get('symbol')} — {r.get('status')}")
-        else:
-            print("  No CSP trades executed (either no candidates or scores below threshold)")
-
-        # Scan for CC candidates on assigned positions
-        assigned = find_assigned_positions()
-        if assigned:
-            print(f"\n  --- CC Scan ({len(assigned)} assigned positions) ---")
-            cc_candidates = scan_for_ccs(client, daily, weekly, chains, iv)
-            if cc_candidates:
-                for c in cc_candidates[:3]:
-                    print(f"  📋 CC candidate: {c.ticker} {c.strike}C exp {c.expiration} "
-                          f"score {c.composite_score}/9 ${c.premium:.2f}")
+        # Phase 1: Stock trading
+        if phase <= 2:
+            print("\n  --- Stock Scan ---")
+            stock_results = run_stock_scan_and_execute(
+                client, daily, weekly, portfolio, max_trades=2,
+            )
+            if stock_results:
+                for r in stock_results:
+                    action = r.get("action", "")
+                    if action == "buy":
+                        c = r["candidate"]
+                        print(f"  ✅ Bought {c['shares']}x {c['ticker']} @ ${c['current_price']:.2f} "
+                              f"(score {c['composite_score']}/9, {c['pattern'] or 'no pattern'})")
+                    elif action == "sell":
+                        print(f"  💰 Sold {r['ticker']} — {r['reason']}")
             else:
-                print("  No CC candidates found")
-        else:
-            print("\n  No assigned positions — CC scan skipped")
+                print("  No stock trades (candidates below score threshold or already held)")
+
+        # Phase 2+: CSP scanning
+        if phase >= 2 and chains:
+            print(f"\n  --- CSP Scan ({len(chains)} chains) ---")
+            csp_results = run_csp_scan_and_execute(
+                client, daily, weekly, chains, iv, max_trades=1,
+            )
+            if csp_results:
+                for r in csp_results:
+                    print(f"  ✅ CSP executed: {r.get('symbol')} — {r.get('status')}")
+            else:
+                print("  No CSP trades (no candidates or scores below 7)")
+
+        # Phase 3: CC scanning on assigned positions
+        if phase >= 2:
+            assigned = find_assigned_positions()
+            if assigned:
+                print(f"\n  --- CC Scan ({len(assigned)} assigned) ---")
+                cc_candidates = scan_for_ccs(client, daily, weekly, chains, iv)
+                if cc_candidates:
+                    for c in cc_candidates[:3]:
+                        print(f"  📋 CC: {c.ticker} {c.strike}C exp {c.expiration} "
+                              f"score {c.composite_score}/9 ${c.premium:.2f}")
+
+        print()
 
     except Exception as e:
         print(f"\n  ❌ Scan failed: {e}")
         log_event("main", "scan_failed", {"error": str(e)}, result="failed")
-        raise
+        import traceback
+        traceback.print_exc()
 
 
 def cmd_monitor():

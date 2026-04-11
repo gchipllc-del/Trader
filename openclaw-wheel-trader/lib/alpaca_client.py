@@ -153,39 +153,68 @@ class AlpacaClient:
 
         start = datetime.now(timezone.utc) - __import__("datetime").timedelta(days=400)
 
-        request = StockBarsRequest(
-            symbol_or_symbols=tickers,
-            timeframe=tf,
-            start=start,
-            limit=limit,
-        )
-
-        bars = client.get_stock_bars(request)
+        # Fetch in batches per ticker via raw API for reliability
+        import requests as _requests
 
         result = {}
+        headers = {
+            "APCA-API-KEY-ID": self.api_key,
+            "APCA-API-SECRET-KEY": self.secret_key,
+        }
+        tf_str = "1Day" if tf == TimeFrame.Day else "1Week"
+
         for ticker in tickers:
-            ticker_bars = bars[ticker] if ticker in bars else []
-            if not ticker_bars:
+            self.limiter.wait_if_needed()
+            url = f"https://data.alpaca.markets/v2/stocks/{ticker}/bars"
+            params = {
+                "timeframe": tf_str,
+                "limit": limit,
+                "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "adjustment": "split",
+            }
+            try:
+                resp = _requests.get(url, params=params, headers=headers, timeout=15)
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
+                all_bars = data.get("bars", [])
+
+                # Handle pagination
+                while data.get("next_page_token") and len(all_bars) < limit:
+                    self.limiter.wait_if_needed()
+                    params["page_token"] = data["next_page_token"]
+                    resp = _requests.get(url, params=params, headers=headers, timeout=15)
+                    if resp.status_code != 200:
+                        break
+                    data = resp.json()
+                    all_bars.extend(data.get("bars", []))
+
+                if not all_bars:
+                    continue
+
+                rows = []
+                for b in all_bars:
+                    rows.append({
+                        "open": float(b["o"]),
+                        "high": float(b["h"]),
+                        "low": float(b["l"]),
+                        "close": float(b["c"]),
+                        "volume": int(b["v"]),
+                        "timestamp": b["t"],
+                    })
+                df = pd.DataFrame(rows)
+                df.index = pd.to_datetime(df["timestamp"])
+                df = df.drop(columns=["timestamp"])
+                result[ticker] = df
+
+            except Exception as e:
+                log_event("data", "bars_fetch_error", {"ticker": ticker, "error": str(e)})
                 continue
-            rows = []
-            for b in ticker_bars:
-                rows.append({
-                    "open": float(b.open),
-                    "high": float(b.high),
-                    "low": float(b.low),
-                    "close": float(b.close),
-                    "volume": int(b.volume),
-                    "timestamp": b.timestamp,
-                })
-            df = pd.DataFrame(rows)
-            df.index = pd.to_datetime(df["timestamp"])
-            df = df.drop(columns=["timestamp"])
-            result[ticker] = df
 
         log_event("data", "bars_fetched", {
-            "tickers": tickers,
-            "timeframe": timeframe,
-            "bars_per_ticker": {t: len(result.get(t, [])) for t in tickers},
+            "tickers": list(result.keys()),
+            "timeframe": tf_str,
+            "count": len(result),
         })
 
         return result

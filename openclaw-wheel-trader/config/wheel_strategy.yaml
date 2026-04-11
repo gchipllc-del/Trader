@@ -3,7 +3,32 @@
 # ============================================================
 
 # --- Target Universe ---
-tickers:
+# Phase 1 (stocks, <$1500 portfolio): affordable, liquid stocks
+# Phase 2 ($5k+): add CSPs on cheap underlyings
+# Phase 3 ($10k+): full Wheel on bigger tickers
+tickers_phase1:   # Stock trading — build the portfolio
+  - F             # Ford ~$12
+  - SOFI          # SoFi ~$16
+  - NIO           # NIO ~$6
+  - AAL           # American Airlines ~$11
+  - INTC          # Intel ~$62
+  - BAC           # Bank of America ~$52
+  - T             # AT&T ~$26
+  - SNAP          # Snap ~$5
+  - KO            # Coca-Cola ~$77
+  - PFE           # Pfizer ~$27
+  - RIVN          # Rivian ~$15
+  - LCID          # Lucid ~$9
+  - MARA          # Marathon Digital ~$10
+
+tickers_phase2:   # CSPs on cheap stocks (collateral $500-1500)
+  - F
+  - NIO
+  - SOFI
+  - AAL
+  - SNAP
+
+tickers:          # Phase 3 — full Wheel
   - AAPL
   - MSFT
   - NVDA
