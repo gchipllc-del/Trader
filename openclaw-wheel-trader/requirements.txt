@@ -5,6 +5,10 @@ pandas>=2.0.0
 numpy>=1.24.0
 requests>=2.31.0
 
+# Dashboard
+flask>=2.2.0
+rich>=13.0.0
+
 # MemPalace integration (optional — falls back to SQLite if missing)
 chromadb>=0.4.0
 # mempalace>=3.0.0  # uncomment when using full MCP integration

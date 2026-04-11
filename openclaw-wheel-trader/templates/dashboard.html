@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OpenClaw Wheel Trader</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0f0f23; color: #e0e0e0; font-family: 'Courier New', monospace; font-size: 14px; }
+.container { max-width: 1400px; margin: 0 auto; padding: 16px; }
+
+/* Header */
+.header { background: linear-gradient(135deg, #1a1a3e, #2a1a4e); border: 1px solid #3a2a6e; border-radius: 8px; padding: 20px; margin-bottom: 16px; }
+.header h1 { color: #f0c040; font-size: 20px; margin-bottom: 12px; }
+.header-stats { display: flex; flex-wrap: wrap; gap: 24px; }
+.stat { }
+.stat-label { color: #888; font-size: 11px; text-transform: uppercase; }
+.stat-value { font-size: 22px; font-weight: bold; }
+.badges { display: flex; gap: 8px; margin-top: 12px; }
+.badge { padding: 3px 10px; border-radius: 4px; font-size: 11px; font-weight: bold; }
+.badge-paper { background: #f0c040; color: #000; }
+.badge-live { background: #ff4444; color: #fff; }
+.badge-phase { background: #2a5a8a; color: #80c0ff; }
+.badge-regime { background: #3a3a5e; color: #c0c0ff; }
+
+/* Grid */
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+.full-width { grid-column: 1 / -1; }
+
+/* Cards */
+.card { background: #1a1a3e; border: 1px solid #2a2a5e; border-radius: 8px; padding: 16px; }
+.card h2 { color: #f0c040; font-size: 14px; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 1px; }
+
+/* Tables */
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; color: #888; font-size: 11px; text-transform: uppercase; padding: 6px 8px; border-bottom: 1px solid #2a2a5e; }
+td { padding: 6px 8px; border-bottom: 1px solid #1a1a2e; }
+tr:hover { background: #22224e; }
+.right { text-align: right; }
+.center { text-align: center; }
+.green { color: #00d4aa; }
+.red { color: #ff6b6b; }
+.gold { color: #f0c040; }
+.dim { color: #666; }
+
+/* Breaker bars */
+.breaker-row { display: flex; align-items: center; margin-bottom: 10px; gap: 12px; }
+.breaker-label { width: 120px; font-size: 12px; }
+.breaker-bar { flex: 1; height: 18px; background: #0f0f23; border-radius: 4px; overflow: hidden; }
+.breaker-fill { height: 100%; border-radius: 4px; transition: width 0.5s; }
+.breaker-value { width: 80px; text-align: right; font-size: 12px; }
+
+/* Events */
+.events-log { max-height: 350px; overflow-y: auto; }
+.event { padding: 4px 0; border-bottom: 1px solid #1a1a2e; font-size: 12px; }
+.event-time { color: #666; }
+.event-type { color: #80c0ff; }
+
+/* Quant loading */
+.spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #333; border-top: 2px solid #f0c040; border-radius: 50%; animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Footer */
+.footer { text-align: center; padding: 12px; color: #666; font-size: 12px; }
+.footer button { background: #2a2a5e; color: #e0e0e0; border: 1px solid #3a3a7e; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-family: inherit; }
+.footer button:hover { background: #3a3a7e; }
+
+/* Chart */
+.chart-container { position: relative; height: 200px; }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <!-- Header -->
+  <div class="header">
+    <h1>OPENCLAW WHEEL TRADER</h1>
+    <div class="header-stats">
+      <div class="stat"><div class="stat-label">Portfolio</div><div class="stat-value" id="portfolio-value">--</div></div>
+      <div class="stat"><div class="stat-label">Cash</div><div class="stat-value" id="cash-value">--</div></div>
+      <div class="stat"><div class="stat-label">Buying Power</div><div class="stat-value" id="bp-value">--</div></div>
+      <div class="stat"><div class="stat-label">Daily P/L</div><div class="stat-value" id="daily-pl">--</div></div>
+    </div>
+    <div class="badges">
+      <span class="badge" id="mode-badge">--</span>
+      <span class="badge badge-phase" id="phase-badge">--</span>
+      <span class="badge badge-regime" id="regime-badge">--</span>
+    </div>
+  </div>
+
+  <!-- Main Grid -->
+  <div class="grid">
+
+    <!-- Positions -->
+    <div class="card full-width">
+      <h2>Positions</h2>
+      <table><thead><tr>
+        <th>Ticker</th><th>Type</th><th class="right">Shares</th><th class="right">Entry</th>
+        <th class="right">Current</th><th class="right">P/L $</th><th class="right">P/L %</th>
+        <th class="right">Target</th><th class="right">Stop</th><th class="center">Score</th>
+      </tr></thead><tbody id="positions-body"><tr><td colspan="10" class="dim">Loading...</td></tr></tbody></table>
+    </div>
+
+    <!-- Quant Scores -->
+    <div class="card">
+      <h2>Quant Scores <span id="quant-spinner" class="spinner"></span></h2>
+      <table><thead><tr>
+        <th>#</th><th>Ticker</th><th class="right">Price</th><th class="right">1Y Ret</th>
+        <th class="right">MaxDD</th><th class="right">Sharpe</th><th class="right">Score</th><th class="center">Verdict</th>
+      </tr></thead><tbody id="quant-body"><tr><td colspan="8" class="dim">Loading...</td></tr></tbody></table>
+    </div>
+
+    <!-- Circuit Breakers -->
+    <div class="card">
+      <h2>Circuit Breakers</h2>
+      <div id="breakers-container"><div class="dim">Loading...</div></div>
+    </div>
+
+    <!-- Recent Events -->
+    <div class="card">
+      <h2>Recent Events</h2>
+      <div class="events-log" id="events-container"><div class="dim">Loading...</div></div>
+    </div>
+
+    <!-- Trade History -->
+    <div class="card">
+      <h2>Trade History</h2>
+      <div id="history-stats" class="dim" style="margin-bottom:8px;">--</div>
+      <div class="chart-container"><canvas id="pl-chart"></canvas></div>
+    </div>
+
+  </div>
+
+  <!-- Footer -->
+  <div class="footer">
+    <span id="last-updated">--</span> &nbsp; Next refresh in <span id="countdown">30</span>s &nbsp;
+    <button id="pause-btn" onclick="togglePause()">Pause</button>
+  </div>
+
+</div>
+
+<script>
+let paused = false;
+let countdown = 30;
+let plChart = null;
+
+function $(id) { return document.getElementById(id); }
+function fmt(n) { return '$' + Number(n).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}); }
+function pct(n) { return (n >= 0 ? '+' : '') + (n * 100).toFixed(1) + '%'; }
+function cls(n) { return n >= 0 ? 'green' : 'red'; }
+
+function renderState(data) {
+  const p = data.portfolio || {};
+  if (p.error) { $('portfolio-value').textContent = 'Error: ' + p.error; return; }
+
+  $('portfolio-value').textContent = fmt(p.portfolio_value);
+  $('cash-value').textContent = fmt(p.cash);
+  $('bp-value').textContent = fmt(p.buying_power);
+
+  const pl = p.daily_pl || 0;
+  $('daily-pl').innerHTML = `<span class="${cls(pl)}">${fmt(pl)}</span>`;
+
+  const mb = $('mode-badge');
+  mb.textContent = (p.mode || 'paper').toUpperCase();
+  mb.className = 'badge ' + (p.mode === 'paper' ? 'badge-paper' : 'badge-live');
+  $('phase-badge').textContent = `Phase ${p.phase}: ${p.phase_label || ''}`;
+  $('regime-badge').textContent = `Regime: ${(p.regime || 'unknown').toUpperCase()}`;
+
+  // Positions
+  const positions = data.positions || [];
+  let html = '';
+  if (positions.length === 0 || (positions.length === 1 && positions[0].error)) {
+    html = '<tr><td colspan="10" class="dim">No positions</td></tr>';
+  } else {
+    positions.forEach(pos => {
+      if (pos.error) return;
+      const c = cls(pos.pnl);
+      const pending = pos.pending ? ' <span class="dim">(pending)</span>' : '';
+      html += `<tr>
+        <td><b>${pos.ticker}</b>${pending}</td><td class="dim">${pos.type}</td>
+        <td class="right">${pos.shares}</td><td class="right">${fmt(pos.entry_price)}</td>
+        <td class="right">${pos.current_price ? fmt(pos.current_price) : '-'}</td>
+        <td class="right ${c}">${fmt(pos.pnl)}</td>
+        <td class="right ${c}">${pct(pos.pnl_pct)}</td>
+        <td class="right dim">${pos.target ? fmt(pos.target) : '-'}</td>
+        <td class="right dim">${pos.stop ? fmt(pos.stop) : '-'}</td>
+        <td class="center">${pos.score}/9</td></tr>`;
+    });
+  }
+  $('positions-body').innerHTML = html;
+
+  // Orders
+  const orders = data.orders || [];
+  if (orders.length > 0 && !orders[0].error) {
+    let ohtml = '';
+    orders.forEach(o => {
+      ohtml += `<tr><td><b>${o.symbol}</b> <span class="dim">(pending)</span></td><td class="dim">order</td>
+        <td class="right">${o.qty}</td><td class="right">-</td><td class="right">-</td>
+        <td class="right dim">-</td><td class="right dim">-</td><td class="right dim">-</td>
+        <td class="right dim">-</td><td class="center dim">${o.status}</td></tr>`;
+    });
+    $('positions-body').innerHTML += ohtml;
+  }
+
+  // Circuit Breakers
+  const cb = data.breakers || {};
+  if (!cb.error) {
+    let bhtml = '';
+    const breakers = cb.breakers || {};
+    for (const [name, b] of Object.entries(breakers)) {
+      const pctUsed = Math.min(b.pct_used || 0, 1);
+      const color = b.tripped ? '#ff6b6b' : (pctUsed > 0.6 ? '#f0c040' : '#00d4aa');
+      const label = name.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+      bhtml += `<div class="breaker-row">
+        <div class="breaker-label">${label}</div>
+        <div class="breaker-bar"><div class="breaker-fill" style="width:${pctUsed*100}%;background:${color}"></div></div>
+        <div class="breaker-value">${b.current} / ${b.limit}</div></div>`;
+    }
+    bhtml += `<div style="margin-top:8px;font-size:12px">Paper Mode: <span class="${cb.paper_mode ? 'green' : 'red'}">${cb.paper_mode ? 'YES' : 'NO'}</span></div>`;
+    $('breakers-container').innerHTML = bhtml;
+  }
+
+  // Events
+  const events = data.events || [];
+  let ehtml = '';
+  events.reverse().forEach(e => {
+    const time = (e.timestamp || '').slice(11, 19);
+    const result = e.result || '';
+    const rc = result === 'success' ? 'green' : (result === 'blocked' || result === 'failed' ? 'red' : 'dim');
+    ehtml += `<div class="event">
+      <span class="event-time">${time}</span>
+      <span class="event-type">${e.event_type || ''}</span>
+      <span class="dim">${e.action || ''}</span>
+      <span class="${rc}">${result}</span>
+      ${e.summary ? '<span class="dim"> ' + e.summary + '</span>' : ''}</div>`;
+  });
+  $('events-container').innerHTML = ehtml || '<div class="dim">No recent events</div>';
+
+  // Trade History
+  const hist = data.history || {};
+  if (hist.total_trades > 0) {
+    $('history-stats').innerHTML = `Trades: <b>${hist.total_trades}</b> | Win Rate: <b>${pct(hist.win_rate)}</b> | Total P/L: <span class="${cls(hist.total_pl)}"><b>${fmt(hist.total_pl)}</b></span>`;
+    renderChart(hist.pl_series || []);
+  } else {
+    $('history-stats').textContent = 'No completed trades yet';
+  }
+
+  $('last-updated').textContent = 'Updated: ' + new Date().toLocaleTimeString();
+}
+
+function renderQuant(scores) {
+  $('quant-spinner').style.display = 'none';
+  if (!scores || scores.length === 0 || scores[0].error) {
+    $('quant-body').innerHTML = '<tr><td colspan="8" class="dim">No data</td></tr>';
+    return;
+  }
+  let html = '';
+  scores.forEach((s, i) => {
+    const vc = {STRONG:'green',OK:'gold',WEAK:'dim',AVOID:'red'}[s.verdict] || 'dim';
+    html += `<tr><td class="dim">${i+1}</td><td><b>${s.ticker}</b></td>
+      <td class="right">${fmt(s.price)}</td><td class="right ${cls(s.return_1y)}">${pct(s.return_1y)}</td>
+      <td class="right ${cls(s.max_drawdown)}">${pct(s.max_drawdown)}</td>
+      <td class="right">${s.sharpe.toFixed(2)}</td>
+      <td class="right gold">${s.quant_score.toFixed(1)}</td>
+      <td class="center ${vc}"><b>${s.verdict}</b></td></tr>`;
+  });
+  $('quant-body').innerHTML = html;
+}
+
+function renderChart(series) {
+  if (!window.Chart || !series.length) return;
+  const ctx = $('pl-chart');
+  if (plChart) plChart.destroy();
+  plChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: series.map(s => s.date),
+      datasets: [{
+        label: 'Cumulative P/L',
+        data: series.map(s => s.pl),
+        borderColor: '#00d4aa', backgroundColor: 'rgba(0,212,170,0.1)',
+        fill: true, tension: 0.3, pointRadius: 3,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: { x: { ticks: { color: '#666' } }, y: { ticks: { color: '#666', callback: v => '$'+v } } },
+      plugins: { legend: { display: false } },
+    }
+  });
+}
+
+async function refresh() {
+  try {
+    const resp = await fetch('/api/state');
+    const data = await resp.json();
+    renderState(data);
+  } catch(e) { console.error('State fetch error:', e); }
+}
+
+async function refreshQuant() {
+  try {
+    $('quant-spinner').style.display = 'inline-block';
+    const resp = await fetch('/api/quant');
+    const data = await resp.json();
+    renderQuant(data);
+  } catch(e) { console.error('Quant fetch error:', e); }
+}
+
+function togglePause() {
+  paused = !paused;
+  $('pause-btn').textContent = paused ? 'Resume' : 'Pause';
+}
+
+// Initial load
+refresh();
+refreshQuant();
+
+// Auto-refresh
+setInterval(() => {
+  if (paused) return;
+  countdown--;
+  $('countdown').textContent = countdown;
+  if (countdown <= 0) {
+    countdown = 30;
+    refresh();
+  }
+}, 1000);
+
+// Quant refresh every 5 minutes
+setInterval(() => { if (!paused) refreshQuant(); }, 300000);
+</script>
+</body>
+</html>

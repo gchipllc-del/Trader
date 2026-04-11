@@ -40,8 +40,17 @@ POSITIONS_PATH = Path(__file__).parent / "data" / "positions.json"
 STATUS_PATH = Path(__file__).parent / "data" / "STATUS.md"
 
 
-def cmd_status():
-    """Print current bot status."""
+def cmd_status(full: bool = False):
+    """Print current bot status with colored output."""
+    try:
+        from lib.dashboard_terminal import render_terminal_dashboard
+        render_terminal_dashboard(include_quant=full)
+    except ImportError:
+        _cmd_status_plain()
+
+
+def _cmd_status_plain():
+    """Fallback plain-text status if Rich is not installed."""
     from lib.alpaca_client import AlpacaClient
 
     print("=" * 50)
@@ -54,7 +63,7 @@ def cmd_status():
         positions = client.get_positions()
         orders = client.get_open_orders()
 
-        print(f"\n  Mode:            {'PAPER' if 'paper' in client.base_url else '🔴 LIVE'}")
+        print(f"\n  Mode:            {'PAPER' if 'paper' in client.base_url else 'LIVE'}")
         print(f"  Portfolio Value:  ${account['portfolio_value']:,.2f}")
         print(f"  Cash:            ${account['cash']:,.2f}")
         print(f"  Buying Power:    ${account['buying_power']:,.2f}")
@@ -68,10 +77,8 @@ def cmd_status():
             print(f"    {o['symbol']:8s} {o['side']:4s} {o['qty']} @ {o.get('limit_price', 'MKT')}")
 
     except Exception as e:
-        print(f"\n  ❌ Could not connect to Alpaca: {e}")
-        print("  Check your .env file and network connection.")
+        print(f"\n  Could not connect to Alpaca: {e}")
 
-    # Local positions
     if POSITIONS_PATH.exists():
         with open(POSITIONS_PATH) as f:
             local_pos = json.load(f)
@@ -80,8 +87,15 @@ def cmd_status():
         for p in open_local:
             print(f"    {p.get('ticker'):8s} {p.get('type'):4s} "
                   f"{p.get('strike', '')} {p.get('status', '')}")
-
     print()
+
+
+def cmd_dashboard(port: int = 5050):
+    """Start the web dashboard server."""
+    from lib.dashboard_web import run_dashboard
+    print(f"  Dashboard: http://localhost:{port}")
+    print("  Press Ctrl+C to stop.\n")
+    run_dashboard(port=port)
 
 
 def cmd_scan():
@@ -332,10 +346,13 @@ def cmd_migrate():
 
 def main():
     parser = argparse.ArgumentParser(description="OpenClaw Wheel Strategy Trader")
-    parser.add_argument("command", choices=["scan", "monitor", "backtest", "kill", "status", "chaos", "migrate"],
+    parser.add_argument("command",
+                        choices=["scan", "monitor", "backtest", "kill", "status", "chaos", "migrate", "dashboard"],
                         help="Command to run")
     parser.add_argument("--ticker", default="SPY", help="Ticker for backtest")
     parser.add_argument("--reason", default="manual_cli", help="Reason for kill switch")
+    parser.add_argument("--port", type=int, default=5050, help="Dashboard web server port")
+    parser.add_argument("--full", action="store_true", help="Include quant scores in status output")
 
     args = parser.parse_args()
 
@@ -345,7 +362,7 @@ def main():
     log_event("main", f"command_{args.command}", {})
 
     if args.command == "status":
-        cmd_status()
+        cmd_status(full=args.full)
     elif args.command == "scan":
         cmd_scan()
     elif args.command == "monitor":
@@ -358,6 +375,8 @@ def main():
         cmd_chaos()
     elif args.command == "migrate":
         cmd_migrate()
+    elif args.command == "dashboard":
+        cmd_dashboard(args.port)
 
 
 if __name__ == "__main__":
