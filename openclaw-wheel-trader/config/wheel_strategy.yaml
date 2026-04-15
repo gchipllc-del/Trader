@@ -3,28 +3,57 @@
 # ============================================================
 
 # --- Target Universe ---
-# Phase 1 (stocks, <$1500 portfolio): affordable, liquid stocks
+# Phase 1 (stocks, <$5000 portfolio): affordable, liquid stocks
 # Phase 2 ($5k+): add CSPs on cheap underlyings
 # Phase 3 ($10k+): full Wheel on bigger tickers
 tickers_phase1:   # Stock trading — quant-screened, dynamically filtered
-  - F             # Ford — STRONG (Sharpe 1.76, -20% DD)
-  - SOFI          # SoFi — OK (Sharpe 1.70, -49% DD)
-  - NIO           # NIO — OK (Sharpe 1.56, -40% DD)
-  - AAL           # American Airlines — OK (Sharpe 0.68)
-  - INTC          # Intel — STRONG (Sharpe 3.88)
-  - BAC           # Bank of America — STRONG (Sharpe 2.05, -19% DD)
-  - T             # AT&T — OK (low vol, defensive)
-  - KO            # Coca-Cola — STRONG (Sharpe 1.79, -10% DD)
-  - PFE           # Pfizer — STRONG (Sharpe 0.63, -17% DD)
-  - RIVN          # Rivian — STRONG (Sharpe 1.95)
-  # REMOVED: SNAP (-44% 1Y, -61% DD), LCID (-59% 1Y, -72% DD), MARA (-28% 1Y, -60% DD)
+  # Updated 2026-04-13 based on live quant + momentum analysis
+  # Core STRONG (Q >= 7.0) — high Sharpe, low drawdown
+  - F             # $12.04 — Q:7.5  S:1.07  -22% DD  M:2/4
+  - BAC           # $52.48 — Q:9.0  S:1.84  -18% DD  (holding 2sh)
+  - PFE           # $27.00 — Q:9.0  S:1.00  -11% DD  (holding 5sh)
+  - INTC          # $64.54 — Q:8.0  S:2.18  -24% DD  (1sh at $300 budget)
+  - VALE          # $17.18 — Q:8.5  S:2.29  -20% DD  M:2/4  +93% 1Y!
+  - WBD           # $27.41 — Q:8.5  S:2.73  -21% DD  +238% 1Y!
+  - KO            # $76.56 — Q:7.0  S:0.57  -11% DD  (holding 1sh)
+  # Strong momentum + affordable (best swing candidates)
+  - NIO           # $6.45  — Q:5.0  M:3/4  46sh per $300  +97% 1Y
+  - RIVN          # $15.45 — Q:6.0  M:3/4  19sh per $300
+  - NU            # $14.87 — Q:6.5  M:3/4  20sh per $300
+  - SOFI          # $16.64 — Q:5.0  M:3/4  18sh per $300
+  # Moderate momentum + value
+  - CCL           # $26.97 — Q:6.5  M:2/4  +53% 1Y  travel recovery
+  - AAL           # $11.07 — Q:4.5  M:2/4  27sh per $300
+  - CLF           # $9.14  — Q:4.0  M:2/4  +7.1% ROC5d  steel swing
+  - GRAB          # $3.62  — Q:1.5  M:2/4  cheap lot size (82sh per $300)
+  # Growth tickers (expensive now, affordable as portfolio grows)
+  - PLTR          # $132.88 — Q:6.0  AI/defense (2sh at $300)
+  - UBER          # $71.21  — Q:2.5  mobility (4sh at $300)
+  # REMOVED 2026-04-13: COIN (AVOID -66% DD), HOOD (AVOID -57% DD),
+  # PINS (AVOID Sharpe -0.56), SNAP (AVOID -62% DD), SQ (no data),
+  # ABNB ($128 too expensive, only OK quant), T (RSI 14.8 crashing -8.5%)
 
 # --- Quant Screening Thresholds ---
 quant:
   min_sharpe: -0.5          # Exclude deeply negative Sharpe
   max_drawdown: -0.55       # Exclude > 55% drawdown
-  min_quant_score: 4.0      # Minimum composite quant score to trade
+  min_quant_score: 3.5      # Lowered for growth mode — more candidates
   exclude_avoid: true       # Auto-remove AVOID-rated tickers
+
+# --- Stock Trading Parameters (Hermes-tunable) ---
+stock_params:
+  min_composite_score: 3       # Minimum total score (0-13) to enter
+  stop_loss_pct: 0.035         # 3.5% stop loss (tighter = cut losses fast)
+  default_target_pct: 0.08     # 8% default target
+  trailing_stop_pct: 0.03      # 3% trailing stop (locks in profits)
+  max_position_pct: 0.20       # 20% of portfolio per position (aggressive)
+  max_trades_per_scan: 3       # Up to 3 trades per scan
+  max_concurrent_positions: 5  # Hold up to 5 at once
+  allow_momentum_only: true    # Momentum can trigger without candlestick signal
+  support_distance_tiers:      # How close to support for level score
+    - 0.04                     # Within 4% = score 3
+    - 0.07                     # Within 7% = score 2
+    - 0.10                     # Within 10% = score 1
 
 tickers_phase2:   # CSPs on cheap stocks (collateral $500-1500)
   - F

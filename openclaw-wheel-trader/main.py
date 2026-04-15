@@ -122,10 +122,18 @@ def cmd_scan():
         cash = account["cash"]
         phase = get_current_phase(portfolio)
 
+        # PDT check
+        from lib.pdt_guard import check_pdt
+        pdt = check_pdt(portfolio)
+
         print("=" * 55)
         print("  OPENCLAW WHEEL TRADER — SCAN")
         print("=" * 55)
         print(f"  Portfolio: ${portfolio:,.2f}  Cash: ${cash:,.2f}")
+        if pdt.get("warning"):
+            print(f"  ⚠️  {pdt['warning']}")
+        else:
+            print(f"  PDT: {pdt['day_trades_used']}/3 day trades used")
         print(f"  Phase {phase}: ", end="")
 
         if phase == 1:
@@ -318,6 +326,45 @@ def cmd_chaos():
         print("  ⚠️  Some tests failed — investigate before going live.")
 
 
+def cmd_hermes(dry_run: bool = False, lookback: int = 14):
+    """Run the Hermes self-optimization agent."""
+    from agents.hermes_optimizer import run_optimization, print_optimization_report
+
+    print("🔮 HERMES SELF-OPTIMIZATION AGENT")
+    print("=" * 55)
+
+    if dry_run:
+        print("  Mode: DRY RUN (analysis only, no parameter changes)\n")
+    else:
+        print("  Mode: LIVE (will adjust parameters if needed)\n")
+
+    report = run_optimization(lookback_days=lookback, dry_run=dry_run)
+    print_optimization_report(report)
+
+
+def cmd_pdt():
+    """Check Pattern Day Trader status."""
+    from lib.pdt_guard import check_pdt
+    from lib.alpaca_client import AlpacaClient
+
+    client = AlpacaClient()
+    account = client.get_account()
+    portfolio = account["portfolio_value"]
+
+    status = check_pdt(portfolio)
+    print("📋 PDT STATUS")
+    print("=" * 40)
+    print(f"  Portfolio: ${portfolio:,.2f}")
+    print(f"  Day trades used (5d): {status['day_trades_used']}")
+    print(f"  Day trades remaining: {status['day_trades_remaining']}")
+
+    if status["warning"]:
+        print(f"\n  ⚠️  {status['warning']}")
+    else:
+        print(f"\n  ✅ No PDT concerns.")
+    print()
+
+
 def cmd_migrate():
     """Print the paper→live migration checklist."""
     print("📋 PAPER → LIVE MIGRATION CHECKLIST")
@@ -347,12 +394,15 @@ def cmd_migrate():
 def main():
     parser = argparse.ArgumentParser(description="OpenClaw Wheel Strategy Trader")
     parser.add_argument("command",
-                        choices=["scan", "monitor", "backtest", "kill", "status", "chaos", "migrate", "dashboard"],
+                        choices=["scan", "monitor", "backtest", "kill", "status",
+                                 "chaos", "migrate", "dashboard", "hermes", "pdt"],
                         help="Command to run")
     parser.add_argument("--ticker", default="SPY", help="Ticker for backtest")
     parser.add_argument("--reason", default="manual_cli", help="Reason for kill switch")
     parser.add_argument("--port", type=int, default=5050, help="Dashboard web server port")
     parser.add_argument("--full", action="store_true", help="Include quant scores in status output")
+    parser.add_argument("--dry-run", action="store_true", help="Hermes: analyze only, don't change params")
+    parser.add_argument("--lookback", type=int, default=14, help="Hermes: days of trade history to analyze")
 
     args = parser.parse_args()
 
@@ -377,6 +427,10 @@ def main():
         cmd_migrate()
     elif args.command == "dashboard":
         cmd_dashboard(args.port)
+    elif args.command == "hermes":
+        cmd_hermes(dry_run=args.dry_run, lookback=args.lookback)
+    elif args.command == "pdt":
+        cmd_pdt()
 
 
 if __name__ == "__main__":

@@ -26,9 +26,11 @@ from lib.iv_rank import calculate_historical_volatility
 from lib.memory_palace import diary_write, remember_trade_decision, get_current_regime
 from lib.circuit_breaker import check_paper_mode, check_daily_loss, CircuitBreakerTripped
 from lib.quant_screener import screen_universe, print_screening_report
+from lib.momentum import analyze_momentum
 
 POSITIONS_PATH = Path(__file__).parent.parent / "data" / "positions.json"
 CONFIG_PATH = Path(__file__).parent.parent / "config" / "settings.yaml"
+STRATEGY_PATH = Path(__file__).parent.parent / "config" / "wheel_strategy.yaml"
 
 # Phase thresholds
 PHASE_2_THRESHOLD = 5000   # Start selling CSPs on cheap stocks
@@ -37,6 +39,11 @@ PHASE_3_THRESHOLD = 10000  # Full Wheel on bigger tickers
 
 def _load_settings() -> dict:
     with open(CONFIG_PATH) as f:
+        return yaml.safe_load(f)
+
+
+def _load_strategy() -> dict:
+    with open(STRATEGY_PATH) as f:
         return yaml.safe_load(f)
 
 
@@ -70,21 +77,34 @@ def score_stock_buy(
     max_position_value: float,
 ) -> dict | None:
     """
-    Score a stock as a buy candidate using the same framework
-    as the options screener (trend + level + signal = 0-9).
+    Score a stock as a buy candidate using trend + level + signal + momentum.
 
-    Returns scored candidate dict or None if it doesn't pass.
+    Composite score 0-13:
+      - Trend alignment (0-3)
+      - Support level quality (0-3)
+      - Candlestick signal (0-3)
+      - Momentum (0-4): RSI, MACD, volume surge, ROC
+
+    Parameters are read from wheel_strategy.yaml so Hermes can tune them.
     """
-    if len(daily_df) < 50 or len(weekly_df) < 20:
+    if len(daily_df) < 30 or len(weekly_df) < 10:
         return None
+
+    strategy = _load_strategy()
+    stock_cfg = strategy.get("stock_params", {})
+    min_score = stock_cfg.get("min_composite_score", 3)
+    stop_loss_pct = stock_cfg.get("stop_loss_pct", 0.05)
+    default_target_pct = stock_cfg.get("default_target_pct", 0.10)
+    allow_momentum_only = stock_cfg.get("allow_momentum_only", False)
+    support_distance_tiers = stock_cfg.get("support_distance_tiers", [0.03, 0.05, 0.08])
 
     # --- Trend Score (0-3) ---
     mtf = multi_timeframe_analysis(weekly_df, daily_df)
     trend_score = mtf["alignment_score"]
 
     weekly_trend = mtf["weekly"]
-    # Don't buy into strong downtrends
-    if weekly_trend.direction == "downtrend" and weekly_trend.strength >= 2:
+    # Don't buy into strong downtrends (strength 3 = confirmed)
+    if weekly_trend.direction == "downtrend" and weekly_trend.strength >= 3:
         return None
 
     # --- Level Score (0-3) ---
@@ -97,11 +117,12 @@ def score_stock_buy(
 
     if nearest_support:
         distance_to_zone = abs(current_price - nearest_support.level) / nearest_support.level
-        if distance_to_zone < 0.03:  # Within 3% of support
+        tiers = support_distance_tiers
+        if distance_to_zone < tiers[0]:
             level_score = 3
-        elif distance_to_zone < 0.05:
+        elif distance_to_zone < tiers[1]:
             level_score = 2
-        elif distance_to_zone < 0.08:
+        elif distance_to_zone < tiers[2]:
             level_score = 1
 
         zone_level = nearest_support.level
@@ -120,17 +141,33 @@ def score_stock_buy(
         signal_score = signal.strength
         pattern_name = signal.pattern
 
-    # --- Composite ---
-    composite = trend_score + level_score + signal_score
+    # --- Momentum Score (0-4) ---
+    momentum = analyze_momentum(daily_df)
+    momentum_score = momentum.momentum_score if momentum else 0
+    momentum_details = {}
+    if momentum:
+        momentum_details = {
+            "rsi": momentum.rsi,
+            "rsi_signal": momentum.rsi_signal,
+            "macd_cross": momentum.macd_cross,
+            "volume_surge": momentum.volume_surge,
+            "roc_5d": momentum.roc_5d,
+        }
 
-    # Phase 1 stocks: more permissive than options
-    # Require a candlestick signal (signal_score >= 1) and not strong downtrend
-    # Allow ranging markets — stocks are less risky than selling puts into chop
-    # Minimum score 3 (must have at least a signal + one other factor)
-    min_score = 3
+    # --- Composite ---
+    composite = trend_score + level_score + signal_score + momentum_score
+
+    # Entry logic — more permissive in growth mode
     not_downtrend = weekly_trend.direction != "downtrend"
     has_signal = signal_score >= 1
-    tradeable = composite >= min_score and not_downtrend and has_signal
+    has_momentum = momentum_score >= 2
+
+    if allow_momentum_only:
+        # Growth mode: momentum alone (score >= 2) can trigger entry
+        tradeable = composite >= min_score and not_downtrend and (has_signal or has_momentum)
+    else:
+        # Conservative: require candlestick signal
+        tradeable = composite >= min_score and not_downtrend and has_signal
 
     # Calculate position size
     shares = calculate_position_size(current_price, max_position_value)
@@ -139,7 +176,13 @@ def score_stock_buy(
 
     # Nearest resistance for profit target
     nearest_resistance = get_nearest_resistance(zones, current_price)
-    target_price = nearest_resistance.level if nearest_resistance else current_price * 1.10
+    target_price = nearest_resistance.level if nearest_resistance else current_price * (1 + default_target_pct)
+
+    # Dynamic stop: tighter when momentum is strong, wider when weak
+    if momentum_score >= 3:
+        actual_stop_pct = stop_loss_pct * 0.8  # Tighter stop, trust the momentum
+    else:
+        actual_stop_pct = stop_loss_pct
 
     return {
         "ticker": ticker,
@@ -150,12 +193,14 @@ def score_stock_buy(
         "trend_score": trend_score,
         "level_score": level_score,
         "signal_score": signal_score,
+        "momentum_score": momentum_score,
         "composite_score": composite,
         "zone_level": zone_level,
         "zone_touches": zone_touches,
         "pattern": pattern_name,
+        "momentum": momentum_details,
         "target_price": round(target_price, 2),
-        "stop_loss": round(current_price * 0.95, 2),  # 5% stop loss
+        "stop_loss": round(current_price * (1 - actual_stop_pct), 2),
         "tradeable": tradeable,
         "weekly_trend": weekly_trend.direction,
     }
@@ -185,18 +230,20 @@ def scan_for_stocks(
     """
     Scan tickers for stock buy candidates.
 
-    Two-gate system:
+    Three-gate system:
       Gate 1: Quantitative screen (Sharpe, drawdown, volatility)
       Gate 2: Technical screen (trend + zones + candlestick signals)
+      Gate 3: Momentum screen (RSI, MACD, volume, ROC)
 
     Returns ranked list of tradeable candidates.
     """
     settings = _load_settings()
+    strategy = _load_strategy()
     max_position_pct = settings["circuit_breakers"]["max_position_pct"]
     max_position_value = portfolio_value * max_position_pct
+    max_concurrent = strategy.get("stock_params", {}).get("max_concurrent_positions", 5)
 
     # Gate 1: Quantitative screening
-    # max_price: we can buy at least 1 share with our position budget
     quant_scores = screen_universe(
         daily_data,
         max_price=max_position_value,
@@ -208,26 +255,34 @@ def scan_for_stocks(
 
     quant_passed = {s.ticker for s in quant_scores if s.verdict != "AVOID"}
 
-    # Check existing positions to avoid doubling up
+    # Check existing positions — respect max concurrent
     positions = _load_positions()
     held_tickers = set(
         p["ticker"] for p in positions
         if p.get("status") in ("open", "assigned") and p.get("type") == "stock"
     )
+    open_count = len(held_tickers)
 
-    # Gate 2: Technical screening (only on quant-passed tickers)
+    if open_count >= max_concurrent:
+        log_event("stock_engine", "max_positions_reached", {"open": open_count, "max": max_concurrent})
+        print(f"  Max concurrent positions reached ({open_count}/{max_concurrent})")
+        return []
+
+    slots_available = max_concurrent - open_count
+
+    # Gate 2+3: Technical + Momentum screening (only on quant-passed tickers)
     candidates = []
     for ticker in quant_passed:
         if ticker in held_tickers:
             continue
 
         daily_df = daily_data.get(ticker)
-        if daily_df is None or len(daily_df) < 50:
+        if daily_df is None or len(daily_df) < 30:
             continue
 
         current_price = daily_df["close"].iloc[-1]
         weekly_df = weekly_data.get(ticker)
-        if weekly_df is None or len(weekly_df) < 20:
+        if weekly_df is None or len(weekly_df) < 10:
             continue
 
         candidate = score_stock_buy(
@@ -242,15 +297,19 @@ def scan_for_stocks(
                 candidate["max_drawdown"] = qs.max_drawdown
             candidates.append(candidate)
 
-    # Sort by: quant_score first, then composite technical score
+    # Sort by: composite score (includes momentum), then quant score
     candidates.sort(
-        key=lambda c: (c.get("quant_score", 0), c["composite_score"]),
+        key=lambda c: (c["composite_score"], c.get("quant_score", 0)),
         reverse=True,
     )
+
+    # Limit to available slots
+    candidates = candidates[:slots_available]
 
     log_event("stock_engine", "scan_complete", {
         "quant_passed": len(quant_passed),
         "technical_passed": len(candidates),
+        "slots_available": slots_available,
         "top": candidates[0]["ticker"] if candidates else "none",
     })
 
@@ -375,7 +434,9 @@ def check_stock_exits(
     Check open stock positions for exit signals:
     - Hit target price (take profit at resistance)
     - Hit stop loss (cut losses)
+    - Trailing stop (lock in profits as price rises)
     - Bearish reversal signal at resistance
+    - Momentum death (MACD bearish cross + RSI overbought)
     """
     positions = _load_positions()
     stock_positions = [p for p in positions if p.get("type") == "stock" and p.get("status") == "open"]
@@ -383,8 +444,13 @@ def check_stock_exits(
     if not stock_positions:
         return []
 
+    strategy = _load_strategy()
+    stock_cfg = strategy.get("stock_params", {})
+    trailing_stop_pct = stock_cfg.get("trailing_stop_pct", 0.0)
+
     broker_positions = client.get_positions()
     broker_map = {p["symbol"]: p for p in broker_positions}
+    positions_changed = False
 
     exits = []
     for pos in stock_positions:
@@ -399,6 +465,14 @@ def check_stock_exits(
         current_price = float(bp["current_price"])
         entry_price = pos.get("entry_price", 0)
         pnl_pct = (current_price - entry_price) / entry_price if entry_price > 0 else 0
+
+        # Trailing stop: ratchet stop up as price rises
+        if trailing_stop_pct > 0 and current_price > entry_price:
+            trailing_stop = current_price * (1 - trailing_stop_pct)
+            if trailing_stop > stop:
+                pos["stop_loss"] = round(trailing_stop, 2)
+                stop = pos["stop_loss"]
+                positions_changed = True
 
         exit_signal = None
 
@@ -420,15 +494,27 @@ def check_stock_exits(
                 "pnl_pct": pnl_pct,
             }
 
+        # Momentum death: bearish MACD cross + RSI overbought
+        elif ticker in daily_data and pnl_pct > 0.02:
+            df = daily_data[ticker]
+            mom = analyze_momentum(df)
+            if mom and mom.macd_cross == "bearish_cross" and mom.rsi > 70:
+                exit_signal = {
+                    "ticker": ticker,
+                    "action": "momentum_exit",
+                    "reason": f"Momentum death: bearish MACD cross + RSI {mom.rsi:.0f}",
+                    "pnl_pct": pnl_pct,
+                }
+
         # Bearish reversal at resistance
-        elif ticker in daily_data:
+        if exit_signal is None and ticker in daily_data:
             df = daily_data[ticker]
             bearish_signal = get_latest_signal(df, "bearish", [
                 "shooting_star", "bearish_engulfing", "evening_star",
                 "gravestone_doji", "bearish_harami",
             ])
-            zones = detect_zones(df, current_price)
-            resistance = get_nearest_resistance(zones, entry_price)
+            zones_list = detect_zones(df, current_price)
+            resistance = get_nearest_resistance(zones_list, entry_price)
 
             if bearish_signal and resistance and abs(current_price - resistance.level) / resistance.level < 0.03:
                 exit_signal = {
@@ -441,6 +527,10 @@ def check_stock_exits(
         if exit_signal:
             exits.append(exit_signal)
             log_event("stock_engine", "exit_signal", exit_signal)
+
+    # Save trailing stop updates
+    if positions_changed:
+        _save_positions(positions)
 
     return exits
 
@@ -509,17 +599,20 @@ def run_stock_scan_and_execute(
     daily_data: dict[str, pd.DataFrame],
     weekly_data: dict[str, pd.DataFrame],
     portfolio_value: float,
-    max_trades: int = 2,
+    max_trades: int = 3,
 ) -> list[dict]:
     """
     Full stock trading pipeline: scan → score → execute.
     Also checks existing positions for exit signals.
     """
-    log_event("stock_engine", "pipeline_started", {"portfolio": portfolio_value})
+    strategy = _load_strategy()
+    max_trades = strategy.get("stock_params", {}).get("max_trades_per_scan", max_trades)
+
+    log_event("stock_engine", "pipeline_started", {"portfolio": portfolio_value, "max_trades": max_trades})
 
     results = []
 
-    # Check exits first
+    # Check exits first — free up capital for new trades
     exits = check_stock_exits(client, daily_data)
     for exit_signal in exits:
         ticker = exit_signal["ticker"]
@@ -534,6 +627,17 @@ def run_stock_scan_and_execute(
     if not candidates:
         log_event("stock_engine", "no_candidates", {})
         return results
+
+    # Print momentum details for top candidates
+    for c in candidates[:5]:
+        mom = c.get("momentum", {})
+        mom_str = ""
+        if mom:
+            mom_str = (f" RSI:{mom.get('rsi', '-')} MACD:{mom.get('macd_cross', '-')} "
+                      f"Vol:{mom.get('volume_surge', '-')}x ROC5d:{mom.get('roc_5d', 0):+.1%}")
+        print(f"  📊 {c['ticker']:5s} score={c['composite_score']}/13 "
+              f"(T:{c['trend_score']} L:{c['level_score']} S:{c['signal_score']} M:{c['momentum_score']})"
+              f"{mom_str}")
 
     # Execute top candidates
     executed = 0

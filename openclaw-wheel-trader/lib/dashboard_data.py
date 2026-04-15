@@ -22,7 +22,7 @@ STRATEGY_PATH = Path(__file__).parent.parent / "config" / "wheel_strategy.yaml"
 
 # Quant score cache (expensive to compute)
 _quant_cache = {"data": None, "timestamp": 0}
-QUANT_CACHE_TTL = 300  # 5 minutes
+QUANT_CACHE_TTL = 900  # 15 minutes (fetching 17 tickers x 252 days is slow)
 
 
 def _get_client() -> AlpacaClient:

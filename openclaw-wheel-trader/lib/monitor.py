@@ -355,6 +355,23 @@ def run_monitoring_check(client: AlpacaClient) -> dict:
             )
             send_alert(daily_summary)
 
+        # Hermes self-optimization (run after close — 4:10 PM ET)
+        if now.hour == 20 and 10 <= now.minute <= 15:
+            try:
+                hermes_cfg = settings.get("hermes", {})
+                if hermes_cfg.get("enabled") and hermes_cfg.get("run_after_close"):
+                    from agents.hermes_optimizer import run_optimization
+                    lookback = hermes_cfg.get("lookback_days", 14)
+                    min_trades = hermes_cfg.get("min_trades_to_optimize", 3)
+                    report = run_optimization(lookback_days=lookback)
+                    changes = report.get("changes", {})
+                    if changes:
+                        change_str = ", ".join(f"{k}: {v['old']}→{v['new']}" for k, v in changes.items())
+                        send_alert(f"🔮 Hermes optimized: {change_str}")
+                        summary["alerts"].append(f"Hermes: {len(changes)} params adjusted")
+            except Exception as e:
+                log_event("monitor", "hermes_failed", {"error": str(e)})
+
     except Exception as e:
         log_event("monitor", "check_failed", {"error": str(e)}, result="failed")
         summary["error"] = str(e)
