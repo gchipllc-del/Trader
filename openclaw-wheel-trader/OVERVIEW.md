@@ -24,7 +24,7 @@ Currently 17 stocks across tech, fintech, travel, commodities, and EV sectors. E
 - 4 market scans per day (8:33, 10:15, 12:30, 1:45 CT)
 - Position monitoring every 3 minutes (stops, targets, exit signals)
 - Hermes self-optimization after market close (reviews trades, adjusts parameters)
-- Web dashboard at localhost:5050
+- Web dashboard at localhost:5051 (polybot uses 5050)
 
 ## Tech Stack
 Python 3.11, Alpaca REST API, Flask, SQLite, ChromaDB, pandas, numpy, Rich, Chart.js

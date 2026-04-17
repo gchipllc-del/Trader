@@ -237,7 +237,7 @@ Persistent memory system across sessions. Three storage layers:
 ## Dashboard
 
 ### Web Dashboard
-Dark trading terminal UI at `http://localhost:5050` with:
+Dark trading terminal UI at `http://localhost:5051` with:
 - Real-time portfolio value and P/L
 - Positions table with entry, current, target, stop, score
 - Quant scores table for full universe

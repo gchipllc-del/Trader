@@ -1,5 +1,9 @@
 """
-Web Dashboard Server — Flask API + HTML dashboard at localhost:5050.
+Web Dashboard Server — Flask API + HTML dashboard at localhost:5051.
+
+Default port is 5051 so it does NOT collide with the sibling polybot project
+(which defaults to 5050). If both defaulted to 5050, starting one would
+silently steal the port from the other.
 
 Usage:
   python main.py dashboard
@@ -61,6 +65,31 @@ def api_breakers():
     return jsonify(get_circuit_breaker_status())
 
 
-def run_dashboard(port: int = 5050):
-    """Start the dashboard web server."""
+def run_dashboard(port: int = 5051):
+    """Start the dashboard web server.
+
+    Fails fast with a helpful message if the port is already bound (e.g. polybot
+    on 5050, or a stale traderbot dashboard on 5051), so the two projects can't
+    silently step on each other.
+    """
+    import errno
+    import socket
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+    try:
+        probe.bind(("127.0.0.1", port))
+    except OSError as exc:
+        if exc.errno in (errno.EADDRINUSE, errno.EACCES):
+            print(f"ERROR: Port {port} is already in use on 127.0.0.1.")
+            print(f"       Another dashboard may already be running "
+                  f"(polybot uses 5050, traderbot uses 5051).")
+            print(f"       Check with:  lsof -i :{port}")
+            print(f"       Or pick a different port:  python main.py dashboard --port <N>")
+            raise SystemExit(2)
+        raise
+    finally:
+        probe.close()
+
+    print(f"Traderbot Dashboard: http://localhost:{port}")
     app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
