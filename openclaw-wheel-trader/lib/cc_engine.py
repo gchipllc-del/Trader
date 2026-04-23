@@ -24,6 +24,7 @@ from lib.memory_palace import (
     remember_trade_decision, diary_write, kg_add, kg_invalidate, kg_query,
 )
 from lib.alpaca_client import AlpacaClient
+from lib.earnings_filter import earnings_veto
 
 POSITIONS_PATH = Path(__file__).parent.parent / "data" / "positions.json"
 TRADE_HISTORY_PATH = Path(__file__).parent.parent / "data" / "trade_history.json"
@@ -97,6 +98,14 @@ def scan_for_ccs(
                 config=config,
             )
             if candidate:
+                # CLAUDE.md rule: never sell options expiring through an earnings date
+                if earnings_veto(ticker, candidate.expiration):
+                    log_event("cc_engine", "skip_earnings", {
+                        "ticker": ticker,
+                        "strike": candidate.strike,
+                        "expiration": candidate.expiration,
+                    })
+                    continue
                 candidates.append(candidate)
 
     return rank_candidates(candidates)
@@ -124,6 +133,16 @@ def execute_cc(
 ) -> dict | None:
     """Execute a covered call through the order gate."""
     ticker = candidate.ticker
+
+    # Defense-in-depth: re-check earnings at execute time (handles stale scan cache,
+    # last-minute earnings schedule changes, etc). CLAUDE.md: never sell through earnings.
+    if earnings_veto(ticker, candidate.expiration):
+        log_event("cc_engine", "skip_earnings_at_execute", {
+            "ticker": ticker, "strike": candidate.strike, "expiration": candidate.expiration,
+        })
+        diary_write("strategy_agent",
+            f"{ticker}|CC_SKIP|earnings|exp_{candidate.expiration}")
+        return None
 
     # Check dividend conflict
     if check_dividend_conflict(ticker, candidate.expiration):
