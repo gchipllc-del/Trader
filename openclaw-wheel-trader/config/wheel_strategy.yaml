@@ -173,6 +173,19 @@ bayesian:
   min_win_prob: 0.58               # Veto if aggregated win probability < 58%
   base_rate: 0.55                  # Prior for bullish zone + trend setups
 
+# --- Earnings Proximity (Gate 6.5) ---
+# Stock swings carry binary event risk through earnings reports. CLAUDE.md
+# hard-vetoes options through earnings; stock buys use a softer two-tier:
+#   - Hard veto if earnings within hard_veto_days (binary event too close)
+#   - Soft downsize if earnings within soft_warn_days (volatility haircut
+#     applied via Kelly sizing, so winners still get in but smaller)
+# Fails open (no block, no penalty) when Finnhub unavailable.
+earnings_proximity:
+  enabled: true
+  hard_veto_days: 2                # Skip entirely if earnings in ≤2 calendar days
+  soft_warn_days: 14               # Downsize if earnings within 14 days
+  soft_penalty: 0.5                # 0.5 = cut position size in half
+
 # --- Correlation Detection (Gate 7) ---
 # Prevents loading up on correlated stocks (e.g., F + NIO both EV-adjacent).
 # Soft veto: reduces Kelly position size by 50% on correlated adds.
@@ -235,3 +248,9 @@ llm:
   max_tokens: 1000                 # Response cap
   cache_ttl_minutes: 60            # Cache analyses for 1 hour per ticker+setup
   trigger_composite_score: 8       # Invoke on 8/13+ setups (DeepSeek is cheap, cast a wider net)
+  # --- Consensus integration (CSP/CC trades) ---
+  # Runs after strategy/risk/compliance approve. Default is ADVISORY ONLY (logged
+  # but not blocking). Flip consensus_veto_enabled to make the LLM a 4th hard vote.
+  consensus_enabled: true          # Run LLM on every approved CSP/CC candidate
+  consensus_veto_enabled: false    # false = advisory only; true = can block trades
+  consensus_veto_confidence: 0.7   # Only veto if LLM says "skip" with confidence ≥ this

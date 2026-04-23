@@ -5,13 +5,19 @@ Trade proceeds ONLY if:
   1. Strategy Agent PROPOSES
   2. Risk Agent APPROVES (does not VETO)
   3. Compliance Agent APPROVES (no regulatory issues)
+  4. LLM Analyst ADVISES (advisory by default; configurable veto)
 
-Unanimous consent required. Any single agent can block a trade.
-The execution layer is behind all three gates — no agent can
-directly call the broker.
+Unanimous consent required from the 3 governance agents. The LLM analyst
+is an advisory 4th voice — logged on every decision; it only blocks when
+`llm.consensus_veto_enabled: true` AND it returns "skip" with high confidence.
+
+The execution layer is behind all gates — no agent can directly call the broker.
 """
 
+from pathlib import Path
 from datetime import datetime, timezone
+
+import yaml
 
 from agents.strategy_agent import StrategyAgent
 from agents.risk_agent import RiskAgent
@@ -24,6 +30,91 @@ from lib.screener import WheelCandidate
 strategy = StrategyAgent()
 risk = RiskAgent()
 compliance = ComplianceAgent()
+
+STRATEGY_PATH = Path(__file__).parent.parent / "config" / "wheel_strategy.yaml"
+
+
+def _load_llm_config() -> dict:
+    try:
+        with open(STRATEGY_PATH) as f:
+            return (yaml.safe_load(f) or {}).get("llm", {}) or {}
+    except Exception:
+        return {}
+
+
+def _llm_advisory_vote(
+    candidate: WheelCandidate,
+    cost_basis: float | None,
+) -> dict:
+    """Call LLM analyst for a 4th-voice vote. Never raises — always returns a dict.
+
+    Returns:
+        {
+            "ran": bool,              # did we actually query the LLM
+            "action": str,            # "sell"|"wait"|"skip"|"skipped"
+            "win_probability": float | None,
+            "confidence": float | None,
+            "reasoning": str,
+            "veto": bool,             # should we block? (only true if config enables + skip + high conf)
+            "provider": str | None,
+            "model": str | None,
+        }
+    """
+    cfg = _load_llm_config()
+    if not cfg.get("enabled", False) or not cfg.get("consensus_enabled", False):
+        return {"ran": False, "action": "skipped", "veto": False,
+                "win_probability": None, "confidence": None, "reasoning": "llm_consensus_disabled",
+                "provider": None, "model": None}
+
+    try:
+        from lib.llm_analyst import analyze_option_setup
+        analysis = analyze_option_setup(
+            ticker=candidate.ticker,
+            trade_type=candidate.trade_type,
+            strike=candidate.strike,
+            premium=candidate.premium,
+            delta=candidate.delta,
+            dte=candidate.dte,
+            composite_score=candidate.composite_score,
+            zone_level=candidate.zone_level,
+            zone_touches=candidate.zone_touches,
+            iv_rank=candidate.iv_rank,
+            annualized_return=candidate.annualized_return,
+            candlestick_pattern=candidate.candlestick_pattern,
+            cost_basis=cost_basis,
+        )
+    except Exception as e:
+        log_event("consensus", "llm_error", {"ticker": candidate.ticker, "error": str(e)[:200]})
+        return {"ran": False, "action": "error", "veto": False,
+                "win_probability": None, "confidence": None, "reasoning": str(e)[:200],
+                "provider": None, "model": None}
+
+    if analysis is None:
+        return {"ran": False, "action": "unavailable", "veto": False,
+                "win_probability": None, "confidence": None, "reasoning": "llm_unavailable_or_parse_fail",
+                "provider": None, "model": None}
+
+    # Veto logic: only block if explicitly enabled AND skip suggested AND confident
+    veto_threshold = float(cfg.get("consensus_veto_confidence", 0.7))
+    veto_enabled = bool(cfg.get("consensus_veto_enabled", False))
+    veto = (
+        veto_enabled
+        and analysis.suggested_action == "skip"
+        and analysis.confidence >= veto_threshold
+    )
+
+    return {
+        "ran": True,
+        "action": analysis.suggested_action,
+        "win_probability": analysis.win_probability,
+        "confidence": analysis.confidence,
+        "reasoning": analysis.reasoning,
+        "bullish_factors": analysis.bullish_factors,
+        "bearish_factors": analysis.bearish_factors,
+        "veto": veto,
+        "provider": analysis.provider,
+        "model": analysis.model,
+    }
 
 
 def seek_consensus(
@@ -98,6 +189,38 @@ def seek_consensus(
             "reason": compliance_review["reason"],
         }
 
+    # Step 4: LLM advisory vote (non-blocking unless config explicitly enables veto)
+    llm_review = _llm_advisory_vote(candidate, cost_basis)
+    if llm_review.get("ran"):
+        log_event("consensus", "llm_advisory", {
+            "ticker": candidate.ticker,
+            "action": llm_review["action"],
+            "win_prob": llm_review["win_probability"],
+            "confidence": llm_review["confidence"],
+            "veto": llm_review["veto"],
+        })
+        diary_write("llm_analyst",
+            f"{candidate.ticker}|{candidate.trade_type.upper()}_{llm_review['action'].upper()}|"
+            f"win_{llm_review['win_probability']:.0%}|conf_{llm_review['confidence']:.2f}|"
+            f"{(llm_review.get('reasoning') or '')[:80]}")
+
+    if llm_review.get("veto"):
+        log_event("consensus", "vetoed_by_llm", {
+            "ticker": candidate.ticker,
+            "reason": llm_review.get("reasoning", "")[:200],
+        })
+        return {
+            "approved": False,
+            "proposal": proposal,
+            "risk_review": risk_review,
+            "compliance_review": compliance_review,
+            "llm_review": llm_review,
+            "decision": "VETOED",
+            "blocking_agent": "llm_analyst",
+            "reason": f"LLM skip w/ confidence {llm_review['confidence']:.2f}: "
+                      f"{llm_review.get('reasoning', '')[:160]}",
+        }
+
     # UNANIMOUS CONSENT — proceed
     log_event("consensus", "approved", {
         "ticker": candidate.ticker,
@@ -114,6 +237,7 @@ def seek_consensus(
         "proposal": proposal,
         "risk_review": risk_review,
         "compliance_review": compliance_review,
+        "llm_review": llm_review,
         "decision": "EXECUTE",
         "blocking_agent": None,
     }

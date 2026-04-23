@@ -337,6 +337,61 @@ def get_basic_financials(ticker: str) -> dict | None:
     }
 
 
+@dataclass
+class DividendEvent:
+    ticker: str
+    ex_date: str            # ISO date "YYYY-MM-DD" — the critical one for CC risk
+    pay_date: str           # ISO date
+    amount: float           # Cash dividend per share
+    currency: str
+
+
+def get_dividend_calendar(ticker: str, days_ahead: int = 60) -> list[DividendEvent]:
+    """Return upcoming ex-dividend events for a ticker within `days_ahead` days.
+
+    This is the key input for CC risk: ITM calls get early-exercised the day
+    before ex-date to capture the dividend, so CC expirations past an ex-date
+    need extra care (or a hard skip for conservative operators).
+    """
+    today = datetime.now(timezone.utc).date()
+    end = today + timedelta(days=days_ahead)
+    data = _get(
+        "/stock/dividend",
+        {"symbol": ticker, "from": today.isoformat(), "to": end.isoformat()},
+        ttl_seconds=6 * 3600,
+    )
+    if not data or not isinstance(data, list):
+        return []
+
+    events = []
+    for d in data:
+        try:
+            ex_date = str(d.get("date", ""))  # Finnhub uses "date" for ex-date
+            if not ex_date:
+                continue
+            events.append(DividendEvent(
+                ticker=str(d.get("symbol", ticker)).upper(),
+                ex_date=ex_date,
+                pay_date=str(d.get("payDate", "")),
+                amount=_safe_float(d.get("amount")) or 0.0,
+                currency=str(d.get("currency", "USD")),
+            ))
+        except Exception:
+            continue
+    events.sort(key=lambda x: x.ex_date)
+    return events
+
+
+def next_ex_dividend_date(ticker: str, days_ahead: int = 60) -> str | None:
+    """ISO date of next ex-dividend event, or None if unknown / none scheduled."""
+    events = get_dividend_calendar(ticker, days_ahead=days_ahead)
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    for e in events:
+        if e.ex_date >= today_iso:
+            return e.ex_date
+    return None
+
+
 def get_insider_trades(ticker: str, days_back: int = 90) -> list[dict]:
     """Recent insider buy/sell transactions."""
     today = datetime.now(timezone.utc).date()

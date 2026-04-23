@@ -319,6 +319,12 @@ def scan_for_stocks(
     if bayes_cfg.get("enabled", True):
         candidates = _apply_bayesian_gate(candidates, bayes_cfg)
 
+    # Gate 6.5: Earnings proximity — hard veto if too close, soft penalty if within window.
+    # Options get absolute veto (CLAUDE.md); stock swings take binary-event haircut instead.
+    earnings_cfg = strategy.get("earnings_proximity", {})
+    if earnings_cfg.get("enabled", True):
+        candidates = _apply_earnings_proximity_gate(candidates, earnings_cfg)
+
     # Gate 7: Correlation check — avoid loading up on correlated stocks
     corr_cfg = strategy.get("correlation", {})
     if corr_cfg.get("enabled", True):
@@ -524,6 +530,71 @@ def _apply_bayesian_gate(candidates: list[dict], bayes_cfg: dict) -> list[dict]:
     return filtered
 
 
+def _apply_earnings_proximity_gate(candidates: list[dict], earnings_cfg: dict) -> list[dict]:
+    """
+    Gate 6.5: Earnings proximity filter for stock swings.
+
+    Stock swings carry binary risk through earnings reports. Unlike options
+    (which get an absolute veto per CLAUDE.md), stock buys use a two-tier model:
+      - Hard veto if earnings within hard_veto_days (too close to manage)
+      - Soft penalty if earnings within soft_warn_days (downsize via Kelly)
+
+    Fails open when Finnhub unavailable — no data = no block, no penalty.
+    Sets candidate["earnings_penalty"] which Kelly multiplies into sizing.
+    """
+    hard_veto_days = earnings_cfg.get("hard_veto_days", 2)
+    soft_warn_days = earnings_cfg.get("soft_warn_days", 14)
+    soft_penalty = earnings_cfg.get("soft_penalty", 0.5)
+
+    filtered = []
+    for candidate in candidates:
+        ticker = candidate["ticker"]
+        try:
+            from lib.earnings_filter import days_to_next_earnings
+            days = days_to_next_earnings(ticker, lookahead_days=max(soft_warn_days, 60))
+
+            if days is None:
+                # No data — fail open (no block, no penalty)
+                candidate["earnings_days"] = None
+                candidate["earnings_penalty"] = 1.0
+                filtered.append(candidate)
+                continue
+
+            candidate["earnings_days"] = days
+
+            if days <= hard_veto_days:
+                print(f"  📅 {ticker}: Earnings VETO — {days}d away (≤ {hard_veto_days}d cutoff)")
+                log_event("stock_engine", "earnings_veto", {
+                    "ticker": ticker, "days_until_earnings": days,
+                })
+                continue
+
+            if days <= soft_warn_days:
+                candidate["earnings_penalty"] = soft_penalty
+                print(f"  📅 {ticker}: Earnings in {days}d — sizing down to "
+                      f"{int(soft_penalty * 100)}%")
+                log_event("stock_engine", "earnings_soft_penalty", {
+                    "ticker": ticker,
+                    "days_until_earnings": days,
+                    "penalty": soft_penalty,
+                })
+            else:
+                candidate["earnings_penalty"] = 1.0
+
+            filtered.append(candidate)
+
+        except Exception as e:
+            # Anything goes wrong — fail open
+            candidate["earnings_days"] = None
+            candidate["earnings_penalty"] = 1.0
+            log_event("stock_engine", "earnings_proximity_error", {
+                "ticker": ticker, "error": str(e)[:200],
+            })
+            filtered.append(candidate)
+
+    return filtered
+
+
 def _apply_correlation_gate(
     candidates: list[dict],
     held_tickers: set,
@@ -617,8 +688,9 @@ def _apply_kelly_sizing(candidates: list[dict], portfolio_value: float, kelly_cf
                     strategy = _load_strategy()
                     max_pct = strategy.get("stock_params", {}).get("max_position_pct", 0.30)
                     pct = min(frac_k, max_pct)
-                    # Apply correlation penalty if flagged
+                    # Apply correlation + earnings penalties if flagged
                     pct *= candidate.get("correlation_penalty", 1.0)
+                    pct *= candidate.get("earnings_penalty", 1.0)
 
                     sizing["win_prob"] = round(bayesian_wp, 4)
                     sizing["fractional_kelly"] = round(frac_k, 4)

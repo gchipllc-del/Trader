@@ -108,45 +108,61 @@ class TestAudit:
 # ============================================================
 
 class TestCircuitBreakers:
+    # Explicit settings make these tests independent of config drift
+    # (Hermes growth mode raises real limits; tests check the mechanism).
+    STRICT_CB = {
+        "circuit_breakers": {
+            "max_daily_loss": -500,
+            "max_position_pct": 0.10,
+            "max_open_orders": 5,
+            "max_contracts_per_order": 3,
+            "cooldown_after_loss_minutes": 30,
+        }
+    }
+
     def test_daily_loss_passes(self):
-        assert check_daily_loss(-100) is True
+        assert check_daily_loss(-100, settings=self.STRICT_CB) is True
 
     def test_daily_loss_trips(self):
         with pytest.raises(CircuitBreakerTripped):
-            check_daily_loss(-600)
+            check_daily_loss(-600, settings=self.STRICT_CB)
 
     def test_position_size_passes(self):
-        assert check_position_size(5000, 100000) is True
+        assert check_position_size(5000, 100000, settings=self.STRICT_CB) is True
 
     def test_position_size_trips(self):
+        # 15% of portfolio exceeds STRICT_CB's 10% max
         with pytest.raises(CircuitBreakerTripped):
-            check_position_size(15000, 100000)
+            check_position_size(15000, 100000, settings=self.STRICT_CB)
 
     def test_open_orders_passes(self):
-        assert check_open_orders(3) is True
+        assert check_open_orders(3, settings=self.STRICT_CB) is True
 
     def test_open_orders_trips(self):
+        # 5 open orders meets STRICT_CB's 5 max (>=) so trips
         with pytest.raises(CircuitBreakerTripped):
-            check_open_orders(5)
+            check_open_orders(5, settings=self.STRICT_CB)
 
     def test_contracts_passes(self):
-        assert check_contracts_per_order(1) is True
+        assert check_contracts_per_order(1, settings=self.STRICT_CB) is True
 
     def test_contracts_trips(self):
+        # 5 contracts > STRICT_CB's 3 max
         with pytest.raises(CircuitBreakerTripped):
-            check_contracts_per_order(5)
+            check_contracts_per_order(5, settings=self.STRICT_CB)
 
     def test_cooldown_passes_no_loss(self):
-        assert check_cooldown(None) is True
+        assert check_cooldown(None, settings=self.STRICT_CB) is True
 
     def test_cooldown_passes_old_loss(self):
         old = datetime.now(timezone.utc) - timedelta(hours=1)
-        assert check_cooldown(old) is True
+        assert check_cooldown(old, settings=self.STRICT_CB) is True
 
     def test_cooldown_trips_recent_loss(self):
+        # 5 min < STRICT_CB's 30-min cooldown
         recent = datetime.now(timezone.utc) - timedelta(minutes=5)
         with pytest.raises(CircuitBreakerTripped):
-            check_cooldown(recent)
+            check_cooldown(recent, settings=self.STRICT_CB)
 
 
 # ============================================================

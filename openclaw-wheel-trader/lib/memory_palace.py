@@ -222,15 +222,16 @@ def _search_fallback(query: str, wing: str | None, n: int) -> list[dict]:
 # KNOWLEDGE GRAPH — Temporal entity-relationship triples
 # ============================================================
 
-_kg_initialized = False
-
-
 def _init_kg_db():
-    """Initialize the knowledge graph SQLite database (idempotent, runs schema once)."""
-    global _kg_initialized
+    """Initialize the knowledge graph SQLite database.
+
+    Uses IF NOT EXISTS so running it on every call is safe and cheap.
+    We don't cache an "initialized" flag because tests monkeypatch KG_DB
+    to temp dirs, and a stale flag would skip schema creation in the new DB.
+    """
     KG_DB.parent.mkdir(parents=True, exist_ok=True)
-    if not _kg_initialized:
-        conn = sqlite3.connect(str(KG_DB))
+    conn = sqlite3.connect(str(KG_DB))
+    try:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS triples (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -247,8 +248,8 @@ def _init_kg_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_object ON triples(object)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_predicate ON triples(predicate)")
         conn.commit()
+    finally:
         conn.close()
-        _kg_initialized = True
 
 
 def kg_add(subject: str, predicate: str, obj: str,

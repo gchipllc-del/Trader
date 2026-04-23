@@ -687,7 +687,6 @@ class TestMemPalace:
         monkeypatch.setattr(mp, "PALACE_DIR", tmp_path / "palace")
         monkeypatch.setattr(mp, "DIARY_DIR", tmp_path / "palace" / "diaries")
         monkeypatch.setattr(mp, "KG_DB", tmp_path / "palace" / "kg.db")
-        monkeypatch.setattr(mp, "_kg_initialized", False)
         monkeypatch.setattr(mp, "HAS_CHROMA", False)
 
         mp.init_palace()
@@ -700,7 +699,6 @@ class TestMemPalace:
         from lib import memory_palace as mp
 
         monkeypatch.setattr(mp, "KG_DB", tmp_path / "kg.db")
-        monkeypatch.setattr(mp, "_kg_initialized", False)
 
         mp.kg_add("AAPL", "entered_csp", "170P_2024-06-21")
         mp.kg_add("AAPL", "zone_support", "168.50")
@@ -712,7 +710,6 @@ class TestMemPalace:
         from lib import memory_palace as mp
 
         monkeypatch.setattr(mp, "KG_DB", tmp_path / "kg.db")
-        monkeypatch.setattr(mp, "_kg_initialized", False)
 
         mp.kg_add("AAPL", "entered_csp", "170P")
         mp.kg_invalidate("AAPL", "entered_csp", "170P")
@@ -727,7 +724,6 @@ class TestMemPalace:
         from lib import memory_palace as mp
 
         monkeypatch.setattr(mp, "KG_DB", tmp_path / "kg.db")
-        monkeypatch.setattr(mp, "_kg_initialized", False)
 
         mp.kg_add("AAPL", "entered_csp", "170P")
         mp.kg_add("AAPL", "assigned", "100_shares")
@@ -761,7 +757,6 @@ class TestMemPalace:
 
         monkeypatch.setattr(mp, "PALACE_DIR", tmp_path / "palace")
         monkeypatch.setattr(mp, "KG_DB", tmp_path / "palace" / "kg.db")
-        monkeypatch.setattr(mp, "_kg_initialized", False)
         monkeypatch.setattr(mp, "HAS_CHROMA", False)
 
         mp.init_palace()
@@ -782,7 +777,6 @@ class TestMemPalace:
         monkeypatch.setattr(mp, "PALACE_DIR", tmp_path / "palace")
         monkeypatch.setattr(mp, "KG_DB", tmp_path / "palace" / "kg.db")
         monkeypatch.setattr(mp, "DIARY_DIR", tmp_path / "palace" / "diaries")
-        monkeypatch.setattr(mp, "_kg_initialized", False)
         monkeypatch.setattr(mp, "HAS_CHROMA", False)
 
         mp.init_palace()
@@ -805,7 +799,6 @@ class TestMemPalace:
         monkeypatch.setattr(mp, "PALACE_DIR", tmp_path / "palace")
         monkeypatch.setattr(mp, "KG_DB", tmp_path / "palace" / "kg.db")
         monkeypatch.setattr(mp, "DIARY_DIR", tmp_path / "palace" / "diaries")
-        monkeypatch.setattr(mp, "_kg_initialized", False)
         monkeypatch.setattr(mp, "HAS_CHROMA", False)
 
         mp.init_palace()

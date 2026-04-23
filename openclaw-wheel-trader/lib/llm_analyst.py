@@ -470,6 +470,222 @@ def analyze_stock_setup(
     return analysis
 
 
+# ── Options Setup Analysis (CSP / CC) ────────────────────────────
+
+@dataclass
+class OptionAnalysis:
+    """Structured LLM assessment for a wheel option trade."""
+    ticker: str
+    trade_type: str              # "csp" | "cc"
+    win_probability: float       # Prob the sold option expires worthless (our win)
+    confidence: float            # Self-assessed 0-1
+    bullish_factors: list[str]
+    bearish_factors: list[str]
+    reasoning: str
+    suggested_action: str        # "sell" | "wait" | "skip"
+    raw_response: str
+    provider: str = "unknown"
+    model: str = "unknown"
+    cached: bool = False
+
+
+def _build_option_prompt(
+    ticker: str,
+    trade_type: str,
+    strike: float,
+    premium: float,
+    delta: float,
+    dte: int,
+    composite_score: int,
+    zone_level: float,
+    zone_touches: int,
+    iv_rank: float,
+    candlestick_pattern: str | None,
+    annualized_return: float,
+    cost_basis: float | None,
+) -> tuple[str, str]:
+    """Build (system, user) prompt pair for CSP/CC assessment."""
+    is_csp = trade_type == "csp"
+
+    direction = "bullish (want price ABOVE strike)" if is_csp else "bearish (want price BELOW strike)"
+    zone_kind = "support" if is_csp else "resistance"
+    leg = f"{strike}P" if is_csp else f"{strike}C"
+    cb_str = f"Cost basis: ${cost_basis:.2f}" if (not is_csp and cost_basis) else ""
+
+    system_prompt = (
+        "You are a disciplined options analyst advising on The Wheel Strategy. "
+        "Your job: assess whether selling this specific option is a good trade right now, "
+        "given the technical setup and confluence. You never recommend buying options. "
+        "You estimate the probability the sold option expires worthless (our win condition). "
+        "Penalize thin premium, weak zone support, contradictory patterns, and near-earnings setups. "
+        "Reward strong zones, ≥2 prior touches, confirming candlesticks, high IV rank. "
+        "You MUST respond with valid JSON only — no markdown, no prose outside JSON."
+    )
+
+    user_prompt = f"""Analyze this wheel option trade and estimate the probability it expires worthless (win).
+
+TICKER: {ticker}
+TRADE: SELL-TO-OPEN {leg} exp in {dte} DTE for ${premium} credit
+BIAS NEEDED: {direction}
+{cb_str}
+
+TECHNICAL SIGNALS:
+- Composite score: {composite_score}/9 (trend + level + candlestick)
+- {zone_kind.capitalize()} zone: ${zone_level:.2f} ({zone_touches} historical touches)
+- Candlestick pattern: {candlestick_pattern or "none"}
+- Delta: {delta:+.2f} (prob of assignment at current model)
+- IV rank: {iv_rank:.0%} (higher = richer premium)
+- Annualized return: {annualized_return:.1%}
+
+Return your analysis as strict JSON:
+{{
+  "win_probability": <float 0-1 — prob option expires OTM = we keep full credit>,
+  "confidence": <float 0-1>,
+  "bullish_factors": [<short string>, ...],
+  "bearish_factors": [<short string>, ...],
+  "reasoning": "<2-3 sentences>",
+  "suggested_action": "<sell|wait|skip>"
+}}
+
+Guidance:
+- Composite ≥ 7/9 AND strong {zone_kind} AND IV rank ≥ 30% AND confirming pattern → "sell".
+- Composite ≤ 5/9 OR zone broken OR opposing pattern → "skip".
+- Otherwise → "wait".
+- Confidence LOW (<0.4) if signals conflict or IV rank is weak."""
+
+    return system_prompt, user_prompt
+
+
+def analyze_option_setup(
+    ticker: str,
+    trade_type: str,
+    strike: float,
+    premium: float,
+    delta: float,
+    dte: int,
+    composite_score: int,
+    zone_level: float,
+    zone_touches: int,
+    iv_rank: float,
+    annualized_return: float,
+    candlestick_pattern: str | None = None,
+    cost_basis: float | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+) -> OptionAnalysis | None:
+    """Ask the configured LLM to assess a CSP or CC candidate.
+
+    Returns None if: LLM disabled, no API key, call fails, or parse fails.
+    Non-blocking: caller should proceed when this returns None.
+    """
+    strategy = _load_strategy()
+    llm_cfg = strategy.get("llm", {}) or {}
+    if not llm_cfg.get("enabled", False):
+        return None
+
+    provider = (provider or llm_cfg.get("provider") or "deepseek").lower()
+    if provider == "deepseek":
+        model = model or llm_cfg.get("model") or "deepseek-chat"
+    elif provider == "claude":
+        model = model or llm_cfg.get("claude_model") or llm_cfg.get("model") or "claude-haiku-4-5"
+    else:
+        log_event("llm_analyst", "unknown_provider", {"ticker": ticker, "provider": provider})
+        return None
+
+    max_tokens = int(llm_cfg.get("max_tokens", 1000))
+    cache_ttl = int(llm_cfg.get("cache_ttl_minutes", 60))
+
+    setup_sig = f"{trade_type}:{strike}:{dte}:{composite_score}:{candlestick_pattern}:{zone_level}:{iv_rank:.2f}"
+    setup_hash = hashlib.md5(setup_sig.encode()).hexdigest()[:8]
+    key = _cache_key(ticker, "opt_" + setup_hash, provider, model)
+
+    cached = _cache_get(key, ttl_minutes=cache_ttl)
+    if cached:
+        try:
+            cached_copy = dict(cached)
+            cached_copy["cached"] = True
+            allowed = set(OptionAnalysis.__annotations__.keys())
+            return OptionAnalysis(**{k: v for k, v in cached_copy.items() if k in allowed})
+        except Exception:
+            pass
+
+    system_prompt, user_prompt = _build_option_prompt(
+        ticker=ticker,
+        trade_type=trade_type,
+        strike=strike,
+        premium=premium,
+        delta=delta,
+        dte=dte,
+        composite_score=composite_score,
+        zone_level=zone_level,
+        zone_touches=zone_touches,
+        iv_rank=iv_rank,
+        candlestick_pattern=candlestick_pattern,
+        annualized_return=annualized_return,
+        cost_basis=cost_basis,
+    )
+
+    _rate_limit(min_interval=2.0)
+
+    if provider == "deepseek":
+        raw = _call_deepseek(system_prompt, user_prompt, model, max_tokens, ticker)
+    else:
+        raw = _call_claude(system_prompt, user_prompt, model, max_tokens, ticker)
+
+    if not raw:
+        return None
+
+    data = _parse_response(raw, ticker, provider)
+    if data is None:
+        return None
+
+    try:
+        win_prob = max(0.05, min(0.95, float(data.get("win_probability", 0.5))))
+        confidence = max(0.0, min(1.0, float(data.get("confidence", 0.5))))
+    except (TypeError, ValueError):
+        log_event("llm_analyst", "option_validation_failed", {"ticker": ticker, "data": str(data)[:200]})
+        return None
+
+    analysis = OptionAnalysis(
+        ticker=ticker,
+        trade_type=trade_type,
+        win_probability=round(win_prob, 4),
+        confidence=round(confidence, 4),
+        bullish_factors=[str(x)[:200] for x in (data.get("bullish_factors") or [])[:5]],
+        bearish_factors=[str(x)[:200] for x in (data.get("bearish_factors") or [])[:5]],
+        reasoning=str(data.get("reasoning", ""))[:500],
+        suggested_action=str(data.get("suggested_action", "wait"))[:20].lower(),
+        raw_response=raw[:2000],
+        provider=provider,
+        model=model,
+        cached=False,
+    )
+
+    _cache_put(key, {
+        "ticker": analysis.ticker,
+        "trade_type": analysis.trade_type,
+        "win_probability": analysis.win_probability,
+        "confidence": analysis.confidence,
+        "bullish_factors": analysis.bullish_factors,
+        "bearish_factors": analysis.bearish_factors,
+        "reasoning": analysis.reasoning,
+        "suggested_action": analysis.suggested_action,
+        "raw_response": analysis.raw_response,
+        "provider": analysis.provider,
+        "model": analysis.model,
+    })
+
+    log_event("llm_analyst", "option_analyzed", {
+        "ticker": ticker,
+        "trade_type": trade_type,
+        "provider": provider,
+        "win_prob": analysis.win_probability,
+        "action": analysis.suggested_action,
+    })
+
+    return analysis
+
+
 # ── Convenience: is the LLM configured and reachable? ────────────
 
 def llm_status() -> dict:

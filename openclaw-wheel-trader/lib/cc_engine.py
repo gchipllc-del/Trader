@@ -114,13 +114,52 @@ def scan_for_ccs(
 def check_dividend_conflict(ticker: str, expiration: str) -> bool:
     """
     Check if selling a call through an ex-dividend date.
+
+    ITM calls get early-exercised the day before ex-dividend to capture the
+    dividend — which would lose us both the dividend AND any remaining
+    extrinsic value. Conservative rule: if an ex-div date falls between
+    today and expiration, flag the conflict and skip this expiration.
+
     Returns True if there IS a conflict (skip this expiration).
-    
-    TODO: Integrate with earnings/dividend calendar API.
-    For now, returns False (no conflict detected).
+    Fails open (returns False) when Finnhub unavailable.
     """
-    # Placeholder — wire to dividend calendar in Sprint 8
-    return False
+    try:
+        from datetime import datetime, timezone
+        from lib.finnhub_client import next_ex_dividend_date
+
+        try:
+            exp_date = datetime.fromisoformat(expiration).date()
+        except (ValueError, TypeError):
+            # Can't parse expiration — can't enforce
+            return False
+
+        today = datetime.now(timezone.utc).date()
+        lookahead = max(0, (exp_date - today).days) + 1
+
+        ex_div_iso = next_ex_dividend_date(ticker, days_ahead=lookahead)
+        if not ex_div_iso:
+            return False
+
+        try:
+            ex_div_date = datetime.fromisoformat(ex_div_iso).date()
+        except (ValueError, TypeError):
+            return False
+
+        # Conflict if ex-div between today (inclusive) and expiration (inclusive)
+        if today <= ex_div_date <= exp_date:
+            log_event("cc_engine", "dividend_ex_date_in_window", {
+                "ticker": ticker,
+                "ex_div": ex_div_iso,
+                "expiration": expiration,
+            })
+            return True
+        return False
+
+    except Exception as e:
+        log_event("cc_engine", "dividend_check_error", {
+            "ticker": ticker, "expiration": expiration, "error": str(e)[:200],
+        })
+        return False
 
 
 def execute_cc(
