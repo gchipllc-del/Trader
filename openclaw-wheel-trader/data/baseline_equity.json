@@ -1,0 +1,6 @@
+{
+  "baseline_equity": 1500.0,
+  "set_at": "2026-04-10T00:00:00+00:00",
+  "source": "alpaca_portfolio_history",
+  "note": "Auto-detected from Alpaca portfolio history (account's first recorded equity). Edit baseline_equity to set a different starting capital, or delete this file to re-detect on next load."
+}

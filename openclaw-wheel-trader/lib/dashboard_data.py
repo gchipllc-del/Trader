@@ -32,14 +32,57 @@ def _get_client() -> AlpacaClient:
     return AlpacaClient()
 
 
+def _fetch_account_starting_equity() -> tuple[float | None, str | None]:
+    """
+    Query Alpaca portfolio history for the earliest recorded equity value
+    (i.e. the account's actual starting capital). Returns (equity, iso_date)
+    or (None, None) if unavailable.
+    """
+    try:
+        import os
+        import requests
+        from dotenv import load_dotenv
+        load_dotenv()
+        headers = {
+            "APCA-API-KEY-ID": os.environ.get("ALPACA_API_KEY", ""),
+            "APCA-API-SECRET-KEY": os.environ.get("ALPACA_SECRET_KEY", ""),
+        }
+        base = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+        if not headers["APCA-API-KEY-ID"] or not headers["APCA-API-SECRET-KEY"]:
+            return None, None
+        r = requests.get(
+            f"{base}/v2/account/portfolio/history",
+            params={"period": "all", "timeframe": "1D"},
+            headers=headers,
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None, None
+        data = r.json()
+        eq = data.get("equity") or []
+        ts = data.get("timestamp") or []
+        if not eq or not ts:
+            return None, None
+        # The very first equity entry = the account's starting capital.
+        first_equity = float(eq[0])
+        first_ts = datetime.fromtimestamp(ts[0], tz=timezone.utc)
+        if first_equity <= 0:
+            return None, None
+        return first_equity, first_ts.isoformat()
+    except Exception:
+        return None, None
+
+
 def _get_baseline(current_equity: float) -> tuple[float, str]:
     """
     Return (baseline_equity, set_at_iso) for the %-gain-to-date metric.
 
-    If `data/baseline_equity.json` does not yet exist, snapshot the current
-    portfolio value on first call so the dashboard has something to compare
-    against.  Users can override or reset by editing that file directly or
-    calling `set_baseline(amount)`.
+    On first call (no baseline file yet), we prefer Alpaca portfolio history's
+    first recorded equity — that's the account's actual starting capital, which
+    is what the user cares about ("my total gains since I opened the account").
+    If Alpaca history is unavailable (keys missing, API error, brand-new
+    account), fall back to current equity. Users can override at any time by
+    editing the file or calling `set_baseline(amount)`.
     """
     try:
         if BASELINE_PATH.exists():
@@ -52,13 +95,29 @@ def _get_baseline(current_equity: float) -> tuple[float, str]:
     except Exception:
         pass  # Fall through to fresh snapshot
 
+    # First run — try to use the account's actual starting equity.
+    source = "current_equity"
+    starting_equity, starting_date = _fetch_account_starting_equity()
+    if starting_equity is not None and starting_date is not None:
+        baseline_value = starting_equity
+        set_at = starting_date
+        source = "alpaca_portfolio_history"
+    else:
+        baseline_value = float(current_equity)
+        set_at = datetime.now(timezone.utc).isoformat()
+
     data = {
-        "baseline_equity": float(current_equity),
-        "set_at": datetime.now(timezone.utc).isoformat(),
+        "baseline_equity": float(baseline_value),
+        "set_at": set_at,
+        "source": source,
         "note": (
-            "Auto-snapshotted on first status/dashboard load. "
-            "Edit baseline_equity to set a specific starting capital, "
-            "or delete this file to re-snapshot on next load."
+            "Auto-detected from Alpaca portfolio history (account's first "
+            "recorded equity). Edit baseline_equity to set a different starting "
+            "capital, or delete this file to re-detect on next load."
+            if source == "alpaca_portfolio_history"
+            else "Auto-snapshotted from current equity (Alpaca history "
+                 "unavailable). Edit baseline_equity to set a specific starting "
+                 "capital, or delete this file to re-snapshot on next load."
         ),
     }
     try:
@@ -68,12 +127,12 @@ def _get_baseline(current_equity: float) -> tuple[float, str]:
         try:
             from lib.audit import log_event
             log_event("dashboard", "baseline_snapshotted",
-                      {"baseline": float(current_equity)})
+                      {"baseline": float(baseline_value), "source": source})
         except Exception:
             pass
     except Exception:
         pass
-    return float(current_equity), data["set_at"]
+    return float(baseline_value), data["set_at"]
 
 
 def set_baseline(amount: float | None = None) -> dict:
