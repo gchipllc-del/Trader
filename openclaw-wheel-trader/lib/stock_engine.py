@@ -160,11 +160,12 @@ def score_stock_buy(
     # Entry logic — more permissive in growth mode
     not_downtrend = weekly_trend.direction != "downtrend"
     has_signal = signal_score >= 1
-    has_momentum = momentum_score >= 2
+    momentum_only_min = stock_cfg.get("momentum_only_min_score", 3)
+    has_strong_momentum = momentum_score >= momentum_only_min
 
     if allow_momentum_only:
-        # Growth mode: momentum alone (score >= 2) can trigger entry
-        tradeable = composite >= min_score and not_downtrend and (has_signal or has_momentum)
+        # Growth mode: strong momentum (default >= 3/4) can substitute for candlestick signal
+        tradeable = composite >= min_score and not_downtrend and (has_signal or has_strong_momentum)
     else:
         # Conservative: require candlestick signal
         tradeable = composite >= min_score and not_downtrend and has_signal
@@ -230,10 +231,12 @@ def scan_for_stocks(
     """
     Scan tickers for stock buy candidates.
 
-    Three-gate system:
+    Five-gate system:
       Gate 1: Quantitative screen (Sharpe, drawdown, volatility)
       Gate 2: Technical screen (trend + zones + candlestick signals)
       Gate 3: Momentum screen (RSI, MACD, volume, ROC)
+      Gate 4: Kronos AI — bearish prediction vetoes the trade
+      Gate 5: News sentiment — strongly negative news vetoes the trade
 
     Returns ranked list of tradeable candidates.
     """
@@ -297,9 +300,42 @@ def scan_for_stocks(
                 candidate["max_drawdown"] = qs.max_drawdown
             candidates.append(candidate)
 
-    # Sort by: composite score (includes momentum), then quant score
+    if not candidates:
+        log_event("stock_engine", "no_candidates_after_technical", {})
+        return []
+
+    # Gate 4: Kronos AI price prediction — veto bearish forecasts
+    kronos_cfg = strategy.get("kronos", {})
+    if kronos_cfg.get("enabled", False):
+        candidates = _apply_kronos_gate(candidates, kronos_cfg)
+
+    # Gate 5: News sentiment — veto strongly negative news
+    news_cfg = strategy.get("news_sentiment", {})
+    if news_cfg.get("enabled", False):
+        candidates = _apply_news_gate(candidates, news_cfg)
+
+    # Gate 6: Bayesian multi-signal forecast (combines all signals into calibrated win prob)
+    bayes_cfg = strategy.get("bayesian", {})
+    if bayes_cfg.get("enabled", True):
+        candidates = _apply_bayesian_gate(candidates, bayes_cfg)
+
+    # Gate 7: Correlation check — avoid loading up on correlated stocks
+    corr_cfg = strategy.get("correlation", {})
+    if corr_cfg.get("enabled", True):
+        candidates = _apply_correlation_gate(candidates, held_tickers, daily_data, corr_cfg)
+
+    # Gate 8: Kelly position sizing (overrides shares count with optimal size)
+    kelly_cfg = strategy.get("kelly", {})
+    if kelly_cfg.get("enabled", True):
+        candidates = _apply_kelly_sizing(candidates, portfolio_value, kelly_cfg)
+
+    # Sort by: bayesian win probability (primary), then composite score (secondary)
     candidates.sort(
-        key=lambda c: (c["composite_score"], c.get("quant_score", 0)),
+        key=lambda c: (
+            c.get("bayesian_win_prob", c["composite_score"] / 13.0),
+            c["composite_score"],
+            c.get("quant_score", 0),
+        ),
         reverse=True,
     )
 
@@ -312,6 +348,303 @@ def scan_for_stocks(
         "slots_available": slots_available,
         "top": candidates[0]["ticker"] if candidates else "none",
     })
+
+    return candidates
+
+
+def _apply_kronos_gate(candidates: list[dict], kronos_cfg: dict) -> list[dict]:
+    """
+    Gate 4: Kronos AI price prediction.
+
+    If Kronos says bearish (expected return < veto_threshold), skip the stock.
+    If Kronos says bullish, attach the forecast for confidence boosting.
+    Non-blocking — if Kronos fails, candidate passes through.
+    """
+    veto_threshold = kronos_cfg.get("veto_return_threshold", -0.02)
+    pred_bars = kronos_cfg.get("pred_bars", 10)
+
+    filtered = []
+    for candidate in candidates:
+        ticker = candidate["ticker"]
+        try:
+            from lib.kronos_forecaster import predict_price
+            forecast = predict_price(
+                ticker=ticker,
+                pred_bars=pred_bars,
+                interval="1d",
+                lookback=200,
+                sample_count=3,
+                temperature=0.8,
+            )
+
+            candidate["kronos_direction"] = forecast.direction
+            candidate["kronos_expected_return"] = forecast.expected_return
+            candidate["kronos_confidence"] = forecast.confidence
+
+            if forecast.expected_return < veto_threshold:
+                # Kronos says this stock is going down — skip it
+                print(f"  🔴 {ticker}: Kronos VETO — predicted {forecast.expected_return:+.1%} "
+                      f"({forecast.direction}, conf={forecast.confidence:.2f})")
+                log_event("stock_engine", "kronos_veto", {
+                    "ticker": ticker,
+                    "expected_return": forecast.expected_return,
+                    "direction": forecast.direction,
+                })
+                continue
+            else:
+                emoji = "🟢" if forecast.direction == "bullish" else "🟡"
+                print(f"  {emoji} {ticker}: Kronos {forecast.direction} "
+                      f"({forecast.expected_return:+.1%}, conf={forecast.confidence:.2f})")
+                filtered.append(candidate)
+
+        except Exception as e:
+            # Kronos failed — let candidate through (non-blocking)
+            candidate["kronos_direction"] = None
+            candidate["kronos_expected_return"] = None
+            candidate["kronos_confidence"] = None
+            log_event("stock_engine", "kronos_error", {
+                "ticker": ticker,
+                "error": str(e)[:200],
+            })
+            filtered.append(candidate)
+
+    return filtered
+
+
+def _apply_news_gate(candidates: list[dict], news_cfg: dict) -> list[dict]:
+    """
+    Gate 5: News sentiment filter.
+
+    If recent news is strongly bearish (sentiment < veto_threshold), skip.
+    Non-blocking — if news check fails, candidate passes through.
+    """
+    veto_threshold = news_cfg.get("veto_sentiment_threshold", 0.25)
+
+    filtered = []
+    for candidate in candidates:
+        ticker = candidate["ticker"]
+        try:
+            from lib.news_sentiment import check_stock_sentiment
+            result = check_stock_sentiment(ticker)
+
+            candidate["news_sentiment"] = result.sentiment
+            candidate["news_signal"] = result.signal
+            candidate["news_confidence"] = result.confidence
+
+            if result.sentiment < veto_threshold and result.confidence > 0.3:
+                # Strong bearish news with decent confidence — skip
+                print(f"  📰 {ticker}: News VETO — {result.signal} sentiment "
+                      f"({result.sentiment:.2f}, {result.article_count} articles)")
+                if result.headlines:
+                    print(f"      Top: {result.headlines[0][:80]}")
+                log_event("stock_engine", "news_veto", {
+                    "ticker": ticker,
+                    "sentiment": result.sentiment,
+                    "signal": result.signal,
+                    "articles": result.article_count,
+                })
+                continue
+            else:
+                if result.article_count > 0:
+                    print(f"  📰 {ticker}: News {result.signal} "
+                          f"(sentiment={result.sentiment:.2f}, {result.article_count} articles)")
+                filtered.append(candidate)
+
+        except Exception as e:
+            # News check failed — let candidate through
+            candidate["news_sentiment"] = None
+            candidate["news_signal"] = None
+            candidate["news_confidence"] = None
+            log_event("stock_engine", "news_error", {
+                "ticker": ticker,
+                "error": str(e)[:200],
+            })
+            filtered.append(candidate)
+
+    return filtered
+
+
+def _apply_bayesian_gate(candidates: list[dict], bayes_cfg: dict) -> list[dict]:
+    """
+    Gate 6: Bayesian multi-signal aggregation.
+
+    Combines composite score + Kronos + news + pattern + momentum into a
+    calibrated win probability. Vetoes setups below min_win_prob threshold.
+    """
+    min_win_prob = bayes_cfg.get("min_win_prob", 0.58)
+
+    filtered = []
+    for candidate in candidates:
+        try:
+            from lib.bayesian_forecaster import forecast_stock
+            forecast = forecast_stock(
+                ticker=candidate["ticker"],
+                composite_score=candidate["composite_score"],
+                trend_score=candidate["trend_score"],
+                level_score=candidate["level_score"],
+                signal_score=candidate["signal_score"],
+                momentum_score=candidate["momentum_score"],
+                pattern=candidate.get("pattern"),
+                zone_touches=candidate.get("zone_touches", 0),
+                weekly_direction=candidate.get("weekly_trend", "sideways"),
+                kronos_expected_return=candidate.get("kronos_expected_return"),
+                kronos_confidence=candidate.get("kronos_confidence", 0.5),
+                news_sentiment=candidate.get("news_sentiment"),
+                news_confidence=candidate.get("news_confidence", 0.5),
+            )
+
+            candidate["bayesian_win_prob"] = forecast.win_probability
+            candidate["bayesian_confidence"] = forecast.confidence
+            candidate["bayesian_sources"] = forecast.sources
+            candidate["bayesian_summary"] = forecast.evidence_summary
+
+            if forecast.win_probability < min_win_prob:
+                print(f"  🎯 {candidate['ticker']}: Bayesian VETO — win_prob "
+                      f"{forecast.win_probability:.0%} < {min_win_prob:.0%}")
+                log_event("stock_engine", "bayesian_veto", {
+                    "ticker": candidate["ticker"],
+                    "win_prob": forecast.win_probability,
+                })
+                continue
+
+            emoji = "🟢" if forecast.win_probability >= 0.70 else "🟡"
+            print(f"  {emoji} {candidate['ticker']}: Bayesian "
+                  f"{forecast.win_probability:.0%} (conf {forecast.confidence:.2f}) — "
+                  f"{forecast.evidence_summary}")
+            filtered.append(candidate)
+
+        except Exception as e:
+            candidate["bayesian_win_prob"] = None
+            log_event("stock_engine", "bayesian_error", {
+                "ticker": candidate["ticker"],
+                "error": str(e)[:200],
+            })
+            filtered.append(candidate)  # Let through on error
+
+    return filtered
+
+
+def _apply_correlation_gate(
+    candidates: list[dict],
+    held_tickers: set,
+    daily_data: dict,
+    corr_cfg: dict,
+) -> list[dict]:
+    """
+    Gate 7: Correlation check.
+
+    Prevents loading up on correlated stocks (e.g., F + NIO = double EV exposure).
+    Softer than a hard veto — reduces position size rather than blocking entirely.
+    """
+    threshold = corr_cfg.get("threshold", 0.70)
+    hard_veto = corr_cfg.get("hard_veto", False)
+
+    if not held_tickers:
+        return candidates  # Nothing to correlate with
+
+    filtered = []
+    for candidate in candidates:
+        try:
+            from lib.correlation import check_portfolio_correlation
+            result = check_portfolio_correlation(
+                new_ticker=candidate["ticker"],
+                held_tickers=list(held_tickers),
+                daily_data=daily_data,
+                threshold=threshold,
+            )
+
+            candidate["correlation_check"] = result
+
+            if result["correlated"]:
+                if hard_veto:
+                    print(f"  🔗 {candidate['ticker']}: Correlation VETO — {result['reason']}")
+                    log_event("stock_engine", "correlation_veto", {
+                        "ticker": candidate["ticker"],
+                        "conflicts": [c["ticker"] for c in result["conflicts"]],
+                    })
+                    continue
+                else:
+                    # Soft veto: flag + shrink position
+                    print(f"  ⚠️  {candidate['ticker']}: Correlated — {result['reason']} (sizing down)")
+                    candidate["correlation_penalty"] = 0.5  # Will halve Kelly sizing
+            filtered.append(candidate)
+
+        except Exception as e:
+            log_event("stock_engine", "correlation_error", {
+                "ticker": candidate["ticker"],
+                "error": str(e)[:200],
+            })
+            filtered.append(candidate)
+
+    return filtered
+
+
+def _apply_kelly_sizing(candidates: list[dict], portfolio_value: float, kelly_cfg: dict) -> list[dict]:
+    """
+    Gate 8: Kelly position sizing.
+
+    Replaces the naive max_position_pct sizing with mathematically-optimal
+    Kelly sizing based on win probability and reward/risk ratio.
+    """
+    fraction = kelly_cfg.get("fraction", 0.25)
+
+    for candidate in candidates:
+        try:
+            from lib.kelly import kelly_position_size
+
+            # Use Bayesian win prob if available, else composite-derived
+            composite_score = candidate["composite_score"]
+
+            sizing = kelly_position_size(
+                portfolio_value=portfolio_value,
+                current_price=candidate["current_price"],
+                target_price=candidate["target_price"],
+                stop_loss=candidate["stop_loss"],
+                composite_score=composite_score,
+                kronos_expected_return=candidate.get("kronos_expected_return"),
+                fraction=fraction,
+            )
+
+            # If Bayesian gave us a more accurate win_prob, override Kelly's composite-derived one
+            bayesian_wp = candidate.get("bayesian_win_prob")
+            if bayesian_wp is not None and bayesian_wp > 0:
+                # Recompute Kelly with Bayesian prob
+                from lib.kelly import fractional_kelly_stock
+                reward_pct = sizing.get("reward_pct", 0)
+                risk_pct = sizing.get("risk_pct", 0)
+                if reward_pct > 0 and risk_pct > 0:
+                    frac_k = fractional_kelly_stock(bayesian_wp, reward_pct, risk_pct, fraction)
+                    strategy = _load_strategy()
+                    max_pct = strategy.get("stock_params", {}).get("max_position_pct", 0.30)
+                    pct = min(frac_k, max_pct)
+                    # Apply correlation penalty if flagged
+                    pct *= candidate.get("correlation_penalty", 1.0)
+
+                    sizing["win_prob"] = round(bayesian_wp, 4)
+                    sizing["fractional_kelly"] = round(frac_k, 4)
+                    sizing["pct_of_portfolio"] = round(pct, 4)
+                    sizing["position_value"] = round(portfolio_value * pct, 2)
+                    sizing["shares"] = int(portfolio_value * pct / candidate["current_price"])
+
+            # Override the screener's default sizing with Kelly's
+            if sizing.get("shares", 0) > 0:
+                candidate["kelly_sizing"] = sizing
+                candidate["shares"] = sizing["shares"]
+                candidate["position_value"] = sizing["position_value"]
+                print(f"  💰 {candidate['ticker']}: Kelly sized to "
+                      f"{sizing['shares']} shares "
+                      f"({sizing['pct_of_portfolio']*100:.1f}% of portfolio, "
+                      f"R/R {sizing.get('reward_to_risk', 0)}x)")
+            else:
+                print(f"  ⚠️  {candidate['ticker']}: Kelly says no trade — {sizing.get('reason', 'unknown')}")
+                # Keep original sizing if Kelly says 0
+                candidate["kelly_sizing"] = sizing
+
+        except Exception as e:
+            log_event("stock_engine", "kelly_sizing_error", {
+                "ticker": candidate["ticker"],
+                "error": str(e)[:200],
+            })
 
     return candidates
 
@@ -352,7 +685,7 @@ def execute_stock_buy(
 
     reasoning = (
         f"Buying {shares} shares of {ticker} at ${price:.2f}. "
-        f"Composite score {candidate['composite_score']}/9 "
+        f"Composite score {candidate['composite_score']}/13 "
         f"(trend:{candidate['trend_score']} level:{candidate['level_score']} "
         f"signal:{candidate['signal_score']}). "
         f"Support zone at {candidate['zone_level']} ({candidate['zone_touches']} touches). "
@@ -421,7 +754,27 @@ def execute_stock_buy(
     )
     diary_write("strategy_agent",
         f"{ticker}|STOCK_BUY|{shares}sh@${price:.2f}|"
-        f"score_{candidate['composite_score']}/9|{candidate['pattern'] or 'no_pattern'}")
+        f"score_{candidate['composite_score']}/13|{candidate['pattern'] or 'no_pattern'}")
+
+    # Calibration — record prediction for accuracy tracking
+    try:
+        from lib.stock_calibration import record_prediction
+        record_prediction(
+            ticker=ticker,
+            composite_score=candidate["composite_score"],
+            kronos_direction=candidate.get("kronos_direction"),
+            kronos_expected_return=candidate.get("kronos_expected_return"),
+            news_sentiment=candidate.get("news_sentiment"),
+            pattern=candidate.get("pattern"),
+            momentum_score=candidate.get("momentum_score", 0),
+            entry_price=price,
+            target_price=candidate.get("target_price", 0),
+            stop_loss=candidate.get("stop_loss", 0),
+            bayesian_win_prob=candidate.get("bayesian_win_prob"),
+            bayesian_sources=candidate.get("bayesian_sources"),
+        )
+    except Exception:
+        pass  # Non-critical — don't block trades on calibration errors
 
     return response
 
@@ -447,6 +800,9 @@ def check_stock_exits(
     strategy = _load_strategy()
     stock_cfg = strategy.get("stock_params", {})
     trailing_stop_pct = stock_cfg.get("trailing_stop_pct", 0.0)
+    partial_exit_threshold = stock_cfg.get("partial_exit_threshold", 0.15)
+    partial_exit_fraction = stock_cfg.get("partial_exit_fraction", 0.5)
+    enable_scale_out = stock_cfg.get("enable_scale_out", True)
 
     broker_positions = client.get_positions()
     broker_map = {p["symbol"]: p for p in broker_positions}
@@ -476,8 +832,24 @@ def check_stock_exits(
 
         exit_signal = None
 
+        # Scale-out: sell part of position at +15% gain (lock gains, let runner ride)
+        # Only fires once per position (tracked via partial_exit_taken flag)
+        partial_exit_taken = pos.get("partial_exit_taken", False)
+        if (enable_scale_out
+                and not partial_exit_taken
+                and pnl_pct >= partial_exit_threshold
+                and pos.get("shares", 0) >= 2):  # Need at least 2 shares to scale out
+            shares_to_sell = max(1, int(pos["shares"] * partial_exit_fraction))
+            exit_signal = {
+                "ticker": ticker,
+                "action": "scale_out",
+                "reason": f"Scale-out at +{pnl_pct:.1%}: selling {shares_to_sell}/{pos['shares']} shares",
+                "pnl_pct": pnl_pct,
+                "partial_shares": shares_to_sell,
+            }
+
         # Stop loss hit
-        if current_price <= stop:
+        elif current_price <= stop:
             exit_signal = {
                 "ticker": ticker,
                 "action": "stop_loss",
@@ -535,6 +907,22 @@ def check_stock_exits(
     return exits
 
 
+TRADE_HISTORY_PATH = Path(__file__).parent.parent / "data" / "trade_history.json"
+
+
+def _load_trade_history() -> list[dict]:
+    if not TRADE_HISTORY_PATH.exists():
+        return []
+    with open(TRADE_HISTORY_PATH) as f:
+        return json.load(f)
+
+
+def _save_trade_history(history: list[dict]):
+    TRADE_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(TRADE_HISTORY_PATH, "w") as f:
+        json.dump(history, f, indent=2)
+
+
 def execute_stock_sell(
     ticker: str,
     client: AlpacaClient,
@@ -554,6 +942,11 @@ def execute_stock_sell(
     shares = pos.get("shares", 0)
     if shares < 1:
         return None
+
+    # Get current price for P/L calculation
+    broker_positions = client.get_positions()
+    broker_map = {p["symbol"]: p for p in broker_positions}
+    exit_price = float(broker_map[ticker]["current_price"]) if ticker in broker_map else pos.get("entry_price", 0)
 
     try:
         from alpaca.trading.requests import MarketOrderRequest
@@ -576,21 +969,178 @@ def execute_stock_sell(
             "qty": str(order.qty),
         }
 
+        # Calculate realized P/L
+        entry_price = pos.get("entry_price", 0)
+        realized_pnl = (exit_price - entry_price) * shares
+        hold_duration = ""
+        if pos.get("opened_at"):
+            opened = datetime.fromisoformat(pos["opened_at"])
+            hold_duration = str(datetime.now(timezone.utc) - opened)
+
         # Update position
         pos["status"] = "closed"
         pos["closed_at"] = datetime.now(timezone.utc).isoformat()
         pos["close_reason"] = reason
+        pos["exit_price"] = exit_price
+        pos["realized_pnl"] = round(realized_pnl, 2)
         _save_positions(positions)
+
+        # Record to trade history (Hermes needs this!)
+        history = _load_trade_history()
+        history.append({
+            "ticker": ticker,
+            "type": "stock",
+            "side": "sell",
+            "shares": shares,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "realized_pnl": round(realized_pnl, 2),
+            "pnl_pct": round((exit_price - entry_price) / entry_price, 4) if entry_price > 0 else 0,
+            "composite_score": pos.get("composite_score", 0),
+            "close_reason": reason,
+            "opened_at": pos.get("opened_at", ""),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "hold_duration": hold_duration,
+        })
+        _save_trade_history(history)
 
         log_event("stock_engine", "sold", {
             "ticker": ticker, "shares": shares, "reason": reason,
+            "realized_pnl": round(realized_pnl, 2),
+            "exit_price": exit_price,
         }, result="success")
 
-        diary_write("strategy_agent", f"{ticker}|STOCK_SOLD|{shares}sh|{reason}")
+        diary_write("strategy_agent",
+            f"{ticker}|STOCK_SOLD|{shares}sh@${exit_price:.2f}|{reason}|pnl_${realized_pnl:+.2f}")
+
+        # Calibration — record outcome for accuracy tracking
+        try:
+            from lib.stock_calibration import record_outcome
+            pnl_pct = (exit_price - entry_price) / entry_price if entry_price > 0 else 0
+            record_outcome(
+                ticker=ticker,
+                outcome="win" if realized_pnl > 0 else "loss",
+                pnl_pct=pnl_pct,
+                close_reason=reason,
+            )
+        except Exception:
+            pass  # Non-critical
+
         return response
 
     except Exception as e:
         log_event("stock_engine", "sell_failed", {"ticker": ticker, "error": str(e)}, result="failed")
+        return None
+
+
+def execute_partial_stock_sell(
+    ticker: str,
+    shares_to_sell: int,
+    client: AlpacaClient,
+    reason: str = "scale_out",
+) -> dict | None:
+    """
+    Sell a fraction of a stock position. Unlike execute_stock_sell (full close),
+    this keeps the position open with reduced share count and marks it as
+    partial_exit_taken=True so we only scale out once.
+
+    Purpose: Lock in gains on big winners while letting a runner ride with
+    the trailing stop.
+    """
+    positions = _load_positions()
+    pos = None
+    for p in positions:
+        if p.get("ticker") == ticker and p.get("type") == "stock" and p.get("status") == "open":
+            pos = p
+            break
+
+    if not pos:
+        return None
+
+    total_shares = pos.get("shares", 0)
+    if shares_to_sell >= total_shares:
+        # Not a partial — route to full sell
+        return execute_stock_sell(ticker, client, reason)
+
+    if shares_to_sell < 1:
+        return None
+
+    # Get current price for P/L
+    broker_positions = client.get_positions()
+    broker_map = {bp["symbol"]: bp for bp in broker_positions}
+    exit_price = float(broker_map[ticker]["current_price"]) if ticker in broker_map else pos.get("entry_price", 0)
+
+    try:
+        from alpaca.trading.requests import MarketOrderRequest
+        from alpaca.trading.enums import OrderSide, TimeInForce
+
+        trading_client = client._get_trading_client()
+        client.limiter.wait_if_needed()
+
+        order = trading_client.submit_order(MarketOrderRequest(
+            symbol=ticker,
+            qty=shares_to_sell,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY,
+        ))
+
+        response = {
+            "id": str(order.id),
+            "status": str(order.status),
+            "symbol": order.symbol,
+            "qty": str(order.qty),
+            "partial": True,
+        }
+
+        # Update position — reduce shares, mark partial taken
+        entry_price = pos.get("entry_price", 0)
+        realized_pnl = (exit_price - entry_price) * shares_to_sell
+        pos["shares"] = total_shares - shares_to_sell
+        pos["partial_exit_taken"] = True
+        pos["partial_exit_price"] = exit_price
+        pos["partial_exit_shares"] = shares_to_sell
+        pos["partial_exit_pnl"] = round(realized_pnl, 2)
+        pos["partial_exit_at"] = datetime.now(timezone.utc).isoformat()
+        _save_positions(positions)
+
+        # Record partial sale in trade history (important for Hermes)
+        history = _load_trade_history()
+        history.append({
+            "ticker": ticker,
+            "type": "stock",
+            "side": "partial_sell",
+            "shares": shares_to_sell,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "realized_pnl": round(realized_pnl, 2),
+            "pnl_pct": round((exit_price - entry_price) / entry_price, 4) if entry_price > 0 else 0,
+            "composite_score": pos.get("composite_score", 0),
+            "close_reason": reason,
+            "opened_at": pos.get("opened_at", ""),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "is_partial": True,
+            "remaining_shares": pos["shares"],
+        })
+        _save_trade_history(history)
+
+        log_event("stock_engine", "partial_sold", {
+            "ticker": ticker,
+            "shares_sold": shares_to_sell,
+            "remaining": pos["shares"],
+            "realized_pnl": round(realized_pnl, 2),
+            "exit_price": exit_price,
+        }, result="success")
+
+        diary_write("strategy_agent",
+            f"{ticker}|SCALE_OUT|{shares_to_sell}/{total_shares}sh@${exit_price:.2f}|"
+            f"locked_${realized_pnl:+.2f}|letting_{pos['shares']}sh_ride")
+
+        return response
+
+    except Exception as e:
+        log_event("stock_engine", "partial_sell_failed", {
+            "ticker": ticker, "error": str(e)
+        }, result="failed")
         return None
 
 
@@ -603,7 +1153,7 @@ def run_stock_scan_and_execute(
 ) -> list[dict]:
     """
     Full stock trading pipeline: scan → score → execute.
-    Also checks existing positions for exit signals.
+    Also checks existing positions for exit signals (stop, target, scale-out).
     """
     strategy = _load_strategy()
     max_trades = strategy.get("stock_params", {}).get("max_trades_per_scan", max_trades)
@@ -614,12 +1164,46 @@ def run_stock_scan_and_execute(
 
     # Check exits first — free up capital for new trades
     exits = check_stock_exits(client, daily_data)
+    freed_capital = False
     for exit_signal in exits:
         ticker = exit_signal["ticker"]
+        action = exit_signal.get("action")
         print(f"  🔔 Exit signal: {ticker} — {exit_signal['reason']}")
-        resp = execute_stock_sell(ticker, client, exit_signal["action"])
-        if resp:
-            results.append({"action": "sell", **exit_signal, "order": resp})
+
+        # Scale-out is a partial sale (keeps position open, smaller size)
+        if action == "scale_out":
+            shares = exit_signal.get("partial_shares", 0)
+            resp = execute_partial_stock_sell(ticker, shares, client, "scale_out")
+            if resp:
+                results.append({"action": "scale_out", **exit_signal, "order": resp})
+                freed_capital = True
+                print(f"  💰 Partial sold {shares}x {ticker} — runner continues")
+        else:
+            # Full close (stop loss, target, momentum death, bearish reversal)
+            resp = execute_stock_sell(ticker, client, action)
+            if resp:
+                results.append({"action": "sell", **exit_signal, "order": resp})
+                freed_capital = True
+
+    # After exits, wait briefly for settlement then re-fetch portfolio value
+    # Paper account settles instantly; live has T+2 but buying power updates fast
+    if freed_capital:
+        import time
+        time.sleep(2)  # Brief pause for order settlement
+        try:
+            account = client.get_account()
+            old_pv = portfolio_value
+            portfolio_value = account["portfolio_value"]
+            cash_available = float(account.get("cash", 0))
+            log_event("stock_engine", "capital_refreshed", {
+                "old_portfolio_value": old_pv,
+                "new_portfolio_value": portfolio_value,
+                "cash_available": cash_available,
+                "exits": len(exits),
+            })
+            print(f"  ♻️  Capital recycled: ${cash_available:,.2f} cash available after {len(exits)} exits")
+        except Exception:
+            pass  # Use original portfolio_value if refresh fails
 
     # Scan for new buys
     candidates = scan_for_stocks(client, daily_data, weekly_data, portfolio_value)
@@ -640,9 +1224,19 @@ def run_stock_scan_and_execute(
               f"{mom_str}")
 
     # Execute top candidates
+    # If we freed capital from exits, allow up to max_trades + freed_slots
+    # so that one exit can be immediately replaced by one high-conviction entry
+    effective_max_trades = max_trades
+    if freed_capital:
+        # Give ourselves extra slots equal to number of full exits (not scale-outs)
+        full_exits = sum(1 for e in exits if e.get("action") != "scale_out")
+        effective_max_trades = max_trades + full_exits
+        if full_exits > 0:
+            print(f"  🚀 Fast-recycle: allowing up to {effective_max_trades} buys this cycle (redeploying {full_exits} freed slots)")
+
     executed = 0
     for candidate in candidates:
-        if executed >= max_trades:
+        if executed >= effective_max_trades:
             break
 
         resp = execute_stock_buy(candidate, client, portfolio_value)
@@ -652,6 +1246,8 @@ def run_stock_scan_and_execute(
 
     log_event("stock_engine", "pipeline_complete", {
         "exits": len(exits), "buys": executed,
+        "scale_outs": sum(1 for e in exits if e.get("action") == "scale_out"),
+        "freed_slots_redeployed": executed if freed_capital else 0,
     })
 
     return results

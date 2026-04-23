@@ -252,7 +252,9 @@ def run_monitoring_check(client: AlpacaClient) -> dict:
         stock_positions = [p for p in open_positions if p.get("type") == "stock"]
         if stock_positions:
             try:
-                from lib.stock_engine import check_stock_exits, execute_stock_sell
+                from lib.stock_engine import (
+                    check_stock_exits, execute_stock_sell, execute_partial_stock_sell,
+                )
                 from lib.data_pipeline import fetch_all_data
                 import yaml as _yaml
 
@@ -265,15 +267,28 @@ def run_monitoring_check(client: AlpacaClient) -> dict:
                     t = exit_signal["ticker"]
                     reason = exit_signal["reason"]
                     pnl_pct = exit_signal.get("pnl_pct", 0)
+                    action = exit_signal.get("action", "")
 
-                    resp = execute_stock_sell(t, client, exit_signal["action"])
-                    if resp:
-                        emoji = "💰" if pnl_pct > 0 else "🔴"
-                        msg = f"{emoji} {t}: {reason} (P/L: {pnl_pct:+.1%})"
-                        summary["actions"].append(exit_signal)
-                        summary["alerts"].append(msg)
-                        diary_write("strategy_agent",
-                            f"{t}|STOCK_EXIT|{exit_signal['action']}|pnl_{pnl_pct:+.1%}")
+                    # Scale-out: partial sell (keeps position open with fewer shares)
+                    if action == "scale_out":
+                        shares = exit_signal.get("partial_shares", 0)
+                        resp = execute_partial_stock_sell(t, shares, client, "scale_out")
+                        if resp:
+                            msg = f"💰 {t}: SCALE-OUT {shares}sh @ +{pnl_pct:.1%} (runner continues)"
+                            summary["actions"].append(exit_signal)
+                            summary["alerts"].append(msg)
+                            diary_write("strategy_agent",
+                                f"{t}|SCALE_OUT|{shares}sh|pnl_{pnl_pct:+.1%}|runner_continues")
+                    else:
+                        # Full close (stop loss, target, momentum death, bearish reversal)
+                        resp = execute_stock_sell(t, client, action)
+                        if resp:
+                            emoji = "💰" if pnl_pct > 0 else "🔴"
+                            msg = f"{emoji} {t}: {reason} (P/L: {pnl_pct:+.1%})"
+                            summary["actions"].append(exit_signal)
+                            summary["alerts"].append(msg)
+                            diary_write("strategy_agent",
+                                f"{t}|STOCK_EXIT|{action}|pnl_{pnl_pct:+.1%}")
             except Exception as e:
                 log_event("monitor", "stock_check_failed", {"error": str(e)})
 

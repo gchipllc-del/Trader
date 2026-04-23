@@ -12,3 +12,26 @@ rich>=13.0.0
 # MemPalace integration (optional — falls back to SQLite if missing)
 chromadb>=0.4.0
 # mempalace>=3.0.0  # uncomment when using full MCP integration
+
+# Kronos AI Price Forecasting (polybot integration)
+torch>=2.0.0
+yfinance>=0.2.30
+
+# News sentiment (optional — works without API key via RSS fallback)
+# Set NEWSAPI_KEY env var for NewsAPI.org (better coverage)
+
+# Portfolio Greeks — analytical Black-Scholes (pyarrow-free).
+# Do NOT switch to py_vollib_vectorized: it requires pyarrow which has
+# pre-built wheels missing on some Mac setups and compiling from source
+# adds minutes to a clean install. The non-vectorized form is fine
+# for <50 positions.
+py_vollib>=1.0.0
+
+# Insider flow (SEC Form 4): uses only stdlib urllib + optional defusedxml.
+# No additional deps. Set SEC_CONTACT_EMAIL env var (SEC requires a
+# contact email in the User-Agent for data.sec.gov access).
+defusedxml>=0.7.0  # optional but recommended (safer XML than stdlib)
+
+# Congress flow (Senate STOCK Act): stdlib-only by default. Set
+# CONGRESS_FEED_URL env var to point at a paid fresh-data endpoint
+# (Quiver Quant / Unusual Whales) for real-time signals.

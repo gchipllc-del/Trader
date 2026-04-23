@@ -40,11 +40,17 @@ OPTIMIZATION_LOG = Path(__file__).parent.parent / "data" / "hermes_log.jsonl"
 BOUNDS = {
     "stop_loss_pct":         (0.02, 0.08),
     "default_target_pct":    (0.05, 0.20),
-    "min_composite_score":   (2, 6),
+    "min_composite_score":   (2, 10),  # Expanded 6→10 for high-conviction growth mode
     "max_position_pct":      (0.10, 0.30),
     "max_trades_per_scan":   (1, 5),
     "trailing_stop_pct":     (0.0, 0.06),
     "max_concurrent_positions": (2, 8),
+    "partial_exit_threshold": (0.08, 0.30),  # New: scale-out trigger (8%-30%)
+    "partial_exit_fraction":  (0.25, 0.75),  # New: % to sell at scale-out
+    # New polybot integration parameters
+    "kelly_fraction":         (0.10, 0.50),  # Fractional Kelly multiplier
+    "bayesian_min_win_prob":  (0.50, 0.75),  # Bayesian veto threshold
+    "correlation_threshold":  (0.50, 0.85),  # Price correlation flag point
 }
 
 # How much to adjust per optimization cycle (conservative steps)
@@ -55,6 +61,11 @@ STEP_SIZES = {
     "max_position_pct":      0.025,
     "max_trades_per_scan":   1,
     "trailing_stop_pct":     0.005,
+    "partial_exit_threshold": 0.02,
+    "partial_exit_fraction":  0.10,
+    "kelly_fraction":         0.05,
+    "bayesian_min_win_prob":  0.02,
+    "correlation_threshold":  0.05,
     "max_concurrent_positions": 1,
 }
 

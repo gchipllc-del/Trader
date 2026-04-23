@@ -37,11 +37,25 @@ def render_terminal_dashboard(include_quant: bool = False):
     pl_color = "green" if pl >= 0 else "red"
     pl_str = f"[{pl_color}]${pl:+,.2f}[/]"
 
+    # %-gain-to-date vs baseline equity
+    baseline = portfolio.get("baseline_equity", 0)
+    dollar_gain = portfolio.get("dollar_gain_to_date", 0)
+    pct_gain = portfolio.get("pct_gain_to_date", 0)
+    gain_color = "green" if dollar_gain >= 0 else "red"
+    baseline_date = (portfolio.get("baseline_set_at") or "")[:10]
+    gain_line = (
+        f"  Gain vs. ${baseline:,.2f} baseline"
+        + (f" (since {baseline_date})" if baseline_date else "")
+        + f": [{gain_color}]${dollar_gain:+,.2f}[/] "
+          f"[{gain_color}]{pct_gain:+.2%}[/]"
+    )
+
     header = Text.from_markup(
         f"  Portfolio: [bold]${portfolio['portfolio_value']:,.2f}[/]  "
         f"Cash: ${portfolio['cash']:,.2f}  "
         f"Buying Power: ${portfolio['buying_power']:,.2f}\n"
-        f"  Mode: {mode_badge}  {phase_text}  Regime: [cyan]{regime_text}[/]  Daily P/L: {pl_str}"
+        f"  Mode: {mode_badge}  {phase_text}  Regime: [cyan]{regime_text}[/]  Daily P/L: {pl_str}\n"
+        f"{gain_line}"
     )
     console.print(Panel(header, title="[bold gold1]OPENCLAW WHEEL TRADER[/]", border_style="gold1"))
 

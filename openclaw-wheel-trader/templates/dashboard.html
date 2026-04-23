@@ -82,6 +82,10 @@ tr:hover { background: #22224e; }
       <div class="stat"><div class="stat-label">Cash</div><div class="stat-value" id="cash-value">--</div></div>
       <div class="stat"><div class="stat-label">Buying Power</div><div class="stat-value" id="bp-value">--</div></div>
       <div class="stat"><div class="stat-label">Daily P/L</div><div class="stat-value" id="daily-pl">--</div></div>
+      <div class="stat">
+        <div class="stat-label" id="gain-label">Gain to Date</div>
+        <div class="stat-value" id="gain-value">--</div>
+      </div>
     </div>
     <div class="badges">
       <span class="badge" id="mode-badge">--</span>
@@ -161,6 +165,16 @@ function renderState(data) {
 
   const pl = p.daily_pl || 0;
   $('daily-pl').innerHTML = `<span class="${cls(pl)}">${fmt(pl)}</span>`;
+
+  // %-gain-to-date vs baseline equity
+  const dGain = p.dollar_gain_to_date || 0;
+  const pGain = p.pct_gain_to_date || 0;
+  const baseline = p.baseline_equity || 0;
+  const setAt = (p.baseline_set_at || '').slice(0, 10);
+  $('gain-value').innerHTML =
+    `<span class="${cls(dGain)}">${fmt(dGain)} (${pct(pGain)})</span>`;
+  $('gain-label').textContent =
+    `Gain vs ${fmt(baseline).replace('$', '$')}${setAt ? ' (since ' + setAt + ')' : ''}`;
 
   const mb = $('mode-badge');
   mb.textContent = (p.mode || 'paper').toUpperCase();

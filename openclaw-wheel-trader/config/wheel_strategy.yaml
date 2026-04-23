@@ -42,18 +42,23 @@ quant:
 
 # --- Stock Trading Parameters (Hermes-tunable) ---
 stock_params:
-  min_composite_score: 3       # Minimum total score (0-13) to enter
+  min_composite_score: 7       # Raised 5→7 — only high-conviction entries (was letting 4/9 KO in)
   stop_loss_pct: 0.035         # 3.5% stop loss (tighter = cut losses fast)
-  default_target_pct: 0.08     # 8% default target
+  default_target_pct: 0.10     # 10% default target (was 8% — let winners run)
   trailing_stop_pct: 0.03      # 3% trailing stop (locks in profits)
-  max_position_pct: 0.20       # 20% of portfolio per position (aggressive)
-  max_trades_per_scan: 3       # Up to 3 trades per scan
-  max_concurrent_positions: 5  # Hold up to 5 at once
+  max_position_pct: 0.30       # 30% of portfolio per position (concentrated growth)
+  max_trades_per_scan: 2       # Focus capital, don't spread thin
+  max_concurrent_positions: 3  # 3 concentrated positions (was 5 scattered)
   allow_momentum_only: true    # Momentum can trigger without candlestick signal
+  momentum_only_min_score: 3   # But require momentum >= 3/4 when no candlestick
   support_distance_tiers:      # How close to support for level score
     - 0.04                     # Within 4% = score 3
     - 0.07                     # Within 7% = score 2
     - 0.10                     # Within 10% = score 1
+  # Scale-out rules — lock in gains on winners, let runner ride
+  enable_scale_out: true
+  partial_exit_threshold: 0.15   # Trigger scale-out at +15% gain
+  partial_exit_fraction: 0.5     # Sell 50% of position, keep 50% riding
 
 tickers_phase2:   # CSPs on cheap stocks (collateral $500-1500)
   - F
@@ -131,3 +136,102 @@ zones:
 iv:
   min_iv_rank: 30                # Only sell options when IV rank > 30%
   iv_rank_lookback: 252          # 1 year of trading days
+
+# ============================================================
+# POLYBOT INTEGRATION — AI + NEWS GATES
+# ============================================================
+
+# --- Kronos AI Price Prediction (Gate 4) ---
+# Uses pretrained 102M-param transformer (NeoQuasar/Kronos-base)
+# Zero-shot price forecasting — no fine-tuning needed.
+# Runs on Apple Silicon (MPS), CUDA, or CPU.
+kronos:
+  enabled: true                    # Enable Kronos AI gate in stock scanning
+  model_name: "NeoQuasar/Kronos-base"
+  pred_bars: 10                    # Predict 10 trading days ahead
+  lookback: 200                    # Feed 200 days of history to model
+  sample_count: 3                  # 3 inference samples (speed vs accuracy)
+  temperature: 0.8                 # Sampling temperature
+  cache_ttl_minutes: 60            # Cache predictions for 1 hour
+  veto_return_threshold: -0.02     # Veto if predicted return < -2%
+
+# --- News Sentiment (Gate 5) ---
+# Checks recent headlines before buying.
+# Sources: NewsAPI (needs NEWSAPI_KEY env var) + Yahoo Finance RSS (free).
+news_sentiment:
+  enabled: true                    # Enable news sentiment gate
+  cache_ttl_minutes: 30            # Cache results for 30 min
+  veto_sentiment_threshold: 0.25   # Veto if sentiment < 0.25 (strongly bearish)
+  min_confidence_to_veto: 0.3     # Only veto with confidence > 30%
+
+# --- Bayesian Forecaster (Gate 6) ---
+# Combines composite score + Kronos + news + pattern + momentum into a
+# calibrated win probability using Bayes' theorem. This is the primary
+# ranking signal — candidates are sorted by Bayesian win probability.
+bayesian:
+  enabled: true                    # Enable Bayesian multi-signal forecaster
+  min_win_prob: 0.58               # Veto if aggregated win probability < 58%
+  base_rate: 0.55                  # Prior for bullish zone + trend setups
+
+# --- Correlation Detection (Gate 7) ---
+# Prevents loading up on correlated stocks (e.g., F + NIO both EV-adjacent).
+# Soft veto: reduces Kelly position size by 50% on correlated adds.
+correlation:
+  enabled: true                    # Enable correlation check
+  threshold: 0.70                  # Pearson correlation above this = flagged
+  hard_veto: false                 # false = size down; true = block entirely
+
+# --- Kelly Criterion Sizing (Gate 8) ---
+# Mathematically-optimal position sizing based on win probability and R/R.
+# Replaces fixed max_position_pct with dynamic Kelly-based allocation.
+kelly:
+  enabled: true                    # Enable Kelly sizing
+  fraction: 0.25                   # Quarter Kelly (conservative); Hermes can tune 0.15-0.50
+
+# --- Insider Flow (Gate 9 — SEC Form 4) ---
+# Pulls insider open-market BUY clusters from data.sec.gov. Bullish
+# signal when ≥3 insiders buy within 30 days (Cohen/Malloy/Pomorski,
+# Jeng/Metrick/Zeckhauser). We never trade on sells (10b5-1 noise).
+# Requires SEC_CONTACT_EMAIL env var.
+insider_flow:
+  enabled: true
+  lookback_days: 90                # Window to scan for Form 4 buys
+  min_confidence_to_boost: 0.30    # Bayesian forecaster applies signal only above this
+  # Hermes can tune these bounds within [0.0, 1.0]
+
+# --- Congress Flow (Gate 10 — Senate STOCK Act PTRs) ---
+# Pulls senator periodic transaction reports. Cluster buy = ≥3 senators
+# in 30 days (Ziobrowski et al. JFQA 2004). Default feed is community-
+# maintained and can lag — module auto-suppresses signal when stale.
+# For live data set CONGRESS_FEED_URL env var.
+congress_flow:
+  enabled: true
+  lookback_days: 180
+  feed_staleness_warn_days: 60     # Suppress signal when feed older than this
+  min_confidence_to_boost: 0.30
+
+# --- Portfolio Greeks (risk aggregation, not a gate) ---
+# Uses py_vollib analytical Black-Scholes to aggregate delta/gamma/vega/
+# theta across all open positions. Lets the risk agent enforce portfolio-
+# level vega caps rather than per-trade only.
+greeks:
+  enabled: true
+  risk_free_rate: 0.045
+  default_iv: 0.30                 # Fallback when IV chain unavailable
+  max_portfolio_vega: 500          # |total_vega| > $500/vol-pt triggers risk_agent review
+  max_portfolio_abs_delta: 0.80    # 80% of notional bankroll = ceiling on net delta exposure
+
+# --- LLM Analyst (optional, multi-provider) ---
+# Uses an LLM for qualitative reasoning on top of quantitative signals.
+# Picks which stocks to buy/sell and sometimes WHEN to act.
+# Supported providers: "deepseek" (default — fast, cheap, great reasoning)
+#                      "claude"   (fallback — needs ANTHROPIC_API_KEY)
+# Gracefully skipped if the chosen provider's API key is missing.
+llm:
+  enabled: true                    # Turn on for DeepSeek (cheap enough to run freely)
+  provider: "deepseek"             # "deepseek" | "claude"
+  model: "deepseek-chat"           # deepseek-chat (DeepSeek-V3, fast) | deepseek-reasoner (R1, deeper reasoning, slower)
+  claude_model: "claude-haiku-4-5" # Used only if provider == "claude"
+  max_tokens: 1000                 # Response cap
+  cache_ttl_minutes: 60            # Cache analyses for 1 hour per ticker+setup
+  trigger_composite_score: 8       # Invoke on 8/13+ setups (DeepSeek is cheap, cast a wider net)

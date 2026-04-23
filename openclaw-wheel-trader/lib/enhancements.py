@@ -26,17 +26,58 @@ from lib.memory_palace import diary_write, kg_add, search_memory
 # In production, pull from API (e.g., Alpha Vantage, FMP, Alpaca)
 # This is the skeleton that gets wired to live data.
 
+EARNINGS_PATH = Path(__file__).parent.parent / "data" / "earnings_calendar.json"
+
 _earnings_cache: dict[str, str] = {}  # ticker -> next earnings date
+_earnings_loaded: bool = False
+
+
+def _load_earnings_file():
+    """Load earnings dates from local JSON file into cache."""
+    global _earnings_loaded
+    if _earnings_loaded:
+        return
+    if EARNINGS_PATH.exists():
+        try:
+            with open(EARNINGS_PATH) as f:
+                data = json.load(f)
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            for ticker, date_str in data.items():
+                # Only cache future earnings
+                if date_str >= today:
+                    _earnings_cache[ticker] = date_str
+        except (json.JSONDecodeError, KeyError):
+            pass
+    _earnings_loaded = True
 
 
 def set_earnings_date(ticker: str, date: str):
     """Manually set or cache an earnings date."""
     _earnings_cache[ticker] = date
     kg_add(ticker, "earnings_date", date)
+    # Persist to file
+    _save_earnings_file()
+
+
+def _save_earnings_file():
+    """Persist the earnings cache to disk."""
+    EARNINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # Merge with existing file data
+    existing = {}
+    if EARNINGS_PATH.exists():
+        try:
+            with open(EARNINGS_PATH) as f:
+                existing = json.load(f)
+        except (json.JSONDecodeError, KeyError):
+            pass
+    existing.update(_earnings_cache)
+    with open(EARNINGS_PATH, "w") as f:
+        json.dump(existing, f, indent=2, sort_keys=True)
 
 
 def get_next_earnings(ticker: str) -> str | None:
-    """Get next earnings date for a ticker."""
+    """Get next earnings date for a ticker. Loads from file on first call."""
+    _load_earnings_file()
     return _earnings_cache.get(ticker)
 
 
@@ -46,6 +87,77 @@ def is_earnings_conflict(ticker: str, expiration: str) -> bool:
     if not earnings or not expiration:
         return False
     return expiration >= earnings
+
+
+def refresh_earnings_calendar(tickers: list[str]) -> dict[str, str]:
+    """
+    Fetch upcoming earnings dates for a list of tickers.
+
+    Tries Alpha Vantage (if ALPHA_VANTAGE_KEY env var is set),
+    then falls back to a lightweight SEC/free API scrape.
+    Results are cached to data/earnings_calendar.json.
+
+    Returns: {ticker: "YYYY-MM-DD"} for tickers with upcoming earnings
+    """
+    import os
+    import requests as _requests
+
+    updated = {}
+    av_key = os.environ.get("ALPHA_VANTAGE_KEY", "")
+
+    if av_key:
+        # Alpha Vantage EARNINGS endpoint (free tier: 25 calls/day)
+        for ticker in tickers:
+            try:
+                url = "https://www.alphavantage.co/query"
+                params = {
+                    "function": "EARNINGS",
+                    "symbol": ticker,
+                    "apikey": av_key,
+                }
+                resp = _requests.get(url, params=params, timeout=10)
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
+                upcoming = data.get("quarterlyEarnings", [])
+                if upcoming:
+                    # First entry is next/most recent
+                    next_date = upcoming[0].get("reportedDate", "")
+                    if next_date:
+                        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                        if next_date >= today:
+                            updated[ticker] = next_date
+                            _earnings_cache[ticker] = next_date
+            except Exception:
+                continue
+    else:
+        # Try Financial Modeling Prep free endpoint (no key, limited)
+        try:
+            url = "https://financialmodelingprep.com/api/v3/earning_calendar"
+            params = {"apikey": "demo"}  # Demo key for limited free access
+            resp = _requests.get(url, params=params, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                ticker_set = set(tickers)
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                for entry in data:
+                    sym = entry.get("symbol", "")
+                    date = entry.get("date", "")
+                    if sym in ticker_set and date >= today:
+                        if sym not in updated:  # Keep earliest upcoming
+                            updated[sym] = date
+                            _earnings_cache[sym] = date
+        except Exception:
+            pass
+
+    if updated:
+        _save_earnings_file()
+        log_event("enhancements", "earnings_refreshed", {
+            "count": len(updated),
+            "tickers": list(updated.keys()),
+        })
+
+    return updated
 
 
 # ============================================================

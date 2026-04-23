@@ -11,6 +11,13 @@ logs/*.log
 data/positions.json
 data/trade_history.json
 data/STATUS.md
+data/hermes_log.jsonl
+data/earnings_calendar.json
+data/*_cache/
+data/palace/
+data/llm_cache/
+data/finnhub_cache/
+data/alpha_vantage_cache/
 
 # Python
 __pycache__/
@@ -22,6 +29,7 @@ venv/
 .vscode/
 .idea/
 *.swp
+.claude/
 
 # OS
 .DS_Store

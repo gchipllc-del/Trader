@@ -17,6 +17,7 @@ from lib.alpaca_client import AlpacaClient
 
 POSITIONS_PATH = Path(__file__).parent.parent / "data" / "positions.json"
 TRADE_HISTORY_PATH = Path(__file__).parent.parent / "data" / "trade_history.json"
+BASELINE_PATH = Path(__file__).parent.parent / "data" / "baseline_equity.json"
 CONFIG_PATH = Path(__file__).parent.parent / "config" / "settings.yaml"
 STRATEGY_PATH = Path(__file__).parent.parent / "config" / "wheel_strategy.yaml"
 
@@ -31,6 +32,78 @@ def _get_client() -> AlpacaClient:
     return AlpacaClient()
 
 
+def _get_baseline(current_equity: float) -> tuple[float, str]:
+    """
+    Return (baseline_equity, set_at_iso) for the %-gain-to-date metric.
+
+    If `data/baseline_equity.json` does not yet exist, snapshot the current
+    portfolio value on first call so the dashboard has something to compare
+    against.  Users can override or reset by editing that file directly or
+    calling `set_baseline(amount)`.
+    """
+    try:
+        if BASELINE_PATH.exists():
+            with open(BASELINE_PATH) as f:
+                data = json.load(f)
+            baseline = float(data.get("baseline_equity", current_equity))
+            if baseline <= 0:
+                baseline = float(current_equity)
+            return baseline, str(data.get("set_at", ""))
+    except Exception:
+        pass  # Fall through to fresh snapshot
+
+    data = {
+        "baseline_equity": float(current_equity),
+        "set_at": datetime.now(timezone.utc).isoformat(),
+        "note": (
+            "Auto-snapshotted on first status/dashboard load. "
+            "Edit baseline_equity to set a specific starting capital, "
+            "or delete this file to re-snapshot on next load."
+        ),
+    }
+    try:
+        BASELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(BASELINE_PATH, "w") as f:
+            json.dump(data, f, indent=2)
+        try:
+            from lib.audit import log_event
+            log_event("dashboard", "baseline_snapshotted",
+                      {"baseline": float(current_equity)})
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return float(current_equity), data["set_at"]
+
+
+def set_baseline(amount: float | None = None) -> dict:
+    """
+    Manually set (or reset) the %-gain-to-date baseline.
+
+    Pass `amount=None` to snapshot the *current* portfolio value.  Returns
+    the new baseline dict so callers can report it to the user.
+    """
+    if amount is None:
+        client = _get_client()
+        account = client.get_account()
+        amount = float(account["portfolio_value"])
+
+    data = {
+        "baseline_equity": float(amount),
+        "set_at": datetime.now(timezone.utc).isoformat(),
+        "note": "Manually set via set_baseline().",
+    }
+    BASELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(BASELINE_PATH, "w") as f:
+        json.dump(data, f, indent=2)
+    try:
+        from lib.audit import log_event
+        log_event("dashboard", "baseline_manual_set", {"baseline": float(amount)})
+    except Exception:
+        pass
+    return data
+
+
 def get_portfolio_summary() -> dict:
     """Portfolio value, cash, phase, regime, daily P/L."""
     try:
@@ -40,6 +113,11 @@ def get_portfolio_summary() -> dict:
 
         daily_pl = sum(float(p.get("unrealized_pl", 0)) for p in positions)
         portfolio = account["portfolio_value"]
+
+        # %-gain-to-date vs baseline equity (auto-snapshots on first call)
+        baseline, baseline_set_at = _get_baseline(float(portfolio))
+        dollar_gain = float(portfolio) - baseline
+        pct_gain = (dollar_gain / baseline) if baseline > 0 else 0.0
 
         from lib.stock_engine import get_current_phase, PHASE_2_THRESHOLD, PHASE_3_THRESHOLD
         phase = get_current_phase(portfolio)
@@ -62,6 +140,10 @@ def get_portfolio_summary() -> dict:
             "buying_power": account["buying_power"],
             "equity": account["equity"],
             "daily_pl": round(daily_pl, 2),
+            "baseline_equity": round(baseline, 2),
+            "baseline_set_at": baseline_set_at,
+            "dollar_gain_to_date": round(dollar_gain, 2),
+            "pct_gain_to_date": round(pct_gain, 6),
             "phase": phase,
             "phase_label": phase_labels.get(phase, ""),
             "regime": regime,

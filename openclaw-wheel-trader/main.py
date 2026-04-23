@@ -2,21 +2,25 @@
 Sprint 9: Main Entry Point & Hardening
 
 The single entry point for the trading bot. Supports modes:
-  - scan      : Run one CSP/CC scan cycle
+  - scan      : Run one CSP/CC scan cycle (now with Kronos + News gates)
   - monitor   : Start continuous monitoring loop
   - backtest  : Run backtest + Monte Carlo
   - kill      : Emergency kill switch
   - status    : Print current positions and portfolio
   - chaos     : Run chaos tests (simulate failures)
   - migrate   : Begin paper→live migration checklist
+  - kronos    : Run Kronos AI price prediction on a ticker
+  - news      : Check news sentiment for a ticker
+  - calibrate : Print stock prediction accuracy report
+  - pred-scan : Scan prediction markets for opportunities (Manifold paper)
 
 Usage:
   python main.py scan
   python main.py monitor
-  python main.py backtest --ticker AAPL
-  python main.py kill
-  python main.py status
-  python main.py chaos
+  python main.py kronos --ticker AAPL
+  python main.py news --ticker SOFI
+  python main.py calibrate
+  python main.py pred-scan
 """
 
 import argparse
@@ -67,6 +71,20 @@ def _cmd_status_plain():
         print(f"  Portfolio Value:  ${account['portfolio_value']:,.2f}")
         print(f"  Cash:            ${account['cash']:,.2f}")
         print(f"  Buying Power:    ${account['buying_power']:,.2f}")
+
+        # %-gain-to-date vs baseline equity
+        try:
+            from lib.dashboard_data import _get_baseline
+            baseline, baseline_set_at = _get_baseline(float(account["portfolio_value"]))
+            dollar_gain = float(account["portfolio_value"]) - baseline
+            pct_gain = (dollar_gain / baseline) if baseline > 0 else 0.0
+            baseline_date = (baseline_set_at or "")[:10]
+            since = f" (since {baseline_date})" if baseline_date else ""
+            print(f"  Gain to Date:    ${dollar_gain:+,.2f} ({pct_gain:+.2%}) "
+                  f"vs ${baseline:,.2f} baseline{since}")
+        except Exception:
+            pass
+
         print(f"  Market Regime:   {get_current_regime() or 'unknown'}")
         print(f"\n  Open Positions:  {len(positions)}")
         for p in positions:
@@ -90,10 +108,54 @@ def _cmd_status_plain():
     print()
 
 
-def cmd_dashboard(port: int = 5050):
-    """Start the web dashboard server."""
+def cmd_baseline(amount: float | None = None, show: bool = False):
+    """
+    Set (or view) the %-gain-to-date baseline.
+
+        python main.py baseline                   # show current baseline
+        python main.py baseline --amount 932      # set starting capital to $932
+        python main.py baseline --snapshot        # use current portfolio as baseline
+    """
+    from lib.dashboard_data import set_baseline, _get_baseline, BASELINE_PATH
+    from lib.alpaca_client import AlpacaClient
+
+    if show:
+        if not BASELINE_PATH.exists():
+            print("  No baseline set yet. Run `status` or `dashboard` to auto-snapshot,")
+            print("  or `baseline --amount <X>` to set explicitly.")
+            return
+        with open(BASELINE_PATH) as f:
+            data = json.load(f)
+        print(f"  Baseline equity: ${float(data.get('baseline_equity', 0)):,.2f}")
+        print(f"  Set at:          {data.get('set_at', '')}")
+        print(f"  Note:            {data.get('note', '')}")
+
+        try:
+            client = AlpacaClient()
+            account = client.get_account()
+            current = float(account["portfolio_value"])
+            baseline = float(data.get("baseline_equity", current))
+            gain = current - baseline
+            pct = (gain / baseline) if baseline > 0 else 0.0
+            print(f"\n  Current equity:  ${current:,.2f}")
+            print(f"  Gain to date:    ${gain:+,.2f} ({pct:+.2%})")
+        except Exception as e:
+            print(f"  (Could not fetch current equity: {e})")
+        return
+
+    result = set_baseline(amount)  # amount=None → snapshot current portfolio
+    print(f"  Baseline set to ${float(result['baseline_equity']):,.2f}")
+    print(f"  Set at:         {result['set_at']}")
+
+
+def cmd_dashboard(port: int = 5051):
+    """Start the web dashboard server.
+
+    Default port 5051 avoids collision with sibling polybot project (port 5050).
+    """
     from lib.dashboard_web import run_dashboard
-    print(f"  Dashboard: http://localhost:{port}")
+    print(f"  Traderbot Dashboard: http://localhost:{port}")
+    print("  (Polybot uses 5050; traderbot uses 5051 to avoid conflict.)")
     print("  Press Ctrl+C to stop.\n")
     run_dashboard(port=port)
 
@@ -149,6 +211,15 @@ def cmd_scan():
         if portfolio <= 0 and cash <= 0:
             print("\n  ⚠️  Paper account has $0. Reset it at https://app.alpaca.markets/paper/dashboard")
             return
+
+        # Refresh earnings calendar (non-blocking — uses cached file if API fails)
+        try:
+            from lib.enhancements import refresh_earnings_calendar
+            earnings = refresh_earnings_calendar(tickers)
+            if earnings:
+                print(f"\n  📅 Earnings dates loaded: {', '.join(f'{t}={d}' for t, d in earnings.items())}")
+        except Exception:
+            pass  # Non-critical — trades still filtered by KG fallback
 
         # Fetch market data for phase-appropriate tickers
         print(f"\n  Fetching data for {len(tickers)} tickers: {', '.join(tickers)}")
@@ -235,17 +306,102 @@ def cmd_kill(reason: str = "manual_cli"):
         print("  ✅ Clean shutdown.")
 
 
-def cmd_backtest(ticker: str = "SPY"):
-    """Run backtest with Monte Carlo."""
-    print(f"📊 Backtesting Wheel Strategy on {ticker}...")
-    print("   Requires historical data. Run in Claude Code with:")
-    print(f'   "Backtest the Wheel Strategy on {ticker} using 2 years of data"')
-    print()
-    print("   The backtest engine (lib/backtest.py) supports:")
-    print("   - Walk-forward validation")
-    print("   - Monte Carlo simulation (1000+ runs)")
-    print("   - Slippage & fee modeling")
-    print("   - Benchmark comparison vs buy-and-hold")
+def cmd_backtest(ticker: str = "SPY", simulations: int = 500, capital: float = 0):
+    """Run backtest with Monte Carlo simulation on real historical data."""
+    from lib.alpaca_client import AlpacaClient
+    from lib.backtest import run_wheel_backtest, run_monte_carlo, compare_to_benchmark
+
+    sep = "=" * 58
+    print(f"\n  {sep}")
+    print(f"  📊 WHEEL STRATEGY BACKTEST — {ticker}")
+    print(f"  {sep}")
+
+    try:
+        client = AlpacaClient()
+
+        # Use actual portfolio value if not specified
+        if capital <= 0:
+            account = client.get_account()
+            capital = account["portfolio_value"]
+        print(f"  Starting capital: ${capital:,.2f}")
+        print(f"  Monte Carlo runs: {simulations}")
+
+        # Fetch 252 trading days (~1 year) of daily bars
+        print(f"\n  Fetching {ticker} daily bars (1 year)...")
+        daily_data = client.get_bars([ticker], timeframe="1Day", limit=252)
+
+        if ticker not in daily_data or daily_data[ticker].empty:
+            print(f"\n  ❌ No data for {ticker}. Check ticker symbol.")
+            return
+
+        df = daily_data[ticker]
+        print(f"  Got {len(df)} bars ({df.index[0].strftime('%Y-%m-%d')} → {df.index[-1].strftime('%Y-%m-%d')})")
+
+        # ---- Run Wheel Backtest ----
+        print(f"\n  Running Wheel backtest...")
+        bt = run_wheel_backtest(df, initial_capital=capital)
+
+        print(f"\n  {'─' * 42}")
+        print(f"  WHEEL STRATEGY RESULTS")
+        print(f"  {'─' * 42}")
+        print(f"  Total Return:      {bt.total_return:>+8.2%}")
+        print(f"  Annualized Return: {bt.annualized_return:>+8.2%}")
+        print(f"  Max Drawdown:      {bt.max_drawdown:>8.2%}")
+        print(f"  Sharpe Ratio:      {bt.sharpe_ratio:>8.2f}")
+        print(f"  Sortino Ratio:     {bt.sortino_ratio:>8.2f}")
+        print(f"  Win Rate:          {bt.win_rate:>8.2%}")
+        print(f"  Total Trades:      {bt.total_trades:>8d}")
+        print(f"  Avg Trade P/L:     ${bt.avg_trade_pnl:>8.2f}")
+        print(f"  Total Premiums:    ${bt.total_premiums:>10.2f}")
+        print(f"  Assignments:       {bt.assignments:>8d}")
+        print(f"  Wheel Cycles:      {bt.wheel_cycles_completed:>8d}")
+
+        # ---- Benchmark Comparison ----
+        bench = compare_to_benchmark(df, bt)
+        print(f"\n  {'─' * 42}")
+        print(f"  vs BUY & HOLD {ticker}")
+        print(f"  {'─' * 42}")
+        print(f"  B&H Return:        {bench['buy_and_hold']['total_return']:>+8.2%}")
+        print(f"  B&H Annualized:    {bench['buy_and_hold']['annualized']:>+8.2%}")
+        print(f"  B&H Max Drawdown:  {bench['buy_and_hold']['max_drawdown']:>8.2%}")
+        out = bench['outperformance']
+        label = "OUTPERFORMS" if out > 0 else "UNDERPERFORMS"
+        print(f"  Wheel {label}: {out:>+.2%}")
+
+        # ---- Monte Carlo ----
+        print(f"\n  Running Monte Carlo ({simulations} simulations)...")
+        mc = run_monte_carlo(df, n_simulations=simulations, initial_capital=capital)
+
+        print(f"\n  {'─' * 42}")
+        print(f"  MONTE CARLO DISTRIBUTION")
+        print(f"  {'─' * 42}")
+        print(f"  Mean Return:       {mc.mean_return:>+8.2%}")
+        print(f"  Median Return:     {mc.median_return:>+8.2%}")
+        print(f"  Std Dev:           {mc.std_return:>8.2%}")
+        print(f"  5th Percentile:    {mc.percentile_5:>+8.2%}  (worst case)")
+        print(f"  25th Percentile:   {mc.percentile_25:>+8.2%}")
+        print(f"  75th Percentile:   {mc.percentile_75:>+8.2%}")
+        print(f"  95th Percentile:   {mc.percentile_95:>+8.2%}  (best case)")
+        print(f"  P(Loss):           {mc.probability_of_loss:>8.2%}")
+        print(f"  P(Ruin >50% DD):   {mc.probability_of_ruin:>8.2%}")
+
+        # Final verdict
+        print(f"\n  {'─' * 42}")
+        if mc.probability_of_loss < 0.20 and mc.mean_return > 0.05:
+            print(f"  ✅ VERDICT: Strategy looks viable on {ticker}")
+            print(f"     {mc.probability_of_loss:.0%} chance of loss, {mc.mean_return:.1%} avg return")
+        elif mc.probability_of_loss < 0.40:
+            print(f"  ⚠️  VERDICT: Moderate risk on {ticker}")
+            print(f"     {mc.probability_of_loss:.0%} chance of loss — consider tighter parameters")
+        else:
+            print(f"  ❌ VERDICT: High risk on {ticker}")
+            print(f"     {mc.probability_of_loss:.0%} chance of loss — not recommended")
+        print()
+
+    except Exception as e:
+        print(f"\n  ❌ Backtest failed: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 def cmd_chaos():
@@ -365,6 +521,915 @@ def cmd_pdt():
     print()
 
 
+def cmd_kronos(ticker: str = "SPY"):
+    """Run Kronos AI price prediction on a ticker."""
+    print(f"\n  {'=' * 55}")
+    print(f"  🧠 KRONOS AI PRICE FORECAST — {ticker}")
+    print(f"  {'=' * 55}")
+
+    try:
+        from lib.kronos_forecaster import predict_price
+
+        print(f"  Loading Kronos model (first run downloads ~400MB)...\n")
+
+        forecast = predict_price(
+            ticker=ticker,
+            pred_bars=30,
+            interval="1d",
+            lookback=400,
+            sample_count=5,
+            temperature=0.8,
+        )
+
+        # Direction emoji
+        dir_emoji = {"bullish": "🟢", "bearish": "🔴", "neutral": "🟡"}
+        emoji = dir_emoji.get(forecast.direction, "⚪")
+
+        print(f"  Current Price:     ${forecast.current_price:,.2f}")
+        print(f"  30-Day Forecast:   ${forecast.pred_final_close:,.2f} ({forecast.expected_return:+.1%})")
+        print(f"  Direction:         {emoji} {forecast.direction.upper()}")
+        print(f"  Confidence:        {forecast.confidence:.2f}")
+        print(f"  Predicted High:    ${forecast.pred_high_watermark:,.2f}")
+        print(f"  Predicted Low:     ${forecast.pred_low_watermark:,.2f}")
+        print(f"  Lookback Bars:     {forecast.lookback_bars}")
+
+        # Price trajectory (simplified sparkline)
+        closes = forecast.predicted_close
+        if closes:
+            print(f"\n  30-Day Price Trajectory:")
+            step = max(1, len(closes) // 10)
+            for i in range(0, len(closes), step):
+                bar_pct = (closes[i] - forecast.current_price) / forecast.current_price
+                bar_len = int(abs(bar_pct) * 200)
+                if bar_pct >= 0:
+                    bar = "  " + "▓" * min(bar_len, 30)
+                    print(f"    Day {i+1:>2}: ${closes[i]:>8.2f} {bar_pct:+.1%} {bar}")
+                else:
+                    bar = "░" * min(bar_len, 30) + "  "
+                    print(f"    Day {i+1:>2}: ${closes[i]:>8.2f} {bar_pct:+.1%} {bar}")
+
+        print()
+
+    except Exception as e:
+        print(f"\n  ❌ Kronos prediction failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def cmd_news(ticker: str = "SPY"):
+    """Check news sentiment for a ticker."""
+    print(f"\n  {'=' * 55}")
+    print(f"  📰 NEWS SENTIMENT CHECK — {ticker}")
+    print(f"  {'=' * 55}")
+
+    try:
+        from lib.news_sentiment import check_stock_sentiment
+
+        result = check_stock_sentiment(ticker)
+
+        sig_emoji = {"bullish": "🟢", "bearish": "🔴", "neutral": "🟡"}
+        emoji = sig_emoji.get(result.signal, "⚪")
+
+        print(f"\n  Signal:       {emoji} {result.signal.upper()}")
+        print(f"  Sentiment:    {result.sentiment:.2f} (0=bearish, 1=bullish)")
+        print(f"  Confidence:   {result.confidence:.2f}")
+        print(f"  Articles:     {result.article_count}")
+        print(f"  Cached:       {'yes' if result.cached else 'no'}")
+
+        if result.headlines:
+            print(f"\n  Recent Headlines:")
+            for i, h in enumerate(result.headlines[:5], 1):
+                print(f"    {i}. {h[:80]}")
+
+        # Trade implication
+        if result.sentiment < 0.25 and result.confidence > 0.3:
+            print(f"\n  ⚠️  TRADE SIGNAL: Avoid buying {ticker} — strong bearish news")
+        elif result.sentiment > 0.70 and result.confidence > 0.3:
+            print(f"\n  ✅ TRADE SIGNAL: News supports buying {ticker}")
+        else:
+            print(f"\n  ℹ️  TRADE SIGNAL: News is neutral — no strong opinion")
+
+        print()
+
+    except Exception as e:
+        print(f"\n  ❌ News check failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def cmd_insiders(ticker: str = "SPY"):
+    """Check SEC Form 4 insider-buying signal for a ticker."""
+    print(f"\n  {'=' * 55}")
+    print(f"  🏢 INSIDER FLOW — {ticker}")
+    print(f"  {'=' * 55}")
+
+    try:
+        from lib.insider_flow import check_insider_flow
+
+        result = check_insider_flow(ticker, days=90)
+
+        sig_emoji = {
+            "bullish_cluster": "🟢🟢",
+            "bullish": "🟢",
+            "neutral": "🟡",
+            "bearish": "🔴",
+        }
+        emoji = sig_emoji.get(result.signal, "⚪")
+
+        print(f"\n  Signal:           {emoji} {result.signal.upper()}")
+        print(f"  Sentiment:        {result.sentiment:.2f} (0.5 = neutral)")
+        print(f"  Confidence:       {result.confidence:.2f}")
+        print(f"  Buys (90d):       {result.buy_count} purchases")
+        print(f"  Sells (90d):      {result.sell_count}  (informational only)")
+        print(f"  Cluster detected: {'YES ⚡' if result.cluster_detected else 'no'}")
+        print(f"  Total buy $:      ${result.total_buy_value_usd:,.0f}")
+        print(f"  Cached:           {'yes' if result.cached else 'no'}")
+        print(f"  Reason:           {result.reason}")
+
+        if result.recent_buys:
+            print(f"\n  Recent insider purchases:")
+            for b in result.recent_buys[:5]:
+                title = f" ({b.insider_title[:20]})" if b.insider_title else ""
+                print(f"    • {b.filing_date}  {b.insider_name[:30]:<30}{title}")
+                print(f"        {b.shares:>6} sh @ ${b.price_per_share:>7.2f}  "
+                      f"(${b.dollar_value:>10,.0f})")
+
+        # Trade implication
+        if result.cluster_detected:
+            print(f"\n  ✅ TRADE SIGNAL: Insider cluster buy — "
+                  f"positive lead indicator for {ticker}")
+        elif result.signal == "bullish":
+            print(f"\n  ℹ️  TRADE SIGNAL: Meaningful insider buying — mild tailwind")
+        else:
+            print(f"\n  ℹ️  TRADE SIGNAL: No material insider buying in window")
+
+        print()
+
+    except Exception as e:
+        print(f"\n  ❌ Insider flow check failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def cmd_congress(ticker: str = "SPY"):
+    """Check Senate STOCK Act purchase signal for a ticker."""
+    print(f"\n  {'=' * 55}")
+    print(f"  🏛️  CONGRESS FLOW — {ticker}")
+    print(f"  {'=' * 55}")
+
+    try:
+        from lib.congress_flow import check_congress_flow
+
+        result = check_congress_flow(ticker, days=180)
+
+        sig_emoji = {
+            "bullish_cluster": "🟢🟢",
+            "bullish": "🟢",
+            "neutral": "🟡",
+        }
+        emoji = sig_emoji.get(result.signal, "⚪")
+
+        print(f"\n  Signal:           {emoji} {result.signal.upper()}")
+        print(f"  Sentiment:        {result.sentiment:.2f}")
+        print(f"  Confidence:       {result.confidence:.2f}")
+        print(f"  Buys (180d):      {result.buy_count} senator purchases")
+        print(f"  Sells:            {result.sell_count}  (informational)")
+        print(f"  Distinct 30d:     {result.distinct_buyers_30d}")
+        print(f"  Cluster detected: {'YES ⚡' if result.cluster_detected else 'no'}")
+        print(f"  Total buy $:      ${result.total_buy_midpoint_usd:,.0f}")
+        print(f"  Cached:           {'yes' if result.cached else 'no'}")
+
+        # Feed freshness — critical context
+        freshness_flag = "⚠️  STALE" if result.feed_stale else "✓ fresh"
+        print(f"  Feed newest txn:  {result.feed_newest_txn_date} "
+              f"({result.feed_age_days}d old — {freshness_flag})")
+        print(f"  Reason:           {result.reason}")
+
+        if result.feed_stale:
+            print(f"\n  ⚠️  Feed is stale — signal is suppressed to confidence~0.")
+            print(f"     Export CONGRESS_FEED_URL=<paid feed URL> for live data.")
+
+        if result.recent_buys:
+            print(f"\n  Recent Senate purchases:")
+            for b in result.recent_buys[:5]:
+                print(f"    • {b.transaction_date}  {b.senator[:30]:<30}"
+                      f"  ({b.owner})  ~${b.amount_midpoint_usd:,.0f}")
+
+        # Trade implication
+        if result.feed_stale:
+            print(f"\n  ℹ️  TRADE SIGNAL: Signal suppressed (stale data)")
+        elif result.cluster_detected:
+            print(f"\n  ✅ TRADE SIGNAL: Senate cluster buy on {ticker}")
+        elif result.signal == "bullish":
+            print(f"\n  ℹ️  TRADE SIGNAL: Material Senate buying — mild tailwind")
+        else:
+            print(f"\n  ℹ️  TRADE SIGNAL: No material Senate activity")
+
+        print()
+
+    except Exception as e:
+        print(f"\n  ❌ Congress flow check failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def cmd_greeks():
+    """Display portfolio-level Greeks across all open positions."""
+    print(f"\n  {'=' * 65}")
+    print(f"  Δ  PORTFOLIO GREEKS")
+    print(f"  {'=' * 65}")
+
+    try:
+        import json
+        from pathlib import Path
+        from lib.portfolio_greeks import compute_portfolio_greeks
+
+        positions_path = Path(__file__).parent / "data" / "positions.json"
+        positions = json.loads(positions_path.read_text())
+
+        # Prefer live Alpaca spots; fall back to entry prices
+        try:
+            from lib.alpaca_client import AlpacaClient
+            client = AlpacaClient()
+            def _spot(tkr: str):
+                try:
+                    return float(client.get_latest_quote(tkr).get("ask_price") or
+                                 client.get_latest_quote(tkr).get("bid_price"))
+                except Exception:
+                    return None
+        except Exception:
+            _spot = lambda tkr: None
+
+        portfolio = compute_portfolio_greeks(positions, spot_fetcher=_spot)
+
+        print(f"\n  Open positions: {len(portfolio.positions) - portfolio.invalid_count} valid / "
+              f"{portfolio.invalid_count} invalid")
+        print(f"\n  ─── Aggregated exposures ─────────────────────────────────────")
+        print(f"   Δ  Delta  (share-equiv):  {portfolio.total_delta:>12,.2f}")
+        print(f"   Γ  Gamma  (per $1 move):  {portfolio.total_gamma:>12,.4f}")
+        print(f"   v  Vega   ($/vol-point):  ${portfolio.total_vega:>11,.2f}")
+        print(f"   θ  Theta  ($/day):        ${portfolio.total_theta:>11,.2f}")
+        print(f"   |Δ| gross (absolute):     {portfolio.gross_delta:>12,.2f}")
+
+        print(f"\n  ─── Per-position breakdown ───────────────────────────────────")
+        print(f"  {'ticker':7s} {'type':6s} {'qty':>5s} {'Δ':>9s} {'Γ':>9s}"
+              f" {'vega':>9s} {'theta':>9s}  notes")
+        for pg in portfolio.positions:
+            flag = " " if pg.valid else "✗"
+            print(f"  {flag}{pg.ticker:6s} {pg.position_type:6s} {pg.quantity:>5d}"
+                  f" {pg.delta:>9.2f} {pg.gamma:>9.4f}"
+                  f" {pg.vega:>9.2f} {pg.theta:>9.2f}  {pg.reason[:30]}")
+
+        # Interpretation
+        print(f"\n  ─── Interpretation ───────────────────────────────────────────")
+        if portfolio.total_theta > 0:
+            print(f"   θ Collecting ~${portfolio.total_theta:.2f}/day in theta — engine running.")
+        if portfolio.total_vega < -100:
+            print(f"   v Short ${-portfolio.total_vega:.0f} vega → exposed to an IV spike.")
+        elif portfolio.total_vega > 100:
+            print(f"   v Long ${portfolio.total_vega:.0f} vega → benefits from IV expansion.")
+        if abs(portfolio.total_gamma) > 0.10:
+            print(f"   Γ Non-trivial gamma — blow-up risk near short option strikes.")
+
+        print()
+
+    except Exception as e:
+        print(f"\n  ❌ Portfolio Greeks calculation failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def cmd_calibrate():
+    """Print stock prediction accuracy report."""
+    from lib.stock_calibration import print_calibration_report
+    print()
+    print_calibration_report()
+    print()
+
+
+def cmd_forecast(ticker: str = "SPY"):
+    """Bayesian multi-signal forecast for a ticker. Combines all signals."""
+    from lib.alpaca_client import AlpacaClient
+    from lib.data_pipeline import fetch_all_data
+    from lib.stock_engine import score_stock_buy
+    from lib.bayesian_forecaster import forecast_stock
+    from lib.news_sentiment import check_stock_sentiment
+
+    print(f"\n  {'=' * 60}")
+    print(f"  🔮 BAYESIAN MULTI-SIGNAL FORECAST — {ticker}")
+    print(f"  {'=' * 60}")
+
+    try:
+        client = AlpacaClient()
+        data = fetch_all_data(client, tickers=[ticker])
+        daily_df = data["daily_data"].get(ticker)
+        weekly_df = data["weekly_data"].get(ticker)
+
+        if daily_df is None or weekly_df is None:
+            print(f"  ❌ No data for {ticker}")
+            return
+
+        current_price = float(daily_df["close"].iloc[-1])
+
+        # Score the setup
+        candidate = score_stock_buy(ticker, daily_df, weekly_df, current_price, 1000.0)
+        if not candidate:
+            print(f"  No viable setup for {ticker} (insufficient data)")
+            return
+
+        # Optional: Kronos forecast
+        kronos_er = None
+        kronos_conf = 0.5
+        try:
+            from lib.kronos_forecaster import predict_price
+            print(f"  Running Kronos AI prediction (may take ~30s)...")
+            kronos = predict_price(ticker, pred_bars=10, lookback=200, sample_count=3)
+            kronos_er = kronos.expected_return
+            kronos_conf = kronos.confidence
+            print(f"  Kronos: {kronos.direction} ({kronos_er:+.1%}, conf={kronos_conf:.2f})")
+        except Exception as e:
+            print(f"  Kronos unavailable: {str(e)[:60]}")
+
+        # Optional: News sentiment
+        news_sent = None
+        news_conf = 0.5
+        try:
+            news = check_stock_sentiment(ticker)
+            news_sent = news.sentiment
+            news_conf = news.confidence
+            print(f"  News:   {news.signal} (sentiment={news_sent:.2f}, n={news.article_count})")
+        except Exception:
+            print(f"  News unavailable")
+
+        # Bayesian aggregation
+        forecast = forecast_stock(
+            ticker=ticker,
+            composite_score=candidate["composite_score"],
+            trend_score=candidate["trend_score"],
+            level_score=candidate["level_score"],
+            signal_score=candidate["signal_score"],
+            momentum_score=candidate["momentum_score"],
+            pattern=candidate["pattern"],
+            zone_touches=candidate.get("zone_touches", 0),
+            weekly_direction=candidate["weekly_trend"],
+            kronos_expected_return=kronos_er,
+            kronos_confidence=kronos_conf,
+            news_sentiment=news_sent,
+            news_confidence=news_conf,
+        )
+
+        # Display
+        print(f"\n  --- Setup ---")
+        print(f"  Current:         ${current_price:.2f}")
+        print(f"  Target:          ${candidate['target_price']:.2f} "
+              f"({(candidate['target_price']/current_price-1)*100:+.1f}%)")
+        print(f"  Stop:            ${candidate['stop_loss']:.2f} "
+              f"({(candidate['stop_loss']/current_price-1)*100:+.1f}%)")
+        print(f"  Composite:       {candidate['composite_score']}/13")
+        print(f"  Pattern:         {candidate['pattern'] or 'none'}")
+
+        print(f"\n  --- Bayesian Chain ---")
+        for step in forecast.bayesian_chain:
+            name = step.get("step", "")
+            post = step.get("posterior", step.get("prob", 0))
+            lh = step.get("likelihood", "-")
+            if lh == "-":
+                print(f"    {name:12s} → p={post:.3f}")
+            else:
+                print(f"    {name:12s} lh={lh:.3f}  → p={post:.3f}")
+
+        print(f"\n  --- Result ---")
+        emoji = "🟢" if forecast.recommended else "🔴"
+        print(f"  {emoji} Win probability: {forecast.win_probability:.1%}")
+        print(f"     Confidence:     {forecast.confidence:.2f}")
+        print(f"     Evidence:       {forecast.evidence_summary}")
+        print(f"     Recommendation: {'BUY' if forecast.recommended else 'SKIP'}")
+        print(f"     Reason:         {forecast.reason}")
+
+        # Show Kelly sizing if recommended
+        if forecast.recommended:
+            from lib.kelly import kelly_position_size
+            account = client.get_account()
+            pv = account["portfolio_value"]
+            sizing = kelly_position_size(
+                portfolio_value=pv,
+                current_price=current_price,
+                target_price=candidate["target_price"],
+                stop_loss=candidate["stop_loss"],
+                composite_score=candidate["composite_score"],
+                kronos_expected_return=kronos_er,
+            )
+            print(f"\n  --- Kelly Sizing (portfolio ${pv:,.2f}) ---")
+            print(f"     Shares:        {sizing.get('shares', 0)}")
+            print(f"     Position $:    ${sizing.get('position_value', 0):.2f} "
+                  f"({sizing.get('pct_of_portfolio', 0)*100:.1f}% of portfolio)")
+            print(f"     Reward/Risk:   {sizing.get('reward_to_risk', 0)}x")
+            print(f"     Full Kelly:    {sizing.get('full_kelly', 0):+.2%}")
+            print(f"     Frac Kelly:    {sizing.get('fractional_kelly', 0):+.2%}")
+
+        print()
+
+    except Exception as e:
+        print(f"\n  ❌ Forecast failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def cmd_kelly(ticker: str = "SPY"):
+    """Show Kelly-optimal position sizing for a ticker's current setup."""
+    from lib.alpaca_client import AlpacaClient
+    from lib.data_pipeline import fetch_all_data
+    from lib.stock_engine import score_stock_buy
+    from lib.kelly import kelly_position_size, composite_to_win_prob
+
+    print(f"\n  {'=' * 55}")
+    print(f"  💰 KELLY CRITERION SIZING — {ticker}")
+    print(f"  {'=' * 55}")
+
+    try:
+        client = AlpacaClient()
+        account = client.get_account()
+        pv = account["portfolio_value"]
+
+        data = fetch_all_data(client, tickers=[ticker])
+        daily_df = data["daily_data"].get(ticker)
+        weekly_df = data["weekly_data"].get(ticker)
+
+        if daily_df is None:
+            print(f"  ❌ No data for {ticker}")
+            return
+
+        current_price = float(daily_df["close"].iloc[-1])
+        candidate = score_stock_buy(ticker, daily_df, weekly_df, current_price, 1000.0)
+        if not candidate:
+            print(f"  No setup for {ticker}")
+            return
+
+        base_win_prob = composite_to_win_prob(candidate["composite_score"])
+
+        sizing = kelly_position_size(
+            portfolio_value=pv,
+            current_price=current_price,
+            target_price=candidate["target_price"],
+            stop_loss=candidate["stop_loss"],
+            composite_score=candidate["composite_score"],
+        )
+
+        print(f"\n  Portfolio:       ${pv:,.2f}")
+        print(f"  Current price:   ${current_price:.2f}")
+        print(f"  Target:          ${candidate['target_price']:.2f} ({sizing.get('reward_pct', 0)*100:+.1f}%)")
+        print(f"  Stop:            ${candidate['stop_loss']:.2f} (-{sizing.get('risk_pct', 0)*100:.1f}%)")
+        print(f"  Composite:       {candidate['composite_score']}/13")
+        print(f"\n  --- Probability Inputs ---")
+        print(f"  Base win prob:   {base_win_prob:.1%} (from composite score)")
+        print(f"  Final win prob:  {sizing.get('win_prob', 0):.1%}")
+        print(f"  Reward/Risk:     {sizing.get('reward_to_risk', 0)}x")
+        print(f"\n  --- Kelly Output ---")
+        print(f"  Full Kelly:      {sizing.get('full_kelly', 0)*100:+.1f}% of bankroll")
+        print(f"  Frac Kelly (¼):  {sizing.get('fractional_kelly', 0)*100:+.1f}% of bankroll")
+        print(f"  Position cap:    {sizing.get('pct_of_portfolio', 0)*100:.1f}%")
+        print(f"\n  --- Recommendation ---")
+        shares = sizing.get('shares', 0)
+        if shares > 0:
+            print(f"  🟢 Buy {shares}x {ticker} @ ${current_price:.2f} = ${sizing['position_value']:,.2f}")
+        else:
+            print(f"  🔴 No trade: {sizing.get('reason', 'unknown')}")
+        print()
+
+    except Exception as e:
+        print(f"\n  ❌ Kelly calculation failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def cmd_llm(ticker: str = "SPY"):
+    """Ask the configured LLM (DeepSeek or Claude) to analyze a stock setup."""
+    from lib.alpaca_client import AlpacaClient
+    from lib.data_pipeline import fetch_all_data
+    from lib.stock_engine import score_stock_buy
+    from lib.llm_analyst import analyze_stock_setup, llm_status
+    from lib.news_sentiment import check_stock_sentiment
+
+    status = llm_status()
+    provider = status["provider"]
+    model = status["model"]
+
+    print(f"\n  {'=' * 55}")
+    print(f"  🧠 LLM ANALYSIS — {ticker}")
+    print(f"     Provider: {provider}  Model: {model}")
+    print(f"  {'=' * 55}")
+
+    # Up-front key check with actionable guidance
+    if provider == "deepseek" and not status["deepseek_key_set"]:
+        print(f"\n  ⚠️  DEEPSEEK_API_KEY not set in environment.")
+        print(f"     Add it to .env — get one at https://platform.deepseek.com")
+        print(f"     Or switch provider in config/wheel_strategy.yaml: llm.provider = \"claude\"")
+        return
+    if provider == "claude" and not status["anthropic_key_set"]:
+        print(f"\n  ⚠️  ANTHROPIC_API_KEY not set in environment.")
+        print(f"     Get a key at https://console.anthropic.com/settings/keys")
+        print(f"     Or switch provider in config/wheel_strategy.yaml: llm.provider = \"deepseek\"")
+        return
+
+    try:
+        client = AlpacaClient()
+        data = fetch_all_data(client, tickers=[ticker])
+        daily_df = data["daily_data"].get(ticker)
+        weekly_df = data["weekly_data"].get(ticker)
+        if daily_df is None:
+            print(f"  ❌ No data for {ticker}")
+            return
+
+        current_price = float(daily_df["close"].iloc[-1])
+        candidate = score_stock_buy(ticker, daily_df, weekly_df, current_price, 1000.0)
+        if not candidate:
+            print(f"  No setup for {ticker}")
+            return
+
+        # Pull Kronos forecast if available (adds real signal to the prompt)
+        kronos_direction = None
+        kronos_expected_return = None
+        try:
+            from lib.kronos_forecaster import forecast_ticker
+            kf = forecast_ticker(ticker)
+            if kf is not None:
+                kronos_direction = kf.direction
+                kronos_expected_return = kf.expected_return
+        except Exception:
+            pass  # Kronos optional
+
+        news = check_stock_sentiment(ticker)
+
+        print(f"  Asking {provider}...")
+        analysis = analyze_stock_setup(
+            ticker=ticker,
+            current_price=current_price,
+            target_price=candidate["target_price"],
+            stop_loss=candidate["stop_loss"],
+            composite_score=candidate["composite_score"],
+            pattern=candidate["pattern"],
+            momentum_score=candidate["momentum_score"],
+            kronos_direction=kronos_direction,
+            kronos_expected_return=kronos_expected_return,
+            news_sentiment=news.sentiment,
+            recent_headlines=news.headlines,
+        )
+
+        if analysis is None:
+            print(f"\n  ⚠️  LLM analysis unavailable (API failed or parse error).")
+            print(f"     Check logs/audit_log.jsonl for 'llm_analyst' entries.")
+            return
+
+        # Color the action
+        action = analysis.suggested_action.upper()
+        action_icon = {"BUY": "🟢", "WAIT": "🟡", "SKIP": "🔴"}.get(action, "⚪")
+
+        print(f"\n  Win Probability:   {analysis.win_probability:.1%}")
+        print(f"  Confidence:        {analysis.confidence:.2f}")
+        print(f"  Suggested Action:  {action_icon} {action}")
+        print(f"  Cached:            {'yes' if analysis.cached else 'no'}")
+
+        if analysis.bullish_factors:
+            print(f"\n  Bullish Factors:")
+            for f in analysis.bullish_factors:
+                print(f"    ✓ {f}")
+        if analysis.bearish_factors:
+            print(f"\n  Bearish Factors:")
+            for f in analysis.bearish_factors:
+                print(f"    ✗ {f}")
+        if analysis.reasoning:
+            print(f"\n  Reasoning:")
+            print(f"    {analysis.reasoning}")
+        print()
+
+    except Exception as e:
+        print(f"\n  ❌ LLM analysis failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def cmd_correlation():
+    """Show correlation groups for current holdings + target universe."""
+    from lib.correlation import get_sector_groups, check_portfolio_correlation
+    from lib.alpaca_client import AlpacaClient
+    from lib.data_pipeline import fetch_all_data
+    import yaml as _yaml
+
+    print(f"\n  {'=' * 55}")
+    print(f"  🔗 CORRELATION ANALYSIS")
+    print(f"  {'=' * 55}")
+
+    try:
+        client = AlpacaClient()
+        positions = client.get_positions()
+        held = [p["symbol"] for p in positions]
+
+        with open(Path(__file__).parent / "config" / "wheel_strategy.yaml") as f:
+            strategy = _yaml.safe_load(f)
+        universe = strategy.get("tickers_phase1", [])
+
+        print(f"\n  Currently held: {', '.join(held) if held else '(none)'}")
+        print(f"  Universe:       {len(universe)} tickers")
+
+        # Show sector groups in holdings
+        if held:
+            groups = get_sector_groups(held)
+            print(f"\n  --- Holdings by Sector ---")
+            for group, members in groups.items():
+                if len(members) > 1:
+                    print(f"  ⚠️  {group}: {', '.join(members)}  (concentrated!)")
+                else:
+                    print(f"  {group}: {', '.join(members)}")
+
+        # Show groups in full universe
+        universe_groups = get_sector_groups(universe)
+        print(f"\n  --- Universe Diversity ---")
+        for group, members in universe_groups.items():
+            print(f"  {group:15s}: {', '.join(members)}")
+
+        # Price correlation with held positions
+        if held and len(held) >= 2:
+            print(f"\n  Fetching price data for correlation check...")
+            tickers_to_fetch = list(set(held + universe[:10]))  # Limit fetch
+            data = fetch_all_data(client, tickers=tickers_to_fetch)
+            daily_data = data["daily_data"]
+
+            print(f"\n  --- Held Position Correlations (60d log returns) ---")
+            from lib.correlation import check_correlation
+            for i, a in enumerate(held):
+                for b in held[i+1:]:
+                    df_a = daily_data.get(a)
+                    df_b = daily_data.get(b)
+                    if df_a is not None and df_b is not None:
+                        result = check_correlation(a, b, df_a, df_b, threshold=0.70)
+                        icon = "🔴" if result.is_correlated else "🟢"
+                        print(f"  {icon} {a}↔{b}: {result.price_correlation:+.2f}  {result.reason}")
+        print()
+
+    except Exception as e:
+        print(f"\n  ❌ Correlation check failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def cmd_earnings(ticker: str = "SPY"):
+    """Show next earnings date + option-sale veto status for a ticker."""
+    from lib.earnings_filter import check_earnings, has_earnings_before
+    from lib.finnhub_client import finnhub_status
+    from datetime import datetime, timezone, timedelta
+
+    print(f"\n  {'=' * 55}")
+    print(f"  📅 EARNINGS CHECK — {ticker}")
+    print(f"  {'=' * 55}")
+
+    status = finnhub_status()
+    if not status["key_set"]:
+        print(f"\n  ⚠️  FINNHUB_API_KEY not set in .env")
+        print(f"     Get a free key at https://finnhub.io/dashboard")
+        print(f"     Then paste into .env on the FINNHUB_API_KEY= line.")
+        return
+
+    try:
+        check = check_earnings(ticker, window_days=14)
+        print(f"\n  Next earnings:       {check.next_earnings or '(unknown / none scheduled)'}")
+        if check.days_until is not None:
+            print(f"  Days until:          {check.days_until}")
+        print(f"  Within 14d window:   {'YES ⚠️' if check.has_earnings_in_window else 'no'}")
+        print(f"  Data source:         {check.data_source}")
+        print(f"  Reason:              {check.reason}")
+
+        # Check 30-day and 45-day option expirations (wheel DTE range)
+        today = datetime.now(timezone.utc).date()
+        for dte in (30, 45):
+            target = today + timedelta(days=dte)
+            veto = has_earnings_before(ticker, target)
+            icon = "🔴 VETO" if veto else "🟢 OK"
+            print(f"  {dte}-DTE expiration:   {icon}  (exp date {target.isoformat()})")
+
+        print()
+    except Exception as e:
+        print(f"\n  ❌ Earnings check failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def cmd_econ():
+    """Show latest macro snapshot (GDP, CPI, unemployment, fed funds, 10Y) via Alpha Vantage."""
+    from lib.alpha_vantage_client import get_economic_snapshot, alpha_vantage_status
+
+    print(f"\n  {'=' * 55}")
+    print(f"  🏛️  ECONOMIC SNAPSHOT")
+    print(f"  {'=' * 55}")
+
+    status = alpha_vantage_status()
+    if not status["key_set"]:
+        print(f"\n  ⚠️  ALPHA_VANTAGE_API_KEY not set in .env")
+        print(f"     Free key: https://www.alphavantage.co/support/#api-key")
+        return
+
+    try:
+        print(f"\n  Fetching (5 AV calls; rate-limited to 1/12s — ~1min cold, instant cached)...")
+        snap = get_economic_snapshot()
+        if snap is None:
+            print(f"\n  ❌ No data returned. Check logs/audit_log.jsonl for 'alpha_vantage' errors.")
+            return
+
+        def _fmt(v, unit=""):
+            return f"{v:.2f}{unit}" if v is not None else "n/a"
+
+        print(f"\n  As of:               {snap.as_of or 'unknown'}")
+        print(f"  Real GDP growth:     {_fmt(snap.gdp_growth)}")
+        print(f"  CPI (level):         {_fmt(snap.cpi)}")
+        print(f"  Unemployment rate:   {_fmt(snap.unemployment, '%')}")
+        print(f"  Fed Funds rate:      {_fmt(snap.fed_funds_rate, '%')}")
+        print(f"  10Y Treasury yield:  {_fmt(snap.treasury_10y, '%')}")
+        print()
+    except Exception as e:
+        print(f"\n  ❌ Economic snapshot failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def cmd_finnhub(ticker: str = "SPY"):
+    """Comprehensive Finnhub data dump for a ticker — quote, analysts, fundamentals, insiders."""
+    from lib.finnhub_client import (
+        finnhub_status, get_quote, get_analyst_recs, get_basic_financials,
+        get_insider_trades, get_company_news, next_earnings_date,
+    )
+
+    print(f"\n  {'=' * 55}")
+    print(f"  📊 FINNHUB SNAPSHOT — {ticker}")
+    print(f"  {'=' * 55}")
+
+    status = finnhub_status()
+    if not status["key_set"]:
+        print(f"\n  ⚠️  FINNHUB_API_KEY not set in .env")
+        print(f"     Free key: https://finnhub.io/dashboard (60 calls/min)")
+        return
+
+    try:
+        # Quote
+        q = get_quote(ticker)
+        if q:
+            chg_icon = "🟢" if q["change"] >= 0 else "🔴"
+            print(f"\n  💵 Quote")
+            print(f"     Price:       ${q['price']:.2f}  {chg_icon} {q['change']:+.2f} ({q['change_pct']:+.2%})")
+            print(f"     Day range:   ${q['low']:.2f} - ${q['high']:.2f}  (open ${q['open']:.2f})")
+            print(f"     Prev close:  ${q['prev_close']:.2f}")
+
+        # Next earnings
+        ne = next_earnings_date(ticker)
+        print(f"\n  📅 Next earnings:  {ne or '(none in next 60 days)'}")
+
+        # Analyst recs (most recent period)
+        recs = get_analyst_recs(ticker)
+        if recs:
+            r = recs[0]
+            print(f"\n  🎯 Analyst recs ({r.period})")
+            print(f"     Strong Buy: {r.strong_buy}   Buy: {r.buy}   Hold: {r.hold}   Sell: {r.sell}   Strong Sell: {r.strong_sell}")
+            score = r.net_score
+            icon = "🟢" if score > 0.2 else ("🔴" if score < -0.2 else "🟡")
+            print(f"     Net score:  {icon} {score:+.2f}  (normalized -1 to +1)")
+
+        # Fundamentals
+        f = get_basic_financials(ticker)
+        if f:
+            print(f"\n  📈 Fundamentals")
+            def _fmt(v, unit="", dec=2):
+                if v is None: return "n/a"
+                return f"{v:.{dec}f}{unit}"
+            print(f"     P/E (TTM):   {_fmt(f['pe_ttm'])}     P/B: {_fmt(f['pb_ttm'])}     P/S: {_fmt(f['ps_ttm'])}")
+            print(f"     Beta:        {_fmt(f['beta'])}     ROE: {_fmt(f['roe_ttm'], '%')}    Div Yield: {_fmt(f['dividend_yield'], '%')}")
+            print(f"     Market cap:  ${_fmt(f['market_cap'])}M"  if f['market_cap'] else "     Market cap:  n/a")
+            print(f"     52w range:   ${_fmt(f['52w_low'])} - ${_fmt(f['52w_high'])}")
+
+        # Insider trades (last 30)
+        ins = get_insider_trades(ticker, days_back=90)
+        if ins:
+            buys = sum(1 for t in ins if t["change"] > 0)
+            sells = sum(1 for t in ins if t["change"] < 0)
+            net_shares = sum(t["change"] for t in ins)
+            icon = "🟢" if net_shares > 0 else ("🔴" if net_shares < 0 else "🟡")
+            print(f"\n  👔 Insider activity (90d)")
+            print(f"     Buys: {buys}   Sells: {sells}   Net change: {icon} {net_shares:+,} shares")
+
+        # News headlines (top 5)
+        news = get_company_news(ticker, days_back=7)
+        if news:
+            print(f"\n  📰 Recent headlines ({len(news)} found, top 5):")
+            for n in news[:5]:
+                print(f"     • [{n.source}] {n.headline[:80]}")
+        print()
+    except Exception as e:
+        print(f"\n  ❌ Finnhub snapshot failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def cmd_pred_scan():
+    """Scan prediction markets for paper trading opportunities (Manifold)."""
+    print(f"\n  {'=' * 55}")
+    print(f"  🎯 PREDICTION MARKET SCANNER")
+    print(f"  {'=' * 55}")
+
+    try:
+        import requests
+
+        # Manifold Markets — free, play money, no API key needed
+        print(f"\n  Scanning Manifold Markets (paper trading)...")
+        url = "https://api.manifold.markets/v0/search-markets"
+        params = {
+            "term": "",
+            "sort": "liquidity",
+            "filter": "open",
+            "limit": 20,
+        }
+
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        markets = resp.json()
+
+        if not markets:
+            print("  No markets found.")
+            return
+
+        # Filter for binary markets with good liquidity
+        viable = []
+        for m in markets:
+            if not isinstance(m, dict):
+                continue
+            mtype = m.get("outcomeType", "")
+            if mtype != "BINARY":
+                continue
+
+            prob = m.get("probability", 0.5)
+            volume = m.get("volume", 0)
+            liquidity = m.get("totalLiquidity", 0)
+            question = m.get("question", "")[:100]
+            market_id = m.get("id", "")
+
+            # Look for mispriced markets (probability far from 50%)
+            # Markets near 50% are hardest to predict
+            edge_potential = abs(prob - 0.5)
+
+            viable.append({
+                "id": market_id,
+                "question": question,
+                "probability": prob,
+                "volume": volume,
+                "liquidity": liquidity,
+                "edge_potential": edge_potential,
+                "url": m.get("url", ""),
+            })
+
+        # Sort by liquidity (most liquid = most trustworthy prices)
+        viable.sort(key=lambda x: x["liquidity"], reverse=True)
+
+        # Print top candidates
+        print(f"\n  Top {min(15, len(viable))} Markets by Liquidity:\n")
+        print(f"  {'#':>3}  {'Prob':>5}  {'Vol':>8}  {'Liq':>8}  Question")
+        print(f"  {'─' * 3}  {'─' * 5}  {'─' * 8}  {'─' * 8}  {'─' * 50}")
+
+        for i, m in enumerate(viable[:15], 1):
+            prob_str = f"{m['probability']:.0%}"
+            vol_str = f"${m['volume']:,.0f}"
+            liq_str = f"${m['liquidity']:,.0f}"
+
+            # Color code by edge potential
+            if m["edge_potential"] > 0.3:
+                marker = "🔥"  # High edge potential
+            elif m["edge_potential"] > 0.15:
+                marker = "📊"
+            else:
+                marker = "  "
+
+            print(f"  {i:>3}  {prob_str:>5}  {vol_str:>8}  {liq_str:>8}  {marker} {m['question'][:55]}")
+
+        # Summary stats
+        avg_prob = sum(m["probability"] for m in viable) / len(viable) if viable else 0
+        total_vol = sum(m["volume"] for m in viable)
+        print(f"\n  Markets scanned: {len(viable)}")
+        print(f"  Total volume:    ${total_vol:,.0f}")
+        print(f"  Avg probability: {avg_prob:.0%}")
+
+        # High-edge candidates (probability far from 50% = might be mispriced)
+        high_edge = [m for m in viable if m["edge_potential"] > 0.25 and m["liquidity"] > 100]
+        if high_edge:
+            print(f"\n  🔥 High-Edge Candidates ({len(high_edge)} markets with edge > 25%):")
+            for m in high_edge[:5]:
+                side = "YES" if m["probability"] > 0.5 else "NO"
+                print(f"      {m['probability']:.0%} ({side}) — {m['question'][:60]}")
+
+        print(f"\n  ℹ️  Platform: Manifold (play money — zero risk paper trading)")
+        print(f"  ℹ️  Use polybot for live prediction market trading (Kalshi/Polymarket)")
+        print()
+
+    except Exception as e:
+        print(f"\n  ❌ Prediction market scan failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+
 def cmd_migrate():
     """Print the paper→live migration checklist."""
     print("📋 PAPER → LIVE MIGRATION CHECKLIST")
@@ -395,14 +1460,24 @@ def main():
     parser = argparse.ArgumentParser(description="OpenClaw Wheel Strategy Trader")
     parser.add_argument("command",
                         choices=["scan", "monitor", "backtest", "kill", "status",
-                                 "chaos", "migrate", "dashboard", "hermes", "pdt"],
+                                 "chaos", "migrate", "dashboard", "hermes", "pdt",
+                                 "kronos", "news", "calibrate", "pred-scan",
+                                 "forecast", "kelly", "llm", "correlation",
+                                 "insiders", "congress", "greeks", "baseline",
+                                 "earnings", "econ", "finnhub"],
                         help="Command to run")
-    parser.add_argument("--ticker", default="SPY", help="Ticker for backtest")
+    parser.add_argument("--ticker", default="SPY", help="Ticker for backtest/kronos/news")
     parser.add_argument("--reason", default="manual_cli", help="Reason for kill switch")
-    parser.add_argument("--port", type=int, default=5050, help="Dashboard web server port")
+    parser.add_argument("--port", type=int, default=5051,
+                        help="Dashboard web server port (default 5051; polybot uses 5050)")
     parser.add_argument("--full", action="store_true", help="Include quant scores in status output")
     parser.add_argument("--dry-run", action="store_true", help="Hermes: analyze only, don't change params")
     parser.add_argument("--lookback", type=int, default=14, help="Hermes: days of trade history to analyze")
+    parser.add_argument("--simulations", type=int, default=500, help="Backtest: Monte Carlo simulation count")
+    parser.add_argument("--capital", type=float, default=0, help="Backtest: starting capital (0 = use portfolio value)")
+    parser.add_argument("--amount", type=float, default=None, help="baseline: starting-capital amount (omit to snapshot current equity)")
+    parser.add_argument("--snapshot", action="store_true", help="baseline: snapshot current portfolio value as baseline")
+    parser.add_argument("--show", action="store_true", help="baseline: show current baseline without changing it")
 
     args = parser.parse_args()
 
@@ -420,7 +1495,7 @@ def main():
     elif args.command == "kill":
         cmd_kill(args.reason)
     elif args.command == "backtest":
-        cmd_backtest(args.ticker)
+        cmd_backtest(args.ticker, simulations=args.simulations, capital=args.capital)
     elif args.command == "chaos":
         cmd_chaos()
     elif args.command == "migrate":
@@ -431,6 +1506,38 @@ def main():
         cmd_hermes(dry_run=args.dry_run, lookback=args.lookback)
     elif args.command == "pdt":
         cmd_pdt()
+    elif args.command == "kronos":
+        cmd_kronos(args.ticker)
+    elif args.command == "news":
+        cmd_news(args.ticker)
+    elif args.command == "calibrate":
+        cmd_calibrate()
+    elif args.command == "pred-scan":
+        cmd_pred_scan()
+    elif args.command == "forecast":
+        cmd_forecast(args.ticker)
+    elif args.command == "kelly":
+        cmd_kelly(args.ticker)
+    elif args.command == "llm":
+        cmd_llm(args.ticker)
+    elif args.command == "correlation":
+        cmd_correlation()
+    elif args.command == "insiders":
+        cmd_insiders(args.ticker)
+    elif args.command == "congress":
+        cmd_congress(args.ticker)
+    elif args.command == "greeks":
+        cmd_greeks()
+    elif args.command == "baseline":
+        # --show takes precedence; --snapshot means use current equity
+        amt = None if args.snapshot else args.amount
+        cmd_baseline(amount=amt, show=args.show)
+    elif args.command == "earnings":
+        cmd_earnings(args.ticker)
+    elif args.command == "econ":
+        cmd_econ()
+    elif args.command == "finnhub":
+        cmd_finnhub(args.ticker)
 
 
 if __name__ == "__main__":

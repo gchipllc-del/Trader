@@ -144,6 +144,20 @@ def execute_cc(
         f"Pattern: {candidate.candlestick_pattern or 'none'}."
     )
 
+    # Agent consensus — strategy proposes, risk + compliance review
+    from agents.consensus import seek_consensus
+    consensus = seek_consensus(candidate, portfolio_value, cost_basis=position.get("cost_basis"))
+    if not consensus["approved"]:
+        log_event("cc_engine", "consensus_rejected", {
+            "ticker": ticker,
+            "decision": consensus["decision"],
+            "blocking_agent": consensus.get("blocking_agent"),
+            "reason": consensus.get("reason", ""),
+        })
+        diary_write("strategy_agent",
+            f"{ticker}|CC_{consensus['decision']}|{consensus.get('blocking_agent', '?')}")
+        return None
+
     intent = OrderIntent(
         ticker=ticker,
         side="sell_to_open",

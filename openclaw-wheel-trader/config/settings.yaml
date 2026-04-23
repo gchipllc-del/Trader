@@ -8,9 +8,9 @@ live_migration_approved: false   # Requires manual flip + documented approval
 
 # --- Circuit Breakers ---
 circuit_breakers:
-  max_daily_loss: -300          # Dollars. Halt all trading if hit. (Aggressive: $300 on $1500)
-  max_position_pct: 0.20        # 20% of portfolio per position (growth mode)
-  max_sector_pct: 0.40          # 40% of portfolio per sector (growth mode)
+  max_daily_loss: -150          # Halt trading at -$150 (-10% of $1500). Protects capital but doesn't choke growth.
+  max_position_pct: 0.30        # 30% of portfolio per position (concentrated growth mode)
+  max_sector_pct: 0.50          # 50% of portfolio per sector (allow conviction bets)
   max_open_orders: 8            # More concurrent orders for growth
   max_contracts_per_order: 2    # Start small
   cooldown_after_loss_minutes: 15  # Faster recovery (was 30)

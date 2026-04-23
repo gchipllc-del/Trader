@@ -77,7 +77,6 @@ def scan_for_csps(
         if ticker not in quant_approved:
             log_event("csp_engine", "skip_quant_fail", {"ticker": ticker})
             continue
-            continue
 
         # Check memory — any reason to skip this ticker?
         history = recall_ticker_history(ticker)
@@ -138,6 +137,21 @@ def execute_csp(
         f"Annualized return {candidate.annualized_return:.1%}. "
         f"Pattern: {candidate.candlestick_pattern or 'none'}."
     )
+
+    # Agent consensus — strategy proposes, risk + compliance review
+    from agents.consensus import seek_consensus
+    consensus = seek_consensus(candidate, portfolio_value)
+    if not consensus["approved"]:
+        log_event("csp_engine", "consensus_rejected", {
+            "ticker": ticker,
+            "decision": consensus["decision"],
+            "blocking_agent": consensus.get("blocking_agent"),
+            "reason": consensus.get("reason", ""),
+        })
+        diary_write("strategy_agent",
+            f"{ticker}|CSP_{consensus['decision']}|{consensus.get('blocking_agent', '?')}|"
+            f"{consensus.get('reason', '')[:80]}")
+        return None
 
     # Step 1: PROPOSE
     intent = OrderIntent(

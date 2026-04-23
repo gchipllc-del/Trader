@@ -128,12 +128,17 @@ class TestCSPEngine:
         assert len(aapl_candidates) == 0
 
     def test_execute_csp_uses_order_gate(self, tmp_path, monkeypatch):
-        """Verify execute_csp goes through propose → validate → execute."""
+        """Verify execute_csp goes through consensus → propose → validate → execute."""
         from lib import csp_engine
 
         pos_file = tmp_path / "positions.json"
         pos_file.write_text("[]")
         monkeypatch.setattr(csp_engine, "POSITIONS_PATH", pos_file)
+
+        # Mock consensus gate — approve everything
+        import agents.consensus
+        monkeypatch.setattr(agents.consensus, "seek_consensus",
+                            lambda c, pv, **kw: {"approved": True, "decision": "APPROVED"})
 
         # Track order gate calls
         calls = []
@@ -164,6 +169,11 @@ class TestCSPEngine:
         pos_file = tmp_path / "positions.json"
         pos_file.write_text("[]")
         monkeypatch.setattr(csp_engine, "POSITIONS_PATH", pos_file)
+
+        # Mock consensus gate — approve everything
+        import agents.consensus
+        monkeypatch.setattr(agents.consensus, "seek_consensus",
+                            lambda c, pv, **kw: {"approved": True, "decision": "APPROVED"})
 
         captured_intent = []
         def mock_propose(intent):
@@ -330,6 +340,11 @@ class TestCCEngine:
         pos_file = tmp_path / "positions.json"
         pos_file.write_text("[]")
         monkeypatch.setattr(cc_engine, "POSITIONS_PATH", pos_file)
+
+        # Mock consensus gate — approve everything
+        import agents.consensus
+        monkeypatch.setattr(agents.consensus, "seek_consensus",
+                            lambda c, pv, **kw: {"approved": True, "decision": "APPROVED"})
 
         captured = []
         def mock_propose(intent):

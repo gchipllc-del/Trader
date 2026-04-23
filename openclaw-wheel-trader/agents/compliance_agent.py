@@ -108,11 +108,22 @@ class ComplianceAgent:
     def _check_earnings(self, ticker: str, expiration: str) -> dict:
         """
         Don't sell options expiring through an earnings date.
-        
-        TODO: Wire to earnings calendar API (Sprint 8).
-        For now, checks KG for known earnings dates.
+
+        Checks two sources:
+        1. Earnings calendar cache (data/earnings_calendar.json, refreshed by scan)
+        2. Knowledge graph (fallback for manually set dates)
         """
-        # Check knowledge graph for earnings info
+        # Source 1: Earnings calendar (enhancements module)
+        from lib.enhancements import is_earnings_conflict, get_next_earnings
+        if is_earnings_conflict(ticker, expiration):
+            earnings_date = get_next_earnings(ticker)
+            return {
+                "pass": False,
+                "reason": f"Option expires {expiration} through earnings on {earnings_date}",
+                "source": "earnings_calendar",
+            }
+
+        # Source 2: Knowledge graph (fallback)
         facts = kg_query(ticker, current_only=True)
         earnings_facts = [f for f in facts if "earnings" in f.get("predicate", "").lower()]
 
@@ -123,6 +134,7 @@ class ComplianceAgent:
                     return {
                         "pass": False,
                         "reason": f"Option expires {expiration} through earnings on {earnings_date}",
+                        "source": "knowledge_graph",
                     }
 
         return {"pass": True, "reason": "No earnings conflict detected"}
