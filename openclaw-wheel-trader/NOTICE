@@ -1,0 +1,82 @@
+OpenClaw Wheel Trader — Third-party attributions
+================================================
+
+This project incorporates curated data or design patterns from the following
+third-party works. Code in this repository is original unless otherwise noted;
+these attributions are retained for provenance.
+
+--------------------------------------------------------------------------------
+1. koala73/worldmonitor
+   https://github.com/koala73/worldmonitor
+   © 2024-2026 Elie Habib
+   Licensed under GNU AGPL-3.0
+
+   USED FOR:
+       - Curated RSS/Atom feed URL list in lib/news_feeds.py
+       - Source-tiering concept (market-moving wire services ranked first)
+
+   WHAT WE DID NOT COPY:
+       - No worldmonitor source code, parsing logic, UI, or proxy helpers
+       - Feed URLs are factual data (URLs to public third-party feeds) and
+         are not themselves copyrightable
+
+   ⚠️  AGPL-3.0 caveat: because AGPL §13 imposes network-copyleft on any
+   code linked or served over a network, worldmonitor's *code* cannot be
+   imported into this project without open-sourcing the entire bot. We
+   chose to re-implement any feed-handling logic from scratch rather than
+   vendor their code. Before any COMMERCIAL or HOSTED deployment of this
+   bot, review whether the curated feed list should be replaced with
+   independently sourced URLs, or worldmonitor should be commercially
+   licensed.
+
+--------------------------------------------------------------------------------
+2. Fincept-Corporation/FinceptTerminal
+   https://github.com/Fincept-Corporation/FinceptTerminal
+   Licensed under GNU AGPL-3.0
+
+   USED FOR:
+       - Reference only. Their published roster of free data sources (FRED,
+         IMF, World Bank, AkShare, Polygon, Kraken, etc.) informed the
+         traderbot's future data-connector shortlist.
+       - No code, no persona prompts, no agent definitions copied.
+
+--------------------------------------------------------------------------------
+3. zilliztech/claude-context
+   https://github.com/zilliztech/claude-context
+   Licensed under Apache-2.0
+
+   USED FOR:
+       - Installed as Claude Code MCP server for semantic code search
+         during development (not vendored — run as external process).
+       - Concept inspired runtime semantic search for lib/memory_palace.py
+         drawers (we implemented this independently with sqlite-vec +
+         sentence-transformers; no claude-context code).
+
+--------------------------------------------------------------------------------
+4. HKUDS/RAG-Anything
+   https://github.com/HKUDS/RAG-Anything
+   Licensed under MIT
+
+   USED FOR:
+       - Document RAG ingestion pipeline for SEC filings, earnings
+         transcripts, and news corpora (lib/rag_corpus.py).
+       - MIT license permits direct use with attribution.
+
+--------------------------------------------------------------------------------
+5. jxnl/instructor
+   https://github.com/jxnl/instructor
+   Licensed under MIT
+
+   USED FOR:
+       - Structured LLM output (Pydantic validation + auto-retry) in
+         lib/llm_analyst.py, replacing hand-rolled JSON-mode parsing.
+
+--------------------------------------------------------------------------------
+6. huggingface/smolagents
+   https://github.com/huggingface/smolagents
+   Licensed under Apache-2.0
+
+   USED FOR:
+       - Optional alternative multi-agent orchestration for the strategy/
+         risk/compliance consensus loop (agents/consensus_smol.py).
+       - Original hand-rolled consensus.py remains the default path.

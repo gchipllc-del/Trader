@@ -42,6 +42,108 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 DEEPSEEK_TIMEOUT = 60  # Seconds — deepseek-reasoner can be slow
 
 
+# ── Structured-output path (instructor library) ──────────────────
+# Optional, opt-in via llm.use_instructor in wheel_strategy.yaml.
+# When enabled, instructor + pydantic validate the LLM response automatically
+# and retry on validation failure — killing the fragile brace-counting regex
+# in _parse_response(). Falls back cleanly if instructor isn't installed.
+try:
+    import instructor  # type: ignore
+    from pydantic import BaseModel, Field  # type: ignore
+    _HAS_INSTRUCTOR = True
+except Exception:
+    _HAS_INSTRUCTOR = False
+
+
+if _HAS_INSTRUCTOR:
+    class _OptionAnalysisSchema(BaseModel):
+        win_probability: float = Field(ge=0.0, le=1.0,
+            description="Probability the sold option expires worthless (our win)")
+        confidence: float = Field(ge=0.0, le=1.0,
+            description="Self-assessed confidence in this analysis")
+        bullish_factors: list[str] = Field(default_factory=list, max_length=5)
+        bearish_factors: list[str] = Field(default_factory=list, max_length=5)
+        reasoning: str = Field(default="", max_length=600)
+        suggested_action: str = Field(default="wait",
+            description="sell | wait | skip")
+
+    class _StockAnalysisSchema(BaseModel):
+        win_probability: float = Field(ge=0.0, le=1.0)
+        confidence: float = Field(ge=0.0, le=1.0)
+        bullish_factors: list[str] = Field(default_factory=list, max_length=5)
+        bearish_factors: list[str] = Field(default_factory=list, max_length=5)
+        reasoning: str = Field(default="", max_length=600)
+        suggested_action: str = Field(default="wait",
+            description="buy | wait | skip")
+
+
+def _use_instructor(llm_cfg: dict) -> bool:
+    """Should we route this call through instructor? Both the lib + config must be on."""
+    return _HAS_INSTRUCTOR and bool(llm_cfg.get("use_instructor", True))
+
+
+def _call_with_instructor(
+    system_prompt: str,
+    user_prompt: str,
+    provider: str,
+    model: str,
+    max_tokens: int,
+    schema_class: type,
+    ticker: str,
+):
+    """Call provider via instructor with a pydantic schema. Returns model instance or None.
+
+    Handles DeepSeek (OpenAI-compatible) and Claude. Any exception (missing key,
+    API error, validation retries exhausted) → returns None so the caller can
+    fall back to the legacy parse path.
+    """
+    try:
+        if provider == "deepseek":
+            api_key = os.environ.get("DEEPSEEK_API_KEY")
+            if not api_key:
+                log_event("llm_analyst", "no_api_key",
+                          {"ticker": ticker, "provider": "deepseek"})
+                return None
+            from openai import OpenAI  # instructor[openai] extra pulls this in
+            client = instructor.from_openai(
+                OpenAI(base_url=DEEPSEEK_BASE_URL, api_key=api_key),
+                mode=instructor.Mode.JSON,  # DeepSeek supports JSON mode
+            )
+            return client.chat.completions.create(
+                model=model,
+                max_tokens=max_tokens,
+                response_model=schema_class,
+                max_retries=2,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+        elif provider == "claude":
+            api_key = os.environ.get("ANTHROPIC_API_KEY")
+            if not api_key:
+                log_event("llm_analyst", "no_api_key",
+                          {"ticker": ticker, "provider": "claude"})
+                return None
+            from anthropic import Anthropic
+            client = instructor.from_anthropic(Anthropic())
+            return client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                response_model=schema_class,
+                max_retries=2,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+        else:
+            return None
+    except Exception as e:
+        log_event("llm_analyst", "instructor_failed", {
+            "ticker": ticker, "provider": provider, "error": str(e)[:200],
+        })
+        return None
+
+
 def _load_strategy() -> dict:
     with open(CONFIG_PATH / "wheel_strategy.yaml", "r") as f:
         return yaml.safe_load(f)
@@ -409,17 +511,33 @@ def analyze_stock_setup(
 
     _rate_limit(min_interval=2.0)
 
-    if provider == "deepseek":
-        raw = _call_deepseek(system_prompt, user_prompt, model, max_tokens, ticker)
-    else:  # claude
-        raw = _call_claude(system_prompt, user_prompt, model, max_tokens, ticker)
+    # Preferred: instructor + pydantic (validated, auto-retries). Falls back
+    # to legacy raw + brace-counting parse on any failure so existing behavior
+    # is preserved.
+    used_instructor = False
+    data: dict | None = None
+    raw: str | None = None
 
-    if not raw:
-        return None
+    if _use_instructor(llm_cfg):
+        result = _call_with_instructor(
+            system_prompt, user_prompt, provider, model, max_tokens,
+            _StockAnalysisSchema, ticker,
+        )
+        if result is not None:
+            data = result.model_dump()
+            raw = json.dumps(data)
+            used_instructor = True
 
-    data = _parse_response(raw, ticker, provider)
     if data is None:
-        return None
+        if provider == "deepseek":
+            raw = _call_deepseek(system_prompt, user_prompt, model, max_tokens, ticker)
+        else:  # claude
+            raw = _call_claude(system_prompt, user_prompt, model, max_tokens, ticker)
+        if not raw:
+            return None
+        data = _parse_response(raw, ticker, provider)
+        if data is None:
+            return None
 
     # Validate and sanitize
     try:
@@ -439,8 +557,8 @@ def analyze_stock_setup(
         bearish_factors=[str(x)[:200] for x in (data.get("bearish_factors") or [])[:5]],
         reasoning=str(data.get("reasoning", ""))[:500],
         suggested_action=str(data.get("suggested_action", "wait"))[:20].lower(),
-        raw_response=raw[:2000],
-        provider=provider,
+        raw_response=(raw or "")[:2000],
+        provider=provider + (":instructor" if used_instructor else ""),
         model=model,
         cached=False,
     )
@@ -627,17 +745,33 @@ def analyze_option_setup(
 
     _rate_limit(min_interval=2.0)
 
-    if provider == "deepseek":
-        raw = _call_deepseek(system_prompt, user_prompt, model, max_tokens, ticker)
-    else:
-        raw = _call_claude(system_prompt, user_prompt, model, max_tokens, ticker)
+    # Preferred path: instructor + pydantic (validated, auto-retries on bad JSON).
+    # Fall back to legacy raw-text + brace-counting parse if instructor is off
+    # or the structured call itself fails.
+    used_instructor = False
+    data: dict | None = None
+    raw: str | None = None
 
-    if not raw:
-        return None
+    if _use_instructor(llm_cfg):
+        result = _call_with_instructor(
+            system_prompt, user_prompt, provider, model, max_tokens,
+            _OptionAnalysisSchema, ticker,
+        )
+        if result is not None:
+            data = result.model_dump()
+            raw = json.dumps(data)  # keep raw_response populated for audit parity
+            used_instructor = True
 
-    data = _parse_response(raw, ticker, provider)
     if data is None:
-        return None
+        if provider == "deepseek":
+            raw = _call_deepseek(system_prompt, user_prompt, model, max_tokens, ticker)
+        else:
+            raw = _call_claude(system_prompt, user_prompt, model, max_tokens, ticker)
+        if not raw:
+            return None
+        data = _parse_response(raw, ticker, provider)
+        if data is None:
+            return None
 
     try:
         win_prob = max(0.05, min(0.95, float(data.get("win_probability", 0.5))))
@@ -655,8 +789,8 @@ def analyze_option_setup(
         bearish_factors=[str(x)[:200] for x in (data.get("bearish_factors") or [])[:5]],
         reasoning=str(data.get("reasoning", ""))[:500],
         suggested_action=str(data.get("suggested_action", "wait"))[:20].lower(),
-        raw_response=raw[:2000],
-        provider=provider,
+        raw_response=(raw or "")[:2000],
+        provider=provider + (":instructor" if used_instructor else ""),
         model=model,
         cached=False,
     )

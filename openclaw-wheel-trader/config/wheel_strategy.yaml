@@ -1,256 +1,179 @@
-# ============================================================
-# WHEEL STRATEGY CONFIGURATION
-# ============================================================
-
-# --- Target Universe ---
-# Phase 1 (stocks, <$5000 portfolio): affordable, liquid stocks
-# Phase 2 ($5k+): add CSPs on cheap underlyings
-# Phase 3 ($10k+): full Wheel on bigger tickers
-tickers_phase1:   # Stock trading — quant-screened, dynamically filtered
-  # Updated 2026-04-13 based on live quant + momentum analysis
-  # Core STRONG (Q >= 7.0) — high Sharpe, low drawdown
-  - F             # $12.04 — Q:7.5  S:1.07  -22% DD  M:2/4
-  - BAC           # $52.48 — Q:9.0  S:1.84  -18% DD  (holding 2sh)
-  - PFE           # $27.00 — Q:9.0  S:1.00  -11% DD  (holding 5sh)
-  - INTC          # $64.54 — Q:8.0  S:2.18  -24% DD  (1sh at $300 budget)
-  - VALE          # $17.18 — Q:8.5  S:2.29  -20% DD  M:2/4  +93% 1Y!
-  - WBD           # $27.41 — Q:8.5  S:2.73  -21% DD  +238% 1Y!
-  - KO            # $76.56 — Q:7.0  S:0.57  -11% DD  (holding 1sh)
-  # Strong momentum + affordable (best swing candidates)
-  - NIO           # $6.45  — Q:5.0  M:3/4  46sh per $300  +97% 1Y
-  - RIVN          # $15.45 — Q:6.0  M:3/4  19sh per $300
-  - NU            # $14.87 — Q:6.5  M:3/4  20sh per $300
-  - SOFI          # $16.64 — Q:5.0  M:3/4  18sh per $300
-  # Moderate momentum + value
-  - CCL           # $26.97 — Q:6.5  M:2/4  +53% 1Y  travel recovery
-  - AAL           # $11.07 — Q:4.5  M:2/4  27sh per $300
-  - CLF           # $9.14  — Q:4.0  M:2/4  +7.1% ROC5d  steel swing
-  - GRAB          # $3.62  — Q:1.5  M:2/4  cheap lot size (82sh per $300)
-  # Growth tickers (expensive now, affordable as portfolio grows)
-  - PLTR          # $132.88 — Q:6.0  AI/defense (2sh at $300)
-  - UBER          # $71.21  — Q:2.5  mobility (4sh at $300)
-  # REMOVED 2026-04-13: COIN (AVOID -66% DD), HOOD (AVOID -57% DD),
-  # PINS (AVOID Sharpe -0.56), SNAP (AVOID -62% DD), SQ (no data),
-  # ABNB ($128 too expensive, only OK quant), T (RSI 14.8 crashing -8.5%)
-
-# --- Quant Screening Thresholds ---
+tickers_phase1:
+- F
+- BAC
+- PFE
+- INTC
+- VALE
+- WBD
+- KO
+- NIO
+- RIVN
+- NU
+- SOFI
+- CCL
+- AAL
+- CLF
+- GRAB
+- PLTR
+- UBER
 quant:
-  min_sharpe: -0.5          # Exclude deeply negative Sharpe
-  max_drawdown: -0.55       # Exclude > 55% drawdown
-  min_quant_score: 3.5      # Lowered for growth mode — more candidates
-  exclude_avoid: true       # Auto-remove AVOID-rated tickers
-
-# --- Stock Trading Parameters (Hermes-tunable) ---
+  min_sharpe: -0.5
+  max_drawdown: -0.55
+  min_quant_score: 3.5
+  exclude_avoid: true
 stock_params:
-  min_composite_score: 7       # Raised 5→7 — only high-conviction entries (was letting 4/9 KO in)
-  stop_loss_pct: 0.035         # 3.5% stop loss (tighter = cut losses fast)
-  default_target_pct: 0.10     # 10% default target (was 8% — let winners run)
-  trailing_stop_pct: 0.03      # 3% trailing stop (locks in profits)
-  max_position_pct: 0.30       # 30% of portfolio per position (concentrated growth)
-  max_trades_per_scan: 2       # Focus capital, don't spread thin
-  max_concurrent_positions: 3  # 3 concentrated positions (was 5 scattered)
-  allow_momentum_only: true    # Momentum can trigger without candlestick signal
-  momentum_only_min_score: 3   # But require momentum >= 3/4 when no candlestick
-  support_distance_tiers:      # How close to support for level score
-    - 0.04                     # Within 4% = score 3
-    - 0.07                     # Within 7% = score 2
-    - 0.10                     # Within 10% = score 1
-  # Scale-out rules — lock in gains on winners, let runner ride
+  min_composite_score: 8
+  stop_loss_pct: 0.035
+  default_target_pct: 0.1
+  trailing_stop_pct: 0.03
+  max_position_pct: 0.3
+  max_trades_per_scan: 2
+  max_concurrent_positions: 3
+  allow_momentum_only: true
+  momentum_only_min_score: 3
+  support_distance_tiers:
+  - 0.04
+  - 0.07
+  - 0.1
   enable_scale_out: true
-  partial_exit_threshold: 0.15   # Trigger scale-out at +15% gain
-  partial_exit_fraction: 0.5     # Sell 50% of position, keep 50% riding
-
-tickers_phase2:   # CSPs on cheap stocks (collateral $500-1500)
-  - F
-  - NIO
-  - SOFI
-  - AAL
-  - SNAP
-
-tickers:          # Phase 3 — full Wheel
-  - AAPL
-  - MSFT
-  - NVDA
-  - AMD
-  - AMZN
-  - META
-  - GOOGL
-  - SPY
-
-# --- Cash-Secured Put Parameters ---
+  partial_exit_threshold: 0.15
+  partial_exit_fraction: 0.5
+tickers_phase2:
+- F
+- NIO
+- SOFI
+- AAL
+- SNAP
+tickers:
+- AAPL
+- MSFT
+- NVDA
+- AMD
+- AMZN
+- META
+- GOOGL
+- SPY
 csp:
-  delta_min: -0.35       # Most aggressive (35% chance of assignment)
-  delta_max: -0.20       # Most conservative (20% chance)
-  dte_min: 30            # Minimum days to expiration
-  dte_max: 45            # Maximum days to expiration
-  min_annualized_return: 0.12   # 12% annualized minimum premium yield
-  min_open_interest: 100        # Liquidity floor
-  max_bid_ask_spread: 0.15      # Max spread in dollars
-  strike_zone: support          # Sell puts at support zones
-
-# --- Covered Call Parameters ---
+  delta_min: -0.35
+  delta_max: -0.2
+  dte_min: 30
+  dte_max: 45
+  min_annualized_return: 0.12
+  min_open_interest: 100
+  max_bid_ask_spread: 0.15
+  strike_zone: support
 cc:
-  delta_min: 0.20
+  delta_min: 0.2
   delta_max: 0.35
   dte_min: 30
   dte_max: 45
-  min_annualized_return: 0.10   # Slightly lower bar since we already hold shares
+  min_annualized_return: 0.1
   min_open_interest: 100
   max_bid_ask_spread: 0.15
-  strike_zone: resistance       # Sell calls at resistance zones
-
-# --- Management Rules ---
+  strike_zone: resistance
 management:
-  early_close_threshold: 0.80   # Close at 80% of max profit
-  early_close_min_dte: 14       # Only early close if >14 DTE remaining
-  roll_trigger_dte: 7           # Consider rolling if <7 DTE and ITM
-  roll_min_credit: 0.50         # Only roll for at least $0.50 additional credit
-
-# --- Signal Confirmation (Candlestick Bible) ---
+  early_close_threshold: 0.8
+  early_close_min_dte: 14
+  roll_trigger_dte: 7
+  roll_min_credit: 0.5
 confirmation:
-  min_composite_score: 7        # Out of 9 (trend + level + signal)
+  min_composite_score: 7
   required_timeframes:
-    - weekly    # Trend direction
-    - daily     # Level identification
-    - 4hour     # Entry timing
-  bullish_patterns:              # Required for CSP entry
-    - pin_bar
-    - bullish_engulfing
-    - morning_star
-    - hammer
-    - dragonfly_doji
-  bearish_patterns:              # Required for CC entry
-    - shooting_star
-    - bearish_engulfing
-    - evening_star
-    - gravestone_doji
-
-# --- Support/Resistance Zones (Naked Forex) ---
+  - weekly
+  - daily
+  - 4hour
+  bullish_patterns:
+  - pin_bar
+  - bullish_engulfing
+  - morning_star
+  - hammer
+  - dragonfly_doji
+  bearish_patterns:
+  - shooting_star
+  - bearish_engulfing
+  - evening_star
+  - gravestone_doji
 zones:
-  min_touches: 2                 # Zone must have ≥2 price touches
-  zone_width_pct: 0.02           # Zone is ±2% of the level price
-  lookback_days: 120             # Look back 120 days for zones
-  room_to_left: true             # Require clear space to the left of the zone
-
-# --- IV Analysis ---
+  min_touches: 2
+  zone_width_pct: 0.02
+  lookback_days: 120
+  room_to_left: true
 iv:
-  min_iv_rank: 30                # Only sell options when IV rank > 30%
-  iv_rank_lookback: 252          # 1 year of trading days
-
-# ============================================================
-# POLYBOT INTEGRATION — AI + NEWS GATES
-# ============================================================
-
-# --- Kronos AI Price Prediction (Gate 4) ---
-# Uses pretrained 102M-param transformer (NeoQuasar/Kronos-base)
-# Zero-shot price forecasting — no fine-tuning needed.
-# Runs on Apple Silicon (MPS), CUDA, or CPU.
+  min_iv_rank: 30
+  iv_rank_lookback: 252
 kronos:
-  enabled: true                    # Enable Kronos AI gate in stock scanning
-  model_name: "NeoQuasar/Kronos-base"
-  pred_bars: 10                    # Predict 10 trading days ahead
-  lookback: 200                    # Feed 200 days of history to model
-  sample_count: 3                  # 3 inference samples (speed vs accuracy)
-  temperature: 0.8                 # Sampling temperature
-  cache_ttl_minutes: 60            # Cache predictions for 1 hour
-  veto_return_threshold: -0.02     # Veto if predicted return < -2%
-
-# --- News Sentiment (Gate 5) ---
-# Checks recent headlines before buying.
-# Sources: NewsAPI (needs NEWSAPI_KEY env var) + Yahoo Finance RSS (free).
+  enabled: true
+  model_name: NeoQuasar/Kronos-base
+  pred_bars: 10
+  lookback: 200
+  sample_count: 3
+  temperature: 0.8
+  cache_ttl_minutes: 60
+  veto_return_threshold: -0.02
 news_sentiment:
-  enabled: true                    # Enable news sentiment gate
-  cache_ttl_minutes: 30            # Cache results for 30 min
-  veto_sentiment_threshold: 0.25   # Veto if sentiment < 0.25 (strongly bearish)
-  min_confidence_to_veto: 0.3     # Only veto with confidence > 30%
-
-# --- Bayesian Forecaster (Gate 6) ---
-# Combines composite score + Kronos + news + pattern + momentum into a
-# calibrated win probability using Bayes' theorem. This is the primary
-# ranking signal — candidates are sorted by Bayesian win probability.
+  enabled: true
+  cache_ttl_minutes: 30
+  veto_sentiment_threshold: 0.25
+  min_confidence_to_veto: 0.3
 bayesian:
-  enabled: true                    # Enable Bayesian multi-signal forecaster
-  min_win_prob: 0.58               # Veto if aggregated win probability < 58%
-  base_rate: 0.55                  # Prior for bullish zone + trend setups
-
-# --- Earnings Proximity (Gate 6.5) ---
-# Stock swings carry binary event risk through earnings reports. CLAUDE.md
-# hard-vetoes options through earnings; stock buys use a softer two-tier:
-#   - Hard veto if earnings within hard_veto_days (binary event too close)
-#   - Soft downsize if earnings within soft_warn_days (volatility haircut
-#     applied via Kelly sizing, so winners still get in but smaller)
-# Fails open (no block, no penalty) when Finnhub unavailable.
+  enabled: true
+  min_win_prob: 0.58
+  base_rate: 0.55
 earnings_proximity:
   enabled: true
-  hard_veto_days: 2                # Skip entirely if earnings in ≤2 calendar days
-  soft_warn_days: 14               # Downsize if earnings within 14 days
-  soft_penalty: 0.5                # 0.5 = cut position size in half
-
-# --- Correlation Detection (Gate 7) ---
-# Prevents loading up on correlated stocks (e.g., F + NIO both EV-adjacent).
-# Soft veto: reduces Kelly position size by 50% on correlated adds.
+  hard_veto_days: 2
+  soft_warn_days: 14
+  soft_penalty: 0.5
 correlation:
-  enabled: true                    # Enable correlation check
-  threshold: 0.70                  # Pearson correlation above this = flagged
-  hard_veto: false                 # false = size down; true = block entirely
-
-# --- Kelly Criterion Sizing (Gate 8) ---
-# Mathematically-optimal position sizing based on win probability and R/R.
-# Replaces fixed max_position_pct with dynamic Kelly-based allocation.
+  enabled: true
+  threshold: 0.7
+  hard_veto: false
 kelly:
-  enabled: true                    # Enable Kelly sizing
-  fraction: 0.25                   # Quarter Kelly (conservative); Hermes can tune 0.15-0.50
-
-# --- Insider Flow (Gate 9 — SEC Form 4) ---
-# Pulls insider open-market BUY clusters from data.sec.gov. Bullish
-# signal when ≥3 insiders buy within 30 days (Cohen/Malloy/Pomorski,
-# Jeng/Metrick/Zeckhauser). We never trade on sells (10b5-1 noise).
-# Requires SEC_CONTACT_EMAIL env var.
+  enabled: true
+  fraction: 0.25
 insider_flow:
   enabled: true
-  lookback_days: 90                # Window to scan for Form 4 buys
-  min_confidence_to_boost: 0.30    # Bayesian forecaster applies signal only above this
-  # Hermes can tune these bounds within [0.0, 1.0]
-
-# --- Congress Flow (Gate 10 — Senate STOCK Act PTRs) ---
-# Pulls senator periodic transaction reports. Cluster buy = ≥3 senators
-# in 30 days (Ziobrowski et al. JFQA 2004). Default feed is community-
-# maintained and can lag — module auto-suppresses signal when stale.
-# For live data set CONGRESS_FEED_URL env var.
+  lookback_days: 90
+  min_confidence_to_boost: 0.3
 congress_flow:
   enabled: true
   lookback_days: 180
-  feed_staleness_warn_days: 60     # Suppress signal when feed older than this
-  min_confidence_to_boost: 0.30
-
-# --- Portfolio Greeks (risk aggregation, not a gate) ---
-# Uses py_vollib analytical Black-Scholes to aggregate delta/gamma/vega/
-# theta across all open positions. Lets the risk agent enforce portfolio-
-# level vega caps rather than per-trade only.
+  feed_staleness_warn_days: 60
+  min_confidence_to_boost: 0.3
 greeks:
   enabled: true
   risk_free_rate: 0.045
-  default_iv: 0.30                 # Fallback when IV chain unavailable
-  max_portfolio_vega: 500          # |total_vega| > $500/vol-pt triggers risk_agent review
-  max_portfolio_abs_delta: 0.80    # 80% of notional bankroll = ceiling on net delta exposure
-
-# --- LLM Analyst (optional, multi-provider) ---
-# Uses an LLM for qualitative reasoning on top of quantitative signals.
-# Picks which stocks to buy/sell and sometimes WHEN to act.
-# Supported providers: "deepseek" (default — fast, cheap, great reasoning)
-#                      "claude"   (fallback — needs ANTHROPIC_API_KEY)
-# Gracefully skipped if the chosen provider's API key is missing.
+  default_iv: 0.3
+  max_portfolio_vega: 500
+  max_portfolio_abs_delta: 0.8
 llm:
-  enabled: true                    # Turn on for DeepSeek (cheap enough to run freely)
-  provider: "deepseek"             # "deepseek" | "claude"
-  model: "deepseek-chat"           # deepseek-chat (DeepSeek-V3, fast) | deepseek-reasoner (R1, deeper reasoning, slower)
-  claude_model: "claude-haiku-4-5" # Used only if provider == "claude"
-  max_tokens: 1000                 # Response cap
-  cache_ttl_minutes: 60            # Cache analyses for 1 hour per ticker+setup
-  trigger_composite_score: 8       # Invoke on 8/13+ setups (DeepSeek is cheap, cast a wider net)
-  # --- Consensus integration (CSP/CC trades) ---
-  # Runs after strategy/risk/compliance approve. Default is ADVISORY ONLY (logged
-  # but not blocking). Flip consensus_veto_enabled to make the LLM a 4th hard vote.
-  consensus_enabled: true          # Run LLM on every approved CSP/CC candidate
-  consensus_veto_enabled: false    # false = advisory only; true = can block trades
-  consensus_veto_confidence: 0.7   # Only veto if LLM says "skip" with confidence ≥ this
+  enabled: true
+  provider: deepseek
+  model: deepseek-chat
+  claude_model: claude-haiku-4-5
+  max_tokens: 1000
+  cache_ttl_minutes: 60
+  trigger_composite_score: 8
+  consensus_enabled: true
+  consensus_veto_enabled: false
+  consensus_veto_confidence: 0.7
+
+  # Route analyze_option_setup / analyze_stock_setup through the `instructor`
+  # library for pydantic-validated JSON output (auto-retries on bad JSON).
+  # Falls back to the legacy regex parse if instructor isn't installed OR the
+  # structured call itself fails.  Default on; set false to pin to legacy.
+  use_instructor: true
+
+  # Optional 2nd-phase orchestration via HuggingFace smolagents. When true,
+  # approved candidates also get a unanimous 3-agent LLM vote before executing.
+  # Off by default — requires `pip install smolagents`. See agents/consensus_smol.py.
+  smol_consensus_enabled: false
+
+# Document RAG (SEC filings, earnings transcripts, Congress/insider filings)
+# via HKUDS/RAG-Anything. Feature-flagged skeleton — see lib/rag_corpus.py.
+# Install deps: pip install raganything
+rag:
+  enabled: false
+  model: deepseek-chat
+  # Where parsed documents are cached on disk:
+  working_dir: data/rag_corpus/lightrag_storage
