@@ -4,5 +4,8 @@
 # Sprint plan (large markdown, not code)
 OPENCLAW_WHEEL_TRADER_SPRINT_PLAN.md
 
+# Claude Code worktree-isolation artefacts (Agent tool subagent workspaces)
+.claude/
+
 # OS
 .DS_Store
