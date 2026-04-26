@@ -45,6 +45,7 @@ Security:
 
 import hashlib
 import json
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -73,6 +74,11 @@ PAPER_PRESETS = {
     "volatility": {"T": 0.9, "top_p": 0.90, "sample_count": 1},
     "generate": {"T": 1.0, "top_p": 0.95, "sample_count": 1},
     "simulate": {"T": 0.6, "top_p": 0.90, "sample_count": 10},
+    # Stock-engine Gate 4 only: a binary "is this bearish?" decision is
+    # over-served by N=10 paths. Drop to N=3 for a ~3x speedup on screening
+    # without materially changing the veto outcome (paper Table 6 keeps the
+    # forecast preset for any task that consumes the actual price path).
+    "screening_gate": {"T": 0.6, "top_p": 0.90, "sample_count": 3},
 }
 
 # ── Model Size Selector ──────────────────────────────────────────
@@ -197,6 +203,14 @@ def _load_predictor(
     If a different model_name is requested than what's currently loaded, the
     old predictor is released and a new one is loaded (size switching).
 
+    Half-precision (fp16) inference on CUDA:
+        Set the environment variable ``OPENCLAW_KRONOS_FP16=1`` to opt in to
+        ``model.half()`` on CUDA devices for a memory + throughput win. This
+        is **opt-in only**: the upstream KronosPredictor has not been formally
+        validated for fp16, so we never enable it by default. CPU and MPS
+        paths always run in fp32 regardless of the env var. The selected
+        dtype is recorded in the ``model_loaded`` audit event for traceability.
+
     Returns the KronosPredictor instance.
     """
     global _predictor, _loaded_model_name, _model_lock
@@ -241,6 +255,24 @@ def _load_predictor(
         else:
             device = "cpu"
 
+        # Optional fp16 on CUDA only — opt-in via env var. Never on CPU/MPS
+        # (CPU fp16 is slow; MPS fp16 has known correctness gaps on torch
+        # versions we've shipped against).
+        dtype = "fp32"
+        fp16_env = os.environ.get("OPENCLAW_KRONOS_FP16", "0").strip()
+        if fp16_env == "1" and device == "cuda:0":
+            try:
+                model = model.half()
+                dtype = "fp16"
+            except Exception as half_err:
+                # If half() fails, log and silently fall back to fp32 — never
+                # break model loading because the perf knob is unavailable.
+                log_event("kronos", "fp16_unavailable", {
+                    "model": model_name,
+                    "error": str(half_err)[:200],
+                })
+                dtype = "fp32"
+
         # Clamp max_context to paper limit (512).
         max_context = min(max(16, int(max_context)), MAX_CONTEXT_LEN)
 
@@ -255,6 +287,7 @@ def _load_predictor(
         log_event("kronos", "model_loaded", {
             "model": model_name,
             "device": device,
+            "dtype": dtype,
             "max_context": max_context,
         }, result="success")
 
@@ -629,6 +662,334 @@ def predict_price(
     }, result="success")
 
     return forecast
+
+
+# ── Batch Prediction ─────────────────────────────────────────────
+
+def _forecast_from_cached_dict(cached: dict) -> "KronosForecast":
+    """Rehydrate a KronosForecast from the on-disk cache payload."""
+    return KronosForecast(
+        ticker=cached["ticker"],
+        interval=cached["interval"],
+        lookback_bars=cached["lookback_bars"],
+        pred_bars=cached["pred_bars"],
+        predicted_close=cached["predicted_close"],
+        predicted_high=cached["predicted_high"],
+        predicted_low=cached["predicted_low"],
+        current_price=cached["current_price"],
+        pred_final_close=cached["pred_final_close"],
+        pred_high_watermark=cached["pred_high_watermark"],
+        pred_low_watermark=cached["pred_low_watermark"],
+        direction=cached["direction"],
+        expected_return=cached["expected_return"],
+        confidence=cached["confidence"],
+    )
+
+
+def _forecast_to_cache_dict(f: "KronosForecast") -> dict:
+    return {
+        "ticker": f.ticker,
+        "interval": f.interval,
+        "lookback_bars": f.lookback_bars,
+        "pred_bars": f.pred_bars,
+        "predicted_close": f.predicted_close,
+        "predicted_high": f.predicted_high,
+        "predicted_low": f.predicted_low,
+        "current_price": f.current_price,
+        "pred_final_close": f.pred_final_close,
+        "pred_high_watermark": f.pred_high_watermark,
+        "pred_low_watermark": f.pred_low_watermark,
+        "direction": f.direction,
+        "expected_return": f.expected_return,
+        "confidence": f.confidence,
+    }
+
+
+def _build_forecast_from_pred_df(
+    *,
+    ticker: str,
+    interval: str,
+    lookback_bars: int,
+    pred_bars: int,
+    pred_df: pd.DataFrame,
+    current_price: float,
+) -> "KronosForecast":
+    """
+    Map a Kronos prediction DataFrame back into a KronosForecast.
+
+    Mirrors the math at the bottom of `predict_price()` so callers see
+    identical shapes whether they hit the single or batch entry point.
+    """
+    pred_close = pred_df["close"].values.tolist()
+    pred_high = pred_df["high"].values.tolist()
+    pred_low = pred_df["low"].values.tolist()
+
+    pred_final = float(pred_close[-1])
+    high_watermark = float(max(pred_high))
+    low_watermark = float(min(pred_low))
+
+    expected_return = (pred_final - current_price) / current_price if current_price > 0 else 0.0
+
+    if expected_return > 0.02:
+        direction = "bullish"
+    elif expected_return < -0.02:
+        direction = "bearish"
+    else:
+        direction = "neutral"
+
+    pred_range = high_watermark - low_watermark
+    normalized_range = pred_range / current_price if current_price > 0 else 1.0
+    confidence = max(0.1, min(1.0 - normalized_range, 0.9))
+
+    return KronosForecast(
+        ticker=ticker,
+        interval=interval,
+        lookback_bars=lookback_bars,
+        pred_bars=pred_bars,
+        predicted_close=[round(p, 4) for p in pred_close],
+        predicted_high=[round(p, 4) for p in pred_high],
+        predicted_low=[round(p, 4) for p in pred_low],
+        current_price=round(current_price, 4),
+        pred_final_close=round(pred_final, 4),
+        pred_high_watermark=round(high_watermark, 4),
+        pred_low_watermark=round(low_watermark, 4),
+        direction=direction,
+        expected_return=round(expected_return, 4),
+        confidence=round(confidence, 4),
+    )
+
+
+def predict_prices_batch(
+    tickers: list[str],
+    pred_bars: int = 30,
+    interval: str = "1d",
+    lookback: int = 400,
+    sample_count: int = 10,              # Paper Table 6 default
+    temperature: float = 0.6,
+    top_p: float = 0.90,
+    model_name: str | None = None,
+    model_size: str | None = None,
+) -> list["KronosForecast"]:
+    """
+    Batch counterpart to ``predict_price()`` — runs Kronos inference for
+    multiple tickers with a single ``KronosPredictor.predict_batch()`` call.
+
+    Why this exists
+    ---------------
+    On an N-ticker screen the per-ticker loop pays the model's fixed-cost
+    autoregressive overhead N times. ``predict_batch`` packs all series into
+    one tensor and amortizes that cost — typical 3-10× wall-clock speedup
+    on GPU for the screening gate.
+
+    Behavior contracts
+    ------------------
+    - Cache is checked first per ticker. Cache hits are returned directly;
+      only cache misses are fetched and run through the model.
+    - The same ``predictor`` singleton serves both ``predict_price()`` and
+      this function — no duplicate weight loads.
+    - Hyperparameters (T, top_p, sample_count) are clamped to the same safe
+      ranges as ``predict_price``.
+    - Direction / expected_return / confidence math matches ``predict_price``
+      exactly so callers can swap entry points without seeing different shapes.
+    - Output order matches input ``tickers`` order.
+    - ``predict_batch`` requires all series in a batch to share the same
+      historical length. If fetched data lengths differ, all series are
+      truncated to a common ``min(len)`` lookback (still capped by paper's
+      512-token max_context). One audit event ``batch_lookback_aligned`` is
+      logged when alignment kicks in.
+
+    Failures
+    --------
+    Per-ticker fetch failures are logged and that ticker is dropped from the
+    result list (preserving order for the rest). If the underlying
+    ``predict_batch`` call itself raises, the exception propagates — callers
+    that want a "non-blocking" fallback should catch and degrade to the
+    serial ``predict_price`` path.
+
+    Args:
+        tickers: Symbols to forecast. Empty list returns ``[]`` without
+            touching the predictor.
+        pred_bars / interval / lookback: As in ``predict_price``.
+        sample_count / temperature / top_p: As in ``predict_price``.
+        model_name / model_size: Resolved via ``_resolve_model``.
+
+    Returns:
+        List of ``KronosForecast`` in the same order as ``tickers``.
+    """
+    if not tickers:
+        return []
+
+    model_name, tokenizer_name = _resolve_model(
+        model_size=model_size, model_name=model_name
+    )
+
+    # Clamp hyperparameters once for the whole batch
+    temperature = max(0.1, min(float(temperature), 2.0))
+    top_p = max(0.1, min(float(top_p), 1.0))
+    sample_count = max(1, min(int(sample_count), 50))
+
+    # 1) Cache lookup. Build placeholders so we keep input order intact.
+    results: list[KronosForecast | None] = [None] * len(tickers)
+    miss_indices: list[int] = []
+    miss_tickers: list[str] = []
+    cache_keys: list[str] = []
+
+    for i, ticker in enumerate(tickers):
+        key = _cache_key(ticker, interval, pred_bars, model_name=model_name)
+        cache_keys.append(key)
+        cached = _cache_get(key, ttl_minutes=60)
+        if cached and "predicted_close" in cached:
+            results[i] = _forecast_from_cached_dict(cached)
+        else:
+            miss_indices.append(i)
+            miss_tickers.append(ticker)
+
+    # If everything was cached, we're done — never even touch the predictor.
+    if not miss_tickers:
+        return [r for r in results if r is not None]  # all non-None by construction
+
+    # 2) Fetch OHLCV per cache miss. Sequential is fine — yfinance is the
+    #    bottleneck per ticker and predict_batch can't help with I/O.
+    period_map = {"1d": "2y", "1h": "60d", "5m": "7d"}
+    period = period_map.get(interval, "1y")
+
+    fetched: list[tuple[int, str, pd.DataFrame]] = []
+    for idx, ticker in zip(miss_indices, miss_tickers):
+        try:
+            data = _fetch_ohlcv(ticker, period=period, interval=interval)
+            fetched.append((idx, ticker, data))
+        except Exception as e:
+            log_event("kronos", "batch_fetch_failed", {
+                "ticker": ticker, "error": str(e)[:200],
+            }, result="failed")
+
+    if not fetched:
+        # Nothing to run — drop the slot and return whatever was cached
+        return [r for r in results if r is not None]
+
+    # 3) Determine the common lookback so predict_batch's equal-length
+    #    invariant holds. Truncate everyone to min(len, lookback, 512).
+    min_len = min(len(data) for _, _, data in fetched)
+    common_lookback = min(lookback, min_len, MAX_CONTEXT_LEN)
+
+    requested_lookbacks = [min(lookback, len(data), MAX_CONTEXT_LEN) for _, _, data in fetched]
+    if len(set(requested_lookbacks)) > 1:
+        log_event("kronos", "batch_lookback_aligned", {
+            "requested": requested_lookbacks,
+            "aligned_to": common_lookback,
+            "tickers": [t for _, t, _ in fetched],
+        })
+
+    # 4) Build df_list / x_timestamp_list / y_timestamp_list per
+    #    KronosPredictor.predict_batch's contract.
+    if interval == "1d":
+        freq = pd.tseries.offsets.BDay(1)
+    elif interval == "1h":
+        freq = pd.tseries.offsets.Hour(1)
+    else:
+        freq = pd.tseries.offsets.Minute(5)
+
+    df_list: list[pd.DataFrame] = []
+    x_timestamp_list: list[pd.Series] = []
+    y_timestamp_list: list[pd.Series] = []
+    current_prices: list[float] = []
+    valid_entries: list[tuple[int, str]] = []  # (original_index, ticker)
+
+    for idx, ticker, data in fetched:
+        # Slice to (common_lookback) historical bars
+        hist = data.tail(common_lookback)
+        if len(hist) < common_lookback:
+            # Should never happen given how we picked common_lookback, but
+            # be defensive.
+            log_event("kronos", "batch_skip_short", {
+                "ticker": ticker, "have": len(hist), "need": common_lookback,
+            })
+            continue
+
+        x_df = hist[["open", "high", "low", "close", "volume"]].copy()
+        x_df["amount"] = x_df["volume"] * x_df["close"]
+        x_timestamp = pd.Series(pd.DatetimeIndex(hist.index))
+        last_ts = x_timestamp.iloc[-1]
+        y_timestamp = pd.Series(
+            pd.date_range(start=last_ts + freq, periods=pred_bars, freq=freq)
+        )
+
+        df_list.append(x_df)
+        x_timestamp_list.append(x_timestamp)
+        y_timestamp_list.append(y_timestamp)
+        current_prices.append(float(hist["close"].iloc[-1]))
+        valid_entries.append((idx, ticker))
+
+    if not df_list:
+        return [r for r in results if r is not None]
+
+    # 5) One predict_batch call. Predictor singleton matches predict_price.
+    predictor = _load_predictor(
+        model_name=model_name, tokenizer_name=tokenizer_name
+    )
+
+    pred_dfs = predictor.predict_batch(
+        df_list=df_list,
+        x_timestamp_list=x_timestamp_list,
+        y_timestamp_list=y_timestamp_list,
+        pred_len=pred_bars,
+        T=temperature,
+        top_p=top_p,
+        sample_count=sample_count,
+        verbose=False,
+    )
+
+    if len(pred_dfs) != len(valid_entries):
+        # Defensive: vendored predict_batch should preserve order/length
+        log_event("kronos", "batch_size_mismatch", {
+            "expected": len(valid_entries),
+            "got": len(pred_dfs),
+        }, result="failed")
+        raise RuntimeError(
+            f"predict_batch returned {len(pred_dfs)} entries, expected {len(valid_entries)}"
+        )
+
+    # 6) Map back to forecasts, persist cache, slot into results in order.
+    for (orig_idx, ticker), pred_df, current_price in zip(
+        valid_entries, pred_dfs, current_prices
+    ):
+        forecast = _build_forecast_from_pred_df(
+            ticker=ticker,
+            interval=interval,
+            lookback_bars=common_lookback,
+            pred_bars=pred_bars,
+            pred_df=pred_df,
+            current_price=current_price,
+        )
+        results[orig_idx] = forecast
+
+        try:
+            _cache_put(cache_keys[orig_idx], _forecast_to_cache_dict(forecast))
+        except Exception as cache_err:
+            # Cache failures must never break inference
+            log_event("kronos", "batch_cache_put_failed", {
+                "ticker": ticker, "error": str(cache_err)[:200],
+            })
+
+        log_event("kronos", "batch_prediction_complete", {
+            "ticker": ticker,
+            "interval": interval,
+            "pred_bars": pred_bars,
+            "current_price": forecast.current_price,
+            "pred_final_close": forecast.pred_final_close,
+            "direction": forecast.direction,
+            "expected_return": forecast.expected_return,
+        }, result="success")
+
+    log_event("kronos", "batch_complete", {
+        "input_count": len(tickers),
+        "cache_hits": len(tickers) - len(miss_tickers),
+        "fetched": len(fetched),
+        "predicted": len(valid_entries),
+    }, result="success")
+
+    # Drop None entries (failed fetches) but preserve order.
+    return [r for r in results if r is not None]
 
 
 # ── Price → Probability Conversion ───────────────────────────────
