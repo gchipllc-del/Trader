@@ -25,6 +25,12 @@ __pycache__/
 .venv/
 venv/
 
+# Test artefacts
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+
 # IDE
 .vscode/
 .idea/

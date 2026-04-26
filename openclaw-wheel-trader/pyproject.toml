@@ -1,0 +1,33 @@
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+markers = [
+    "integration: tests that hit external services (skipped by default in CI)",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["lib", "agents", "main"]
+omit = [
+    "tests/*",
+    "lib/kronos/*",
+]
+
+[tool.coverage.report]
+precision = 1
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
