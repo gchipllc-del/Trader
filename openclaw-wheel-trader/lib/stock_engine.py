@@ -154,8 +154,35 @@ def score_stock_buy(
             "roc_5d": momentum.roc_5d,
         }
 
-    # --- Composite ---
+    # --- Composite (base 0-13) ---
     composite = trend_score + level_score + signal_score + momentum_score
+
+    # --- Options signals boost (±2, optional) ---
+    # Options-market signals act as a "second opinion" on top of the
+    # technical composite. IV-vs-HV ratio and market IV regime both
+    # carry edge as regime/positioning hints (see lib/options_signals.py).
+    # Capped at ±2 so options never dominate the technical signal.
+    options_score = 0
+    options_reasons: list[str] = []
+    options_cfg = strategy.get("options_signals", {}) or {}
+    if options_cfg.get("enabled", False):
+        try:
+            from lib.options_signals import options_signal_score
+            options_score, options_reasons = options_signal_score(
+                ticker=ticker,
+                current_price=current_price,
+                daily_df=daily_df,
+                market_regime_delta=options_cfg.get(
+                    "_market_regime_delta_cached", 0
+                ),
+                enable_iv_hv=options_cfg.get("enable_iv_hv", True),
+                enable_volume=options_cfg.get("enable_unusual_volume", False),
+            )
+            composite += options_score
+        except Exception as e:
+            log_event("stock_engine", "options_signals_error",
+                      {"ticker": ticker, "error": str(e)[:200]},
+                      result="degraded")
 
     # Entry logic — more permissive in growth mode
     not_downtrend = weekly_trend.direction != "downtrend"
@@ -195,6 +222,8 @@ def score_stock_buy(
         "level_score": level_score,
         "signal_score": signal_score,
         "momentum_score": momentum_score,
+        "options_score": options_score,
+        "options_reasons": options_reasons,
         "composite_score": composite,
         "zone_level": zone_level,
         "zone_touches": zone_touches,
@@ -258,12 +287,34 @@ def scan_for_stocks(
 
     quant_passed = {s.ticker for s in quant_scores if s.verdict != "AVOID"}
 
-    # Check existing positions — respect max concurrent
+    # Check existing positions — respect max concurrent.
+    # 2026-04-28: Switched from positions.json (stale across concurrent scans)
+    # to broker positions as source of truth. Broker view is updated atomically
+    # by Alpaca on order submission/fill; positions.json lags 5-30s during
+    # concurrent pipelines. Fall back to positions.json if broker call fails.
     positions = _load_positions()
-    held_tickers = set(
-        p["ticker"] for p in positions
-        if p.get("status") in ("open", "assigned") and p.get("type") == "stock"
-    )
+    try:
+        broker_positions = client.get_positions() or []
+        # Treat any non-zero broker position as "held" — covers the case where
+        # positions.json hasn't been updated yet by a sibling scan.
+        held_tickers = set()
+        for bp in broker_positions:
+            sym = str(bp.get("symbol") or bp.get("ticker") or "").upper()
+            qty = float(bp.get("qty", 0) or 0)
+            # Skip crypto symbols (have "/USD" or "/USDT")
+            if sym and qty != 0 and "/" not in sym:
+                held_tickers.add(sym)
+        # Union with positions.json so we don't miss assigned/CSP positions
+        # that may not show as direct stock holdings on the broker
+        for p in positions:
+            if p.get("status") in ("open", "assigned") and p.get("type") == "stock":
+                held_tickers.add(str(p["ticker"]).upper())
+    except Exception:
+        # Fallback: original behavior on broker failure
+        held_tickers = set(
+            str(p["ticker"]).upper() for p in positions
+            if p.get("status") in ("open", "assigned") and p.get("type") == "stock"
+        )
     open_count = len(held_tickers)
 
     if open_count >= max_concurrent:
@@ -276,7 +327,7 @@ def scan_for_stocks(
     # Gate 2+3: Technical + Momentum screening (only on quant-passed tickers)
     candidates = []
     for ticker in quant_passed:
-        if ticker in held_tickers:
+        if str(ticker).upper() in held_tickers:
             continue
 
         daily_df = daily_data.get(ticker)
@@ -335,10 +386,31 @@ def scan_for_stocks(
     if kelly_cfg.get("enabled", True):
         candidates = _apply_kelly_sizing(candidates, portfolio_value, kelly_cfg)
 
-    # Sort by: bayesian win probability (primary), then composite score (secondary)
+    # Gate 8.5: Sector concentration hard cap.
+    # Runs AFTER Kelly so we know the proposed position value. Vetoes any
+    # candidate that would push a sector group above max_sector_pct.
+    cb_cfg = _load_settings().get("circuit_breakers", {})
+    max_sector_pct = cb_cfg.get("max_sector_pct", 0.50)
+    candidates = _apply_sector_concentration_gate(
+        candidates, positions, portfolio_value, max_sector_pct,
+    )
+
+    # Tier 2 (2026-04-25): news-momentum re-ranker.
+    # Attaches news_momentum_boost in [-max_boost, +max_boost] based on
+    # sentiment deviation from neutral, weighted by confidence. The news
+    # gate (Gate 5) already vetoed strongly bearish news; this re-rank
+    # surfaces bullish-news candidates above quant-equal alternatives.
+    news_cfg_for_rerank = strategy.get("news_sentiment", {})
+    if news_cfg_for_rerank.get("rerank_enabled", True):
+        rerank_max = float(news_cfg_for_rerank.get("rerank_max_boost", 0.10))
+        candidates = _attach_news_momentum_boost(candidates, max_boost=rerank_max)
+
+    # Sort by: bayesian win probability + news boost (primary),
+    # then composite score (secondary)
     candidates.sort(
         key=lambda c: (
-            c.get("bayesian_win_prob", c["composite_score"] / 13.0),
+            c.get("bayesian_win_prob", c["composite_score"] / 13.0)
+            + c.get("news_momentum_boost", 0.0),
             c["composite_score"],
             c.get("quant_score", 0),
         ),
@@ -650,6 +722,120 @@ def _apply_correlation_gate(
     return filtered
 
 
+def _attach_news_momentum_boost(candidates: list[dict], max_boost: float = 0.10) -> list[dict]:
+    """
+    Tier 2 re-ranker: attach a news-driven boost to each candidate.
+
+    The news gate (Gate 5) already vetoed strongly bearish news. This is a
+    pure RANKING signal — it doesn't gate or filter, it just surfaces
+    bullish-news candidates above quant-equal peers.
+
+    Formula:
+        boost = (sentiment - 0.5) * confidence * (max_boost * 2)
+
+    sentiment: 0.0 (very bearish) to 1.0 (very bullish), 0.5 = neutral
+    confidence: 0.0 (no data) to 1.0 (many articles, agreement)
+
+    Examples:
+        sentiment=1.00, confidence=1.0 -> boost = +0.10
+        sentiment=0.75, confidence=0.8 -> boost = +0.04
+        sentiment=0.50, confidence=1.0 -> boost =  0.00 (neutral)
+        sentiment=0.30, confidence=0.5 -> boost = -0.02 (mildly bearish)
+
+    Mutates candidates in-place and returns them.
+    """
+    for c in candidates:
+        sent = c.get("news_sentiment")
+        conf = c.get("news_confidence") or 0.0
+        if sent is None:
+            c["news_momentum_boost"] = 0.0
+            continue
+        c["news_momentum_boost"] = round((sent - 0.5) * conf * (max_boost * 2), 4)
+    return candidates
+
+
+def _apply_sector_concentration_gate(
+    candidates: list[dict],
+    held_positions: list[dict],
+    portfolio_value: float,
+    max_sector_pct: float,
+) -> list[dict]:
+    """
+    Gate 8.5: Hard cap on sector exposure.
+
+    Vetoes any candidate whose addition would push a sector group above
+    max_sector_pct of portfolio value. Uses lib/correlation.CORRELATION_GROUPS
+    as the sector taxonomy.
+
+    A ticker can belong to multiple groups (NIO is both ev_autos AND
+    chinese_adr) — the strictest group governs (any breach = veto).
+
+    This is a HARD veto, not a sizing penalty. Sector concentration is the
+    risk that's hardest to recover from — when consumer confidence tanks,
+    KO + UBER + SOFI all drop the same day. Better to reject the entry.
+    """
+    if portfolio_value <= 0 or max_sector_pct <= 0:
+        return candidates
+
+    from lib.correlation import CORRELATION_GROUPS
+
+    # Per-group $ exposure across currently held stock positions
+    ticker_to_value: dict[str, float] = {
+        p["ticker"]: float(p.get("shares", 0)) * float(p.get("entry_price", 0))
+        for p in held_positions
+        if p.get("status") in ("open", "assigned") and p.get("type") == "stock"
+    }
+    group_exposure: dict[str, float] = {}
+    for ticker, value in ticker_to_value.items():
+        for group_name, group_tickers in CORRELATION_GROUPS.items():
+            if ticker in group_tickers:
+                group_exposure[group_name] = group_exposure.get(group_name, 0) + value
+
+    cap_dollars = portfolio_value * max_sector_pct
+    filtered: list[dict] = []
+
+    for candidate in candidates:
+        ticker = candidate["ticker"]
+        # Prefer Kelly-sized position_value; fall back to shares × current_price
+        proposed_value = float(candidate.get("position_value") or 0)
+        if proposed_value <= 0:
+            proposed_value = (
+                float(candidate.get("shares", 0))
+                * float(candidate.get("current_price", 0))
+            )
+
+        groups = [g for g, tks in CORRELATION_GROUPS.items() if ticker in tks]
+
+        breach: tuple[str, float] | None = None
+        for g in groups:
+            new_total = group_exposure.get(g, 0) + proposed_value
+            if new_total > cap_dollars:
+                breach = (g, new_total)
+                break
+
+        if breach:
+            group, total = breach
+            print(
+                f"  🛑 {ticker}: Sector cap VETO — '{group}' would hit "
+                f"${total:.0f} (cap ${cap_dollars:.0f} = "
+                f"{max_sector_pct:.0%} of ${portfolio_value:.0f})"
+            )
+            log_event("stock_engine", "sector_concentration_veto", {
+                "ticker": ticker,
+                "group": group,
+                "current_exposure": round(group_exposure.get(group, 0), 2),
+                "proposed_addition": round(proposed_value, 2),
+                "would_total": round(total, 2),
+                "cap_dollars": round(cap_dollars, 2),
+                "max_sector_pct": max_sector_pct,
+            })
+            continue
+
+        filtered.append(candidate)
+
+    return filtered
+
+
 def _apply_kelly_sizing(candidates: list[dict], portfolio_value: float, kelly_cfg: dict) -> list[dict]:
     """
     Gate 8: Kelly position sizing.
@@ -736,10 +922,10 @@ def execute_stock_buy(
     shares = candidate["shares"]
     price = candidate["current_price"]
 
-    # Safety checks
+    # Safety checks (portfolio_value passed so the breaker scales with equity)
     try:
         check_paper_mode()
-        check_daily_loss(current_daily_pnl)
+        check_daily_loss(current_daily_pnl, portfolio_value=portfolio_value)
     except CircuitBreakerTripped as e:
         log_event("stock_engine", "blocked", {"ticker": ticker, "error": str(e)})
         diary_write("strategy_agent", f"{ticker}|STOCK_BLOCKED|{e}")
@@ -764,6 +950,44 @@ def execute_stock_buy(
         f"Pattern: {candidate['pattern'] or 'none'}. "
         f"Target: ${candidate['target_price']:.2f}  Stop: ${candidate['stop_loss']:.2f}."
     )
+
+    # Last-mile broker reconciliation — prevents duplicate-buy races across
+    # concurrent scan processes. positions.json can be stale by 5-30 seconds
+    # between read and write across two pipelines; the broker is the single
+    # source of truth on what we actually own. Refuse the order if the
+    # broker already shows an open position OR a working order in this name.
+    try:
+        broker_positions = client.get_positions() or []
+        if any(str(bp.get("symbol") or bp.get("ticker") or "").upper()
+               == ticker.upper() for bp in broker_positions):
+            log_event("stock_engine", "duplicate_buy_blocked",
+                      {"ticker": ticker, "reason": "broker_position_exists"})
+            return None
+        # Also check open orders so we don't queue two buys before either fills
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            tc = client._get_trading_client()
+            client.limiter.wait_if_needed()
+            open_orders = tc.get_orders(filter=GetOrdersRequest(
+                status=QueryOrderStatus.OPEN, symbols=[ticker], limit=10,
+            )) or []
+            if any(str(o.symbol).upper() == ticker.upper()
+                   and str(o.side).lower().endswith("buy")
+                   for o in open_orders):
+                log_event("stock_engine", "duplicate_buy_blocked",
+                          {"ticker": ticker, "reason": "open_buy_order_exists"})
+                return None
+        except Exception:
+            # Non-fatal — if open-order lookup fails, broker-position check
+            # above is still the primary guard.
+            pass
+    except Exception as e:
+        log_event("stock_engine", "broker_reconcile_failed",
+                  {"ticker": ticker, "error": str(e)[:200]}, result="degraded")
+        # If broker check itself fails, fall through to attempt the buy —
+        # don't gate on infrastructure errors. The position-cap check
+        # earlier in scan_for_stocks is the secondary defense.
 
     log_event("stock_engine", "executing", {
         "ticker": ticker, "shares": shares, "price": price,
@@ -894,8 +1118,57 @@ def check_stock_exits(
         entry_price = pos.get("entry_price", 0)
         pnl_pct = (current_price - entry_price) / entry_price if entry_price > 0 else 0
 
-        # Trailing stop: ratchet stop up as price rises
-        if trailing_stop_pct > 0 and current_price > entry_price:
+        # Trailing stop: ratchet stop up as price rises.
+        # 2026-04-28: Replaced static trailing with a tiered ratchet that
+        # tightens as unrealized P/L grows. The static 2% trail meant a
+        # +18% winner exits on a 2% pullback, surrendering most of the
+        # locked gains. With tiered trailing, the stop tightens to 0.8%
+        # past +12% and 0.5% past +20%, converting more of the move into
+        # realized profit. Tiers configurable in `trailing_stop_tiered:`
+        # block in wheel_strategy.yaml; falls back to static `trailing_stop_pct`
+        # when block is absent.
+        tiered_cfg = stock_cfg.get("trailing_stop_tiered", {})
+        if tiered_cfg.get("enabled", False) and current_price > entry_price:
+            # Default tier ladder: (min_pnl_pct, trail_pct)
+            # entries chosen so stop monotonically tightens with profit
+            tiers = tiered_cfg.get("tiers", [
+                {"min_pnl": 0.20, "trail": 0.005},
+                {"min_pnl": 0.12, "trail": 0.008},
+                {"min_pnl": 0.07, "trail": 0.012},
+                {"min_pnl": 0.03, "trail": 0.018},
+                {"min_pnl": 0.00, "trail": 0.025},
+            ])
+            # Pick the tightest tier whose min_pnl ≤ pnl_pct
+            chosen_trail = trailing_stop_pct  # fallback to static
+            for t in sorted(tiers, key=lambda x: -x["min_pnl"]):
+                if pnl_pct >= t["min_pnl"]:
+                    chosen_trail = t["trail"]
+                    break
+
+            # Optional momentum-exhaustion tightening:
+            # if RSI is overheated, reduce the trail width by 30%
+            tighten_on_exhaustion = tiered_cfg.get(
+                "tighten_on_rsi_exhaustion", True
+            )
+            if tighten_on_exhaustion:
+                pos_momentum = pos.get("momentum", {}) or {}
+                rsi = float(pos_momentum.get("rsi") or 50)
+                if rsi >= 78:
+                    chosen_trail *= 0.7  # 30% tighter on overheat
+                    log_event("stock_engine", "trailing_tightened_rsi", {
+                        "ticker": ticker, "rsi": rsi,
+                        "trail_pct": round(chosen_trail, 4),
+                    })
+
+            trailing_stop = current_price * (1 - chosen_trail)
+            if trailing_stop > stop:
+                pos["stop_loss"] = round(trailing_stop, 2)
+                pos["trail_tier_pct"] = round(chosen_trail, 4)
+                stop = pos["stop_loss"]
+                positions_changed = True
+
+        elif trailing_stop_pct > 0 and current_price > entry_price:
+            # Legacy static trailing stop (when tiered config not enabled)
             trailing_stop = current_price * (1 - trailing_stop_pct)
             if trailing_stop > stop:
                 pos["stop_loss"] = round(trailing_stop, 2)

@@ -160,6 +160,293 @@ def cmd_dashboard(port: int = 5051):
     run_dashboard(port=port)
 
 
+def cmd_pairs_scan():
+    """Scan the Phase-1 universe for mean-reverting pairs (T2.6)."""
+    import yaml
+    from lib.alpaca_client import AlpacaClient
+    from lib.portfolio_optimization import find_pairs_opportunities, print_pairs_report
+
+    cfg = yaml.safe_load(open(Path(__file__).parent / "config" / "wheel_strategy.yaml"))
+    tickers = cfg.get("tickers_phase1", [])
+    print(f"Scanning {len(tickers)} tickers for mean-reverting pairs...")
+
+    client = AlpacaClient()
+    bars = client.get_bars(tickers, timeframe="1Day", limit=180)
+    opps = find_pairs_opportunities(bars)
+
+    print()
+    print_pairs_report(opps, top=15)
+    print()
+    print(f"Found {len(opps)} statistically significant pairs.")
+    print("Note: this scans signals only — does not execute trades.")
+    print("Pairs trading needs a long+short engine, which is out of scope")
+    print("for the current Phase-1 (long-only stock) bot. Useful for research.")
+
+
+def cmd_min_variance():
+    """Compute Markowitz min-variance weights for currently held positions (T2.5)."""
+    import json
+    from lib.alpaca_client import AlpacaClient
+    from lib.portfolio_optimization import min_variance_weights
+
+    positions = json.load(open(Path(__file__).parent / "data" / "positions.json"))
+    held = [p for p in positions
+            if p.get("status") == "open" and p.get("type") == "stock"]
+    if len(held) < 2:
+        print(f"Need >= 2 open stock positions to compute min-variance; have {len(held)}.")
+        return
+
+    tickers = [p["ticker"] for p in held]
+    client = AlpacaClient()
+    bars = client.get_bars(tickers, timeframe="1Day", limit=180)
+    import pandas as pd
+    closes = pd.DataFrame({t: bars[t]["close"] for t in tickers if t in bars}).dropna()
+    returns = closes.pct_change().dropna()
+
+    pw = min_variance_weights(returns)
+    print(f"\nMin-variance weights for {len(pw.tickers)} held positions:\n")
+    print(f"{'Ticker':<10}{'MV Weight':<12}{'Current $':<14}{'MV Target $':<14}")
+    total_value = sum(float(p.get("shares", 0)) * float(p.get("entry_price", 0))
+                      for p in held)
+    for p in held:
+        t = p["ticker"]
+        if t not in pw.weights:
+            continue
+        cur = float(p.get("shares", 0)) * float(p.get("entry_price", 0))
+        target = pw.weights[t] * total_value
+        print(f"{t:<10}{pw.weights[t]:<12.3f}${cur:<13.2f}${target:<13.2f}")
+    print(f"\nPortfolio volatility (daily): {pw.portfolio_volatility*100:.3f}%")
+
+
+def cmd_build_cache(signal: str = "all", days_back: int = 180):
+    """Pre-fill historical caches so subsequent backtests are instant.
+
+    signal: "kronos" | "news" | "llm" | "all"
+    """
+    import yaml
+    cfg_path = Path(__file__).parent / "config" / "wheel_strategy.yaml"
+    with open(cfg_path) as f:
+        strategy = yaml.safe_load(f)
+    tickers = strategy.get("tickers_phase1", [])
+
+    from lib.alpaca_client import AlpacaClient
+    from lib import historical_cache
+    client = AlpacaClient()
+
+    print("=" * 60)
+    print(f"  CACHE BUILD — signal={signal}, lookback={days_back}d")
+    print(f"  Universe: {len(tickers)} tickers")
+    print("=" * 60)
+
+    # Pull bars once (warmup + sim window)
+    print("  Fetching bars...")
+    bars = client.get_bars(tickers, timeframe="1Day", limit=days_back + 60)
+    if not bars:
+        print("  No bars returned.")
+        return
+
+    import pandas as pd
+    all_dates = sorted({d for df in bars.values() for d in df.index})
+    if not all_dates:
+        print("  No dates in bars.")
+        return
+    cutoff = all_dates[-1] - pd.Timedelta(days=days_back)
+    sim_dates = [d for d in all_dates if d >= cutoff]
+    print(f"  Sim dates: {len(sim_dates)}  ({sim_dates[0].date()} to {sim_dates[-1].date()})")
+
+    pairs = [(t, d) for t in tickers for d in sim_dates]
+    total = len(pairs)
+    print(f"  Total (ticker, date) pairs: {total}\n")
+
+    signals_to_run = []
+    if signal in ("kronos", "all"):
+        signals_to_run.append("kronos")
+    if signal in ("news", "all"):
+        signals_to_run.append("news")
+    if signal in ("llm", "all"):
+        signals_to_run.append("llm")
+
+    for sig in signals_to_run:
+        print(f"  --- Building {sig} cache ---")
+        if sig == "kronos":
+            from lib.historical_kronos import get_historical_kronos
+            fn = lambda t, d, df: get_historical_kronos(t, d, df)
+        elif sig == "news":
+            from lib.historical_news import get_historical_sentiment
+            fn = lambda t, d, df: get_historical_sentiment(t, d)
+        elif sig == "llm":
+            from lib.historical_llm import get_historical_llm
+            fn = lambda t, d, df: get_historical_llm(t, d, df, target_pct=0.10, horizon_days=21)
+        else:
+            continue
+
+        hits = misses = errors = 0
+        for i, (ticker, date) in enumerate(pairs, 1):
+            if historical_cache.has(sig, ticker, date,
+                                    {"target_pct": 0.10, "horizon_days": 21} if sig == "llm"
+                                    else None):
+                hits += 1
+                continue
+            df = bars.get(ticker)
+            if df is None:
+                misses += 1
+                continue
+            sliced = df[df.index <= date]
+            if len(sliced) < 30:
+                misses += 1
+                continue
+            try:
+                fn(ticker, date, sliced)
+                misses += 1  # was missing, now built
+            except Exception as e:
+                errors += 1
+                if errors <= 3:
+                    print(f"    err {ticker}/{date.date()}: {str(e)[:120]}")
+            if i % 50 == 0:
+                print(f"    [{i}/{total}] hits={hits} built={misses} err={errors}")
+
+        print(f"  {sig} done: hits={hits} built={misses} err={errors}")
+        stats = historical_cache.stats(sig)
+        print(f"  Cache: {stats.get('signals',{}).get(sig,{})}\n")
+
+    print("Build complete.")
+    print("Stats summary:")
+    for sig, info in historical_cache.stats().get("signals", {}).items():
+        kb = info["bytes"] / 1024
+        print(f"  {sig:<10} {info['entries']:>6} entries  {kb:>8.1f} KB")
+
+
+def cmd_backtest_stocks(days_back: int = 180, capital: float = 1500.0,
+                        enable_kronos: bool = False, enable_news: bool = False,
+                        enable_llm: bool = False, enable_bayesian: bool = True):
+    """Run an A/B comparison backtest of stock strategy variants.
+
+    Signal enrichment flags read from CLI: --with-signals (all) or
+    granular --with-kronos / --with-news / --with-llm.
+    """
+    import yaml
+    from lib.stock_backtest import run_backtest
+
+    cfg_path = Path(__file__).parent / "config" / "wheel_strategy.yaml"
+    with open(cfg_path) as f:
+        strategy = yaml.safe_load(f)
+    tickers = strategy.get("tickers_phase1", [])
+
+    enabled_signals = []
+    if enable_bayesian:
+        enabled_signals.append("bayesian")
+    if enable_kronos:
+        enabled_signals.append("kronos")
+    if enable_news:
+        enabled_signals.append("news")
+    if enable_llm:
+        enabled_signals.append("llm")
+    sig_label = "+".join(enabled_signals) if enabled_signals else "price-only"
+
+    print("=" * 60)
+    print(f"  STOCK BACKTEST — {days_back}d on {len(tickers)} tickers")
+    print(f"  Starting capital: ${capital:.0f}")
+    print(f"  Signals enabled:  {sig_label}")
+    print("=" * 60)
+
+    # Pre-flight cache check so the user knows what they're getting
+    if any([enable_kronos, enable_news, enable_llm]):
+        from lib import historical_cache
+        stats = historical_cache.stats()
+        for sig in ("kronos", "news", "llm"):
+            entries = stats.get("signals", {}).get(sig, {}).get("entries", 0)
+            need = (sig == "kronos" and enable_kronos) or \
+                   (sig == "news" and enable_news) or \
+                   (sig == "llm" and enable_llm)
+            if need:
+                expected = len(tickers) * days_back  # rough upper bound
+                pct = (entries / expected * 100) if expected else 0
+                print(f"  cache[{sig}]: {entries} entries (~{pct:.0f}% of full coverage)")
+                if entries == 0:
+                    print(f"    ⚠ cache empty — will compute on-the-fly (slow). "
+                          f"Run `python main.py build-cache --signal {sig}` first.")
+        print()
+
+    variants = {
+        "current": {},
+        "looser_score": {"min_composite_score": 7},
+        "tighter_stop": {"stop_loss_pct": 0.025, "trailing_stop_pct": 0.015},
+        "wider_target": {"default_target_pct": 0.15, "partial_exit_threshold": 0.07},
+    }
+
+    results = {}
+    for label, params in variants.items():
+        print(f"\n=== Variant: {label} ===")
+        results[label] = run_backtest(
+            tickers=tickers, days_back=days_back, starting_capital=capital,
+            params=params, enable_kronos=enable_kronos, enable_news=enable_news,
+            enable_llm=enable_llm, enable_bayesian=enable_bayesian,
+        )
+        print(results[label].summary())
+
+    print("\n" + "=" * 60)
+    print(f"  COMPARISON SUMMARY ({sig_label})")
+    print("=" * 60)
+    print(f"{'Variant':<18}{'Return':<12}{'Sharpe':<10}{'MaxDD':<10}"
+          f"{'Trades':<10}{'WinRate':<10}")
+    for label, r in results.items():
+        print(f"{label:<18}"
+              f"{r.total_return*100:+.2f}%      "
+              f"{r.sharpe_ratio:>5.2f}    "
+              f"{r.max_drawdown*100:.2f}%   "
+              f"{r.total_trades:>4}     "
+              f"{r.win_rate*100:.1f}%")
+    if results:
+        spy = list(results.values())[0].spy_buy_hold_return
+        print(f"\n  Buy-and-hold SPY: {spy*100:+.2f}%")
+
+
+def cmd_crypto_monitor(dry_run: bool = False):
+    """24/7 crypto position monitor — fires every minute via launchd."""
+    from lib.alpaca_client import AlpacaClient
+    from lib.crypto_engine import monitor_crypto_positions
+
+    try:
+        client = AlpacaClient()
+        result = monitor_crypto_positions(client, dry_run=dry_run)
+        if result.get("checked", 0) > 0:
+            log_event("main", "crypto_monitor_complete", result)
+    except Exception as e:
+        log_event("main", "crypto_monitor_failed", {"error": str(e)[:300]}, result="failed")
+        # Don't raise — monitor must keep running even on transient errors
+
+
+def cmd_crypto_scan(dry_run: bool = False):
+    """Run one crypto scan + trade cycle. Tier 2 (2026-04-25)."""
+    from lib.alpaca_client import AlpacaClient
+    from lib.crypto_engine import scan_and_trade_crypto
+
+    log_event("main", "crypto_scan_started", {"dry_run": dry_run})
+
+    try:
+        client = AlpacaClient()
+        account = client.get_account()
+        portfolio = float(account["portfolio_value"])
+
+        # Daily P/L vs baseline_equity (used by daily-loss circuit breaker)
+        try:
+            baseline = json.load(open(Path(__file__).parent / "data" / "baseline_equity.json"))
+            daily_pnl = portfolio - float(baseline.get("baseline_equity", portfolio))
+        except Exception:
+            daily_pnl = 0.0
+
+        result = scan_and_trade_crypto(
+            client=client,
+            portfolio_value=portfolio,
+            current_daily_pnl=daily_pnl,
+            dry_run=dry_run,
+        )
+        log_event("main", "crypto_scan_complete", result)
+    except Exception as e:
+        log_event("main", "crypto_scan_failed", {"error": str(e)[:300]}, result="failed")
+        raise
+
+
 def cmd_scan():
     """Run one scan cycle — auto-selects Phase 1 (stocks) or Phase 2/3 (options) based on portfolio size."""
     from lib.alpaca_client import AlpacaClient
@@ -1430,6 +1717,136 @@ def cmd_pred_scan():
         traceback.print_exc()
 
 
+def cmd_digest(send_telegram: bool = False):
+    """Build and print the daily digest. Optionally push to Telegram.
+
+    Pulls portfolio state, today's closed trades, open positions, postmortem
+    headline, anomaly triggers, and Hermes recent log into one summary.
+    """
+    from lib.alpaca_client import AlpacaClient
+    from lib.daily_digest import build_digest, send_telegram_digest
+
+    client = AlpacaClient()
+    text = build_digest(client)
+    print(text)
+    if send_telegram:
+        ok = send_telegram_digest(text)
+        if ok:
+            print("\n  ✓ Sent to Telegram")
+        else:
+            print("\n  ⚠️  Telegram send failed (check TELEGRAM_BOT_TOKEN/CHAT_ID)")
+
+
+def cmd_dipbuy(
+    watchlist: str | None = None,
+    threshold: float = 0.55,
+    persist: bool = False,
+):
+    """Scan for buy-the-dip setups: oversold + trend-intact pullbacks.
+
+    Five-feature composite (RSI oversold, SMA200 trend intact, pullback
+    magnitude, bounce signal, volume confirmation). Triggers on composite
+    >= threshold. Detection only — strategy engine still applies its own
+    gates before placing trades.
+    """
+    from lib.alpaca_client import AlpacaClient
+    from lib.dip_buyer import (
+        DEFAULT_WATCHLIST, scan_universe, print_dip_report, persist_scores,
+    )
+
+    if watchlist:
+        symbols = [s.strip().upper() for s in watchlist.split(",") if s.strip()]
+    else:
+        symbols = DEFAULT_WATCHLIST
+    print(f"  Dip-buy scan: {len(symbols)} symbols, threshold={threshold:.2f}")
+
+    client = AlpacaClient()
+    scores = scan_universe(client, symbols, composite_threshold=threshold)
+    print()
+    print_dip_report(scores, top=20)
+    if persist:
+        n = persist_scores(scores)
+        print(f"  Persisted {n} triggered hits to data/dip_log.jsonl")
+
+
+def cmd_postmortem(
+    target_date: str | None = None,
+    watchlist: str | None = None,
+    persist: bool = False,
+):
+    """Run the daily postmortem — counterfactuals + missed-opportunity scan.
+
+    Args:
+        target_date: ISO date string (YYYY-MM-DD); default = today.
+        watchlist: comma-separated tickers; default = anomaly DEFAULT_WATCHLIST.
+        persist: append report to data/postmortem_log.jsonl.
+    """
+    from datetime import date as _date
+    from lib.alpaca_client import AlpacaClient
+    from lib.postmortem import generate_report, print_report, persist_report
+
+    if target_date:
+        d = _date.fromisoformat(target_date)
+    else:
+        d = _date.today()
+
+    wl = None
+    if watchlist:
+        wl = [s.strip().upper() for s in watchlist.split(",") if s.strip()]
+
+    client = AlpacaClient()
+    report = generate_report(client, target_date=d, watchlist=wl)
+    print_report(report)
+    if persist:
+        persist_report(report)
+        print(f"\n  ✓ Persisted to data/postmortem_log.jsonl")
+
+
+def cmd_anomaly(
+    watchlist: str | None = None,
+    threshold: float = 4.0,
+    no_news: bool = False,
+    persist: bool = False,
+):
+    """Scan a watchlist for anomaly / "skyrocket" candidates.
+
+    Composite z-score over 4 features: volume, price-move, range, news velocity.
+    Triggers when composite >= threshold AND momentum confirmed AND quality
+    gates pass. Output is detection only — strategy engine still applies its
+    own gates before placing any trade.
+
+    Args:
+        watchlist: comma-separated tickers ("NVDA,TSLA,COIN"). If None, uses
+                   anomaly_detector.DEFAULT_WATCHLIST.
+        threshold: composite z-score required to trigger (default 4.0).
+        no_news: skip NewsAPI/RSS lookup (faster, lower-quality signal).
+        persist: append triggered hits to data/anomaly_log.jsonl.
+    """
+    from lib.alpaca_client import AlpacaClient
+    from lib.anomaly_detector import (
+        DEFAULT_WATCHLIST, scan_universe, print_anomaly_report, persist_scores,
+    )
+
+    if watchlist:
+        symbols = [s.strip().upper() for s in watchlist.split(",") if s.strip()]
+    else:
+        symbols = DEFAULT_WATCHLIST
+    print(f"  Anomaly scan: {len(symbols)} symbols, threshold={threshold:.1f}σ, "
+          f"news={'off' if no_news else 'on'}")
+
+    client = AlpacaClient()
+    scores = scan_universe(
+        client, symbols,
+        fetch_news=not no_news,
+        composite_threshold=threshold,
+    )
+    print()
+    print_anomaly_report(scores, top=20)
+    if persist:
+        n = persist_scores(scores)
+        print(f"  Persisted {n} triggered hits to data/anomaly_log.jsonl")
+
+
 def cmd_migrate():
     """Print the paper→live migration checklist."""
     print("📋 PAPER → LIVE MIGRATION CHECKLIST")
@@ -1464,8 +1881,23 @@ def main():
                                  "kronos", "news", "calibrate", "pred-scan",
                                  "forecast", "kelly", "llm", "correlation",
                                  "insiders", "congress", "greeks", "baseline",
-                                 "earnings", "econ", "finnhub"],
+                                 "earnings", "econ", "finnhub", "crypto-scan",
+                                 "crypto-monitor", "backtest-stocks",
+                                 "build-cache",
+                                 "pairs-scan", "min-variance",
+                                 "anomaly", "postmortem", "digest", "dipbuy"],
                         help="Command to run")
+    parser.add_argument("--signal", default="all",
+                        help="build-cache: which signal to fill (kronos|news|llm|all)")
+    parser.add_argument("--with-signals", action="store_true",
+                        help="backtest-stocks: enable Kronos+News+LLM+Bayesian enrichment "
+                             "(needs caches built first; bayesian works without cache)")
+    parser.add_argument("--with-kronos", action="store_true",
+                        help="backtest-stocks: enable Kronos signal only")
+    parser.add_argument("--with-news", action="store_true",
+                        help="backtest-stocks: enable historical news signal only")
+    parser.add_argument("--with-llm", action="store_true",
+                        help="backtest-stocks: enable LLM forecast signal only")
     parser.add_argument("--ticker", default="SPY", help="Ticker for backtest/kronos/news")
     parser.add_argument("--reason", default="manual_cli", help="Reason for kill switch")
     parser.add_argument("--port", type=int, default=5051,
@@ -1478,6 +1910,18 @@ def main():
     parser.add_argument("--amount", type=float, default=None, help="baseline: starting-capital amount (omit to snapshot current equity)")
     parser.add_argument("--snapshot", action="store_true", help="baseline: snapshot current portfolio value as baseline")
     parser.add_argument("--show", action="store_true", help="baseline: show current baseline without changing it")
+    parser.add_argument("--watchlist", default=None,
+                        help="anomaly: comma-separated tickers (override DEFAULT_WATCHLIST)")
+    parser.add_argument("--threshold", type=float, default=4.0,
+                        help="anomaly: composite z-score trigger threshold (default 4.0)")
+    parser.add_argument("--no-news", action="store_true",
+                        help="anomaly: skip NewsAPI/RSS lookup (faster)")
+    parser.add_argument("--persist", action="store_true",
+                        help="anomaly/postmortem: append output to JSONL log")
+    parser.add_argument("--date", default=None,
+                        help="postmortem: target date (YYYY-MM-DD); default today")
+    parser.add_argument("--telegram", action="store_true",
+                        help="digest: also push to Telegram (needs TELEGRAM_BOT_TOKEN+CHAT_ID)")
 
     args = parser.parse_args()
 
@@ -1490,6 +1934,28 @@ def main():
         cmd_status(full=args.full)
     elif args.command == "scan":
         cmd_scan()
+    elif args.command == "crypto-scan":
+        cmd_crypto_scan(dry_run=args.dry_run)
+    elif args.command == "crypto-monitor":
+        cmd_crypto_monitor(dry_run=args.dry_run)
+    elif args.command == "backtest-stocks":
+        # --with-signals turns on all four; the granular --with-* flags compose
+        # so you can do `--with-kronos --with-llm` etc. for ablation studies.
+        cmd_backtest_stocks(
+            days_back=args.lookback or 180,
+            capital=args.capital or 1500.0,
+            enable_kronos=args.with_signals or args.with_kronos,
+            enable_news=args.with_signals or args.with_news,
+            enable_llm=args.with_signals or args.with_llm,
+            enable_bayesian=True,  # always on (no cache needed, free)
+        )
+    elif args.command == "build-cache":
+        cmd_build_cache(signal=args.signal,
+                        days_back=args.lookback or 180)
+    elif args.command == "pairs-scan":
+        cmd_pairs_scan()
+    elif args.command == "min-variance":
+        cmd_min_variance()
     elif args.command == "monitor":
         cmd_monitor()
     elif args.command == "kill":
@@ -1538,6 +2004,27 @@ def main():
         cmd_econ()
     elif args.command == "finnhub":
         cmd_finnhub(args.ticker)
+    elif args.command == "anomaly":
+        cmd_anomaly(
+            watchlist=args.watchlist,
+            threshold=args.threshold,
+            no_news=args.no_news,
+            persist=args.persist,
+        )
+    elif args.command == "postmortem":
+        cmd_postmortem(
+            target_date=args.date,
+            watchlist=args.watchlist,
+            persist=args.persist,
+        )
+    elif args.command == "digest":
+        cmd_digest(send_telegram=args.telegram)
+    elif args.command == "dipbuy":
+        cmd_dipbuy(
+            watchlist=args.watchlist,
+            threshold=args.threshold if args.threshold != 4.0 else 0.55,
+            persist=args.persist,
+        )
 
 
 if __name__ == "__main__":

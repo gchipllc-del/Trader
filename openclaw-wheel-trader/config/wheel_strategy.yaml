@@ -16,28 +16,117 @@ tickers_phase1:
 - GRAB
 - PLTR
 - UBER
+- TSLA
+- AMD
+- NVDA
+- AVGO
+- COIN
+- HOOD
+- AFRM
+- PYPL
+- SHOP
+- MARA
+- RIOT
+- RBLX
+- U
+- DKNG
+- LCID
 quant:
   min_sharpe: -0.5
   max_drawdown: -0.55
   min_quant_score: 3.5
   exclude_avoid: true
 stock_params:
-  min_composite_score: 8
+  # 2026-04-28: Investigated why bot is making 0 trades.
+  # composite_score is sum(trend, level, signal, momentum) on a 0-13 scale
+  # (NOT the 0-10 quant screener QScore). Today's actual composites for the
+  # STRONG quant names are 1-4/13 because trend_score=0 across the board
+  # (multi-timeframe alignment is weak in current chop regime).
+  # Today's strongest names (BAC, F, SHOP) score composite=4. Setting
+  # threshold to 4 so those clear the gate while AMD(1), VALE(1), PFE(1)
+  # don't. The 3-pt floor still requires meaningful technical structure
+  # (e.g. signal=3 candlestick pattern, OR momentum=3 + signal=1).
+  # Was 10 (Hermes overshoot from 3-trade sample) → 7 (over-tight) → 4.
+  min_composite_score: 4
+  momentum_only_min_score: 2     # Was 3. Lowered so momentum-driven entries fire.
   stop_loss_pct: 0.035
   default_target_pct: 0.1
-  trailing_stop_pct: 0.03
+  trailing_stop_pct: 0.02
   max_position_pct: 0.3
-  max_trades_per_scan: 2
-  max_concurrent_positions: 3
+  max_trades_per_scan: 3
+  max_concurrent_positions: 5
   allow_momentum_only: true
-  momentum_only_min_score: 3
+  # Tiered trailing stop — tightens as unrealized P/L grows.
+  # See lib/stock_engine.py:1093 for behavior. The static `trailing_stop_pct`
+  # above (2%) is the fallback when this block is disabled.
+  trailing_stop_tiered:
+    enabled: true
+    tighten_on_rsi_exhaustion: true   # 30% tighter when RSI ≥ 78
+    tiers:
+      - {min_pnl: 0.20, trail: 0.005}  # +20% → 0.5% trail (very tight, milk the runner)
+      - {min_pnl: 0.12, trail: 0.008}  # +12% → 0.8% trail (aggressive lock)
+      - {min_pnl: 0.07, trail: 0.012}  # +7%  → 1.2% trail (tighten — gains at risk)
+      - {min_pnl: 0.03, trail: 0.018}  # +3%  → 1.8% trail (modest lock)
+      - {min_pnl: 0.00, trail: 0.025}  # 0%   → 2.5% trail (breathing room early)
   support_distance_tiers:
   - 0.04
   - 0.07
   - 0.1
   enable_scale_out: true
-  partial_exit_threshold: 0.15
+  partial_exit_threshold: 0.1
   partial_exit_fraction: 0.5
+tickers_crypto:
+- BTC/USD
+- ETH/USD
+- SOL/USD
+crypto_params:
+  enabled: true
+  # ─── Scalp mode (Tier B 2026-04-25) ───
+  # Tighter, faster setup that cycles capital ~5-10x more than swing-mode.
+  # The math: 0.2% spread + 0.1% slippage = 0.3% round-trip cost. A 3%
+  # gross target = 2.7% net. Risk/reward 1.5:2.7 = 1:1.8. Need >55% win
+  # rate to be net positive. The LLM ensemble + 10-feature score should
+  # clear that bar IF calibration holds.
+  min_trend_score: 7              # 7/10 — stricter than swing's 6 (less noise)
+  min_rsi: 42                     # Slightly tighter than 40 (less false bottoms)
+  max_rsi: 62                     # Avoid topping-out entries
+
+  stop_loss_pct: 0.015            # 1.5% — was 7%. Tighter = more stop-outs but smaller losses
+  target_pct: 0.03                # 3% — was 15%. Faster turnover
+  trailing_stop_pct: 0.01         # 1% trailing once in profit
+  partial_exit_threshold: 0.015   # Take half off at +1.5%
+  partial_exit_fraction: 0.5
+
+  max_position_pct: 0.20          # Same as before
+  max_concurrent: 3               # Was 2. With faster turnover, 3 = ~3x activity
+  max_trades_per_scan: 2          # Up from 1 — fill empty slots faster
+
+  # Cost-edge gate: minimum NET edge after spread + slippage. Skip a
+  # trade if (target_pct - spread_estimate - slippage_estimate) < this.
+  # Crypto on Alpaca: ~0.2% spread, ~0.1% slippage typical = 0.3% costs.
+  # 0.025 = 2.5% min net edge. Below this we're scalping into noise.
+  min_net_edge: 0.025
+  spread_estimate: 0.002
+  slippage_estimate: 0.001
+
+  # Volatility-adaptive overrides (Tier B force multiplier).
+  # When ATR/price > volatility_high, widen targets+stops by 1.5x.
+  # When ATR/price < volatility_low, tighten by 0.7x. Prevents the
+  # bot from getting whipsawed in high-vol regimes or sitting bored
+  # in low-vol regimes.
+  atr_adaptive_enabled: true
+  volatility_high: 0.04           # 4% ATR/price ratio
+  volatility_low: 0.015           # 1.5%
+  atr_high_multiplier: 1.5
+  atr_low_multiplier: 0.7
+
+  # Dynamic Kelly fraction based on conviction.
+  # Base = 0.30, ramps up with composite_score and LLM probability.
+  # High conviction (composite>=10 + llm_prob>=0.70) → 0.65 (near-half-Kelly).
+  # Low conviction (composite<7 + llm_prob<0.55) → 0.20.
+  kelly_fraction_base: 0.30
+  kelly_fraction_high_conviction: 0.65
+  kelly_fraction_low_conviction: 0.20
 tickers_phase2:
 - F
 - NIO
@@ -115,6 +204,8 @@ news_sentiment:
   cache_ttl_minutes: 30
   veto_sentiment_threshold: 0.25
   min_confidence_to_veto: 0.3
+  rerank_enabled: true
+  rerank_max_boost: 0.1
 bayesian:
   enabled: true
   min_win_prob: 0.58
@@ -130,7 +221,7 @@ correlation:
   hard_veto: false
 kelly:
   enabled: true
-  fraction: 0.25
+  fraction: 0.5
 insider_flow:
   enabled: true
   lookback_days: 90
@@ -146,10 +237,21 @@ greeks:
   default_iv: 0.3
   max_portfolio_vega: 500
   max_portfolio_abs_delta: 0.8
+# --- Options-derived signals (lib/options_signals.py) -----------------
+# Adds a ±2 boost to composite_score based on:
+#   1. Per-ticker IV/HV ratio (options cheap/expensive vs realized)
+#   2. SPY IV regime (low/normal/high — set per scan)
+#   3. (Optional) Unusual call volume — extra API call per candidate, off by default
+# Set enabled=false to skip these checks entirely (saves ~1 API call/candidate).
+options_signals:
+  enabled: true
+  enable_iv_hv: true
+  enable_unusual_volume: false   # extra API call per candidate; opt-in
+
 llm:
   enabled: true
   provider: deepseek
-  model: deepseek-chat
+  model: deepseek-v4-flash
   claude_model: claude-haiku-4-5
   max_tokens: 1000
   cache_ttl_minutes: 60
@@ -157,23 +259,9 @@ llm:
   consensus_enabled: true
   consensus_veto_enabled: false
   consensus_veto_confidence: 0.7
-
-  # Route analyze_option_setup / analyze_stock_setup through the `instructor`
-  # library for pydantic-validated JSON output (auto-retries on bad JSON).
-  # Falls back to the legacy regex parse if instructor isn't installed OR the
-  # structured call itself fails.  Default on; set false to pin to legacy.
   use_instructor: true
-
-  # Optional 2nd-phase orchestration via HuggingFace smolagents. When true,
-  # approved candidates also get a unanimous 3-agent LLM vote before executing.
-  # Off by default — requires `pip install smolagents`. See agents/consensus_smol.py.
   smol_consensus_enabled: false
-
-# Document RAG (SEC filings, earnings transcripts, Congress/insider filings)
-# via HKUDS/RAG-Anything. Feature-flagged skeleton — see lib/rag_corpus.py.
-# Install deps: pip install raganything
 rag:
   enabled: false
-  model: deepseek-chat
-  # Where parsed documents are cached on disk:
+  model: deepseek-v4-flash
   working_dir: data/rag_corpus/lightrag_storage

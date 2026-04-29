@@ -100,7 +100,31 @@ def refresh_earnings_calendar(tickers: list[str]) -> dict[str, str]:
     Returns: {ticker: "YYYY-MM-DD"} for tickers with upcoming earnings
     """
     import os
+    import time
     import requests as _requests
+
+    # 2026-04-28: Skip API refresh if local cache file is < 24 hours old.
+    # Previous behavior: every scan call (every 15 min) hit Alpha Vantage
+    # for all 32 tickers, blowing through the 25-call/day free quota in
+    # one scan. Earnings dates change at most weekly, so daily refresh is
+    # plenty.
+    EARNINGS_REFRESH_TTL_SECONDS = 24 * 3600
+    if EARNINGS_PATH.exists():
+        try:
+            age = time.time() - EARNINGS_PATH.stat().st_mtime
+            if age < EARNINGS_REFRESH_TTL_SECONDS:
+                _load_earnings_file()
+                # Return any tickers in the cache that match this universe
+                cached_for_universe = {
+                    t: _earnings_cache[t] for t in tickers
+                    if t in _earnings_cache
+                }
+                log_event("earnings", "cache_hit",
+                          {"age_hours": round(age / 3600, 1),
+                           "tickers_cached": len(cached_for_universe)})
+                return cached_for_universe
+        except Exception:
+            pass  # Fall through to API refresh
 
     updated = {}
     av_key = os.environ.get("ALPHA_VANTAGE_KEY", "")

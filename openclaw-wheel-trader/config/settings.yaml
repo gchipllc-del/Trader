@@ -8,7 +8,14 @@ live_migration_approved: false   # Requires manual flip + documented approval
 
 # --- Circuit Breakers ---
 circuit_breakers:
-  max_daily_loss: -150          # Halt trading at -$150 (-10% of $1500). Protects capital but doesn't choke growth.
+  # Two layers — whichever is more restrictive wins:
+  #   max_daily_loss      : hard dollar floor (kicks in regardless of equity)
+  #   max_daily_loss_pct  : equity-relative ceiling (auto-scales as bankroll grows)
+  # Today $1500 bankroll * -10% = -$150, which matches the dollar floor.
+  # When equity grows the pct path tightens correctly; if equity drops below
+  # $1500 the dollar floor still holds the line at -$150 absolute.
+  max_daily_loss: -150
+  max_daily_loss_pct: -0.10
   max_position_pct: 0.30        # 30% of portfolio per position (concentrated growth mode)
   max_sector_pct: 0.50          # 50% of portfolio per sector (allow conviction bets)
   max_open_orders: 8            # More concurrent orders for growth

@@ -119,7 +119,7 @@ def _get_instance() -> "RAGAnything | None":
                 messages.append(m)
             messages.append({"role": "user", "content": prompt})
             resp = llm_client.chat.completions.create(
-                model=_load_cfg().get("model", "deepseek-chat"),
+                model=_load_cfg().get("model", "deepseek-v4-flash"),
                 messages=messages,
                 temperature=0.2,
             )

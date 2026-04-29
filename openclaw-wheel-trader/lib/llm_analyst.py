@@ -307,8 +307,10 @@ def _call_deepseek(
         "stream": False,
     }
 
-    # deepseek-chat supports structured JSON output natively
-    if model == "deepseek-chat":
+    # DeepSeek V4 chat models support structured JSON output natively.
+    # Match both the legacy alias `deepseek-chat` and the V4 family
+    # (`deepseek-v4-flash`, `deepseek-v4-pro`).
+    if model in ("deepseek-chat", "deepseek-v4-flash", "deepseek-v4-pro"):
         payload["response_format"] = {"type": "json_object"}
 
     try:
@@ -469,7 +471,7 @@ def analyze_stock_setup(
 
     provider = (provider or llm_cfg.get("provider") or "deepseek").lower()
     if provider == "deepseek":
-        model = model or llm_cfg.get("model") or "deepseek-chat"
+        model = model or llm_cfg.get("model") or "deepseek-v4-flash"
     elif provider == "claude":
         model = model or llm_cfg.get("claude_model") or llm_cfg.get("model") or "claude-haiku-4-5"
     else:
@@ -703,7 +705,7 @@ def analyze_option_setup(
 
     provider = (provider or llm_cfg.get("provider") or "deepseek").lower()
     if provider == "deepseek":
-        model = model or llm_cfg.get("model") or "deepseek-chat"
+        model = model or llm_cfg.get("model") or "deepseek-v4-flash"
     elif provider == "claude":
         model = model or llm_cfg.get("claude_model") or llm_cfg.get("model") or "claude-haiku-4-5"
     else:

@@ -40,7 +40,8 @@ OPTIMIZATION_LOG = Path(__file__).parent.parent / "data" / "hermes_log.jsonl"
 BOUNDS = {
     "stop_loss_pct":         (0.02, 0.08),
     "default_target_pct":    (0.05, 0.20),
-    "min_composite_score":   (2, 10),  # Expanded 6→10 for high-conviction growth mode
+    "min_composite_score":   (2, 8),  # Capped at 8 — universe rarely scores >8.5/10
+                                       # so >8 starves the entry pipeline (saw this 2026-04-27)
     "max_position_pct":      (0.10, 0.30),
     "max_trades_per_scan":   (1, 5),
     "trailing_stop_pct":     (0.0, 0.06),
@@ -209,8 +210,31 @@ def diagnose(review: dict, current_params: dict) -> list[dict]:
 
     Each recommendation: {"param": str, "direction": "increase"|"decrease", "reason": str}
     """
-    if review["total_trades"] < 3:
-        return [{"param": "none", "direction": "hold", "reason": f"Only {review['total_trades']} trades — insufficient data"}]
+    # Small-sample guard. Hermes used to recommend changes on samples as
+    # small as 3 trades, which is statistically meaningless. On 2026-04-27
+    # this drove min_composite_score to 10/10 (max) on a 3-trade sample
+    # with 33% win rate, gating the bot to zero entries the next day.
+    # Now we hold below 8 trades, and below 15 we suppress entry-tightening
+    # specifically (it's the single most catastrophic miscalibration).
+    MIN_TRADES_FOR_ENTRY_TIGHTENING = 15
+    MIN_TRADES_ANY_CHANGE = 8
+
+    if review["total_trades"] < MIN_TRADES_ANY_CHANGE:
+        return [{
+            "param": "none", "direction": "hold",
+            "reason": (
+                f"Only {review['total_trades']} trades in window "
+                f"(need ≥{MIN_TRADES_ANY_CHANGE} for any change)."
+            ),
+        }]
+
+    # `increase` on min_composite_score means "be more selective" — tightening
+    # the entry filter. With a small sample, a single bad streak can push
+    # this to a level the universe can't actually achieve. Suppress until
+    # we have ≥15 trades.
+    suppress_entry_tightening = (
+        review["total_trades"] < MIN_TRADES_FOR_ENTRY_TIGHTENING
+    )
 
     recommendations = []
 
@@ -230,7 +254,7 @@ def diagnose(review: dict, current_params: dict) -> list[dict]:
         })
 
     # Win rate too low → raise minimum score or reduce trades
-    if review["win_rate"] < 0.40:
+    if review["win_rate"] < 0.40 and not suppress_entry_tightening:
         recommendations.append({
             "param": "min_composite_score",
             "direction": "increase",
@@ -456,7 +480,10 @@ def print_optimization_report(report: dict):
         print(f"\n  CURRENT PARAMETERS")
         for k, v in sorted(params.items()):
             bounds = BOUNDS.get(k, ("?", "?"))
-            print(f"  {k:<30s} {v:<10} (bounds: {bounds[0]}-{bounds[1]})")
+            # Cast to str — some params are lists (e.g. support_distance_tiers)
+            # which can't be formatted with the f-string {:<10} alignment spec.
+            v_str = str(v)
+            print(f"  {k:<30s} {v_str:<10} (bounds: {bounds[0]}-{bounds[1]})")
 
     print()
 

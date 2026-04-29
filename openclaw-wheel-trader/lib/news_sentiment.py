@@ -110,8 +110,13 @@ def _rate_limit(source: str, min_interval: float = 2.0):
 # ── Cache ────────────────────────────────────────────────────────
 
 def _cache_key(ticker: str) -> str:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H")
-    raw = f"stock_news:{ticker}:{today}"
+    # 2026-04-28: Removed hour bucket from key. Previously the key included
+    # `%Y-%m-%d-%H` so any cache lookup that crossed an hour boundary would
+    # miss regardless of TTL — causing redundant NewsAPI fetches for the
+    # same 4 tickers within 11 minutes (audit-confirmed). With a stable
+    # per-ticker key, the TTL parameter (default 30 min) actually governs
+    # freshness as intended.
+    raw = f"stock_news:{ticker}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 

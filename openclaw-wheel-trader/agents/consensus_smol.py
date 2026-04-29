@@ -68,7 +68,7 @@ def _load_llm_cfg() -> dict:
 def _build_model() -> "OpenAIServerModel":
     """DeepSeek via OpenAI-compatible endpoint (same as lib/llm_analyst.py)."""
     cfg = _load_llm_cfg()
-    model_id = cfg.get("model") or "deepseek-chat"
+    model_id = cfg.get("model") or "deepseek-v4-flash"
     return OpenAIServerModel(
         model_id=model_id,
         api_base="https://api.deepseek.com/v1",
