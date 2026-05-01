@@ -17,6 +17,7 @@ circuit_breakers:
   max_daily_loss: -150
   max_daily_loss_pct: -0.10
   max_position_pct: 0.30        # 30% of portfolio per position (concentrated growth mode)
+  auto_trim_buffer_pct: 0.02    # Auto-trim when position > max + buffer (so 32%) — prevents oversize drift
   max_sector_pct: 0.50          # 50% of portfolio per sector (allow conviction bets)
   max_open_orders: 8            # More concurrent orders for growth
   max_contracts_per_order: 2    # Start small

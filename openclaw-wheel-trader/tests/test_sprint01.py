@@ -170,6 +170,13 @@ class TestCircuitBreakers:
 # ============================================================
 
 class TestOrderGate:
+    @pytest.fixture(autouse=True)
+    def _isolate_dedup(self, tmp_path, monkeypatch):
+        """Point the cross-process dedup store at a per-test temp file so
+        hashes from one test (or a prior `pytest` run) don't carry over."""
+        from lib import order_dedup
+        monkeypatch.setattr(order_dedup, "DEDUP_FILE", tmp_path / "dedup.json")
+
     def test_propose_creates_hash(self):
         intent = OrderIntent(
             ticker="AAPL", side="sell_to_open", order_type="limit",
@@ -210,6 +217,88 @@ class TestOrderGate:
         )
         with pytest.raises(RuntimeError, match="not validated"):
             step3_execute(intent, None)
+
+
+# ============================================================
+# CROSS-PROCESS ORDER DEDUP (gap audit Wave 1 #2)
+# ============================================================
+
+class TestOrderDedup:
+    """The dedup store must be file-locked and survive across processes,
+    so two concurrent scans cannot each clear the same intent hash."""
+
+    @pytest.fixture(autouse=True)
+    def _temp_store(self, tmp_path, monkeypatch):
+        from lib import order_dedup
+        monkeypatch.setattr(order_dedup, "DEDUP_FILE", tmp_path / "dedup.json")
+
+    def test_first_record_succeeds(self):
+        from lib.order_dedup import check_and_record
+        is_dup, _ = check_and_record("hash_abc", window_seconds=60)
+        assert is_dup is False
+
+    def test_second_record_in_window_blocks(self):
+        from lib.order_dedup import check_and_record
+        check_and_record("hash_xyz", window_seconds=60)
+        is_dup, age = check_and_record("hash_xyz", window_seconds=60)
+        assert is_dup is True
+        assert age >= 0
+
+    def test_hash_persists_across_calls(self, tmp_path):
+        """Simulates the BAC double-buy: two separate 'processes' read
+        the same dedup file and the second one sees the first's record."""
+        from lib import order_dedup
+
+        # First "scan"
+        is_dup1, _ = order_dedup.check_and_record("bac_buy_hash", window_seconds=60)
+        assert is_dup1 is False
+        assert order_dedup.DEDUP_FILE.exists()
+
+        # File contains the hash on disk
+        import json
+        on_disk = json.loads(order_dedup.DEDUP_FILE.read_text())
+        assert "bac_buy_hash" in on_disk
+
+        # Second "scan" (same dedup file → simulates concurrent process)
+        is_dup2, _ = order_dedup.check_and_record("bac_buy_hash", window_seconds=60)
+        assert is_dup2 is True
+
+    def test_expired_hash_is_allowed_again(self, tmp_path, monkeypatch):
+        """A retry past the dedup window should be allowed."""
+        from lib import order_dedup
+        import json, time
+
+        # Manually plant an expired hash
+        expired_ts = time.time() - 120
+        order_dedup.DEDUP_FILE.parent.mkdir(parents=True, exist_ok=True)
+        order_dedup.DEDUP_FILE.write_text(json.dumps({"old_hash": expired_ts}))
+
+        # Use a 60s window — old_hash is 120s old, GC'd then re-recorded
+        is_dup, _ = order_dedup.check_and_record("old_hash", window_seconds=60)
+        assert is_dup is False
+
+    def test_step1_propose_uses_persistent_dedup(self, tmp_path, monkeypatch):
+        """End-to-end: order_gate.step1_propose must hit the file-locked store."""
+        from lib import order_dedup
+        from lib.order_gate import OrderIntent, step1_propose
+
+        intent_a = OrderIntent(
+            ticker="ZZZ", side="sell_to_open", order_type="limit",
+            asset_type="option", quantity=1, strike=50,
+            expiration="2026-12-19", composite_score=8,
+        )
+        intent_b = OrderIntent(
+            ticker="ZZZ", side="sell_to_open", order_type="limit",
+            asset_type="option", quantity=1, strike=50,
+            expiration="2026-12-19", composite_score=8,
+        )
+        # Same parameters → same hash
+        assert intent_a.intent_hash == intent_b.intent_hash
+
+        step1_propose(intent_a)
+        # Second call (different intent object, same hash) must block
+        with pytest.raises(ValueError, match="Duplicate"):
+            step1_propose(intent_b)
 
 
 # ============================================================

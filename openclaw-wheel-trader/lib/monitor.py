@@ -228,6 +228,7 @@ def run_monitoring_check(client: AlpacaClient) -> dict:
         "positions_checked": 0,
         "actions": [],
         "alerts": [],
+        "degraded": [],  # tickers we couldn't fetch data for this cycle
     }
 
     try:
@@ -242,11 +243,51 @@ def run_monitoring_check(client: AlpacaClient) -> dict:
 
         # Batch-fetch current option prices for early close checks
         option_prices = {}
+        option_price_fetch_failed = False
         try:
             from lib.data_pipeline import fetch_option_prices_for_positions
             option_prices = fetch_option_prices_for_positions(client, open_positions)
         except Exception as e:
-            log_event("monitor", "option_price_fetch_failed", {"error": str(e)})
+            option_price_fetch_failed = True
+            log_event("monitor", "option_price_fetch_failed", {"error": str(e)},
+                      result="degraded")
+            # Surface loudly: option exit checks (early close, stop) are now blind.
+            uncheckable = [
+                p.get("ticker", "?") for p in open_positions
+                if p.get("type") in ("csp", "cc")
+            ]
+            if uncheckable:
+                msg = (
+                    f"⚠️ DATA OUTAGE: option price fetch failed — "
+                    f"{len(uncheckable)} option position(s) NOT checked this cycle: "
+                    f"{', '.join(uncheckable[:6])}"
+                )
+                summary["alerts"].append(msg)
+                summary["degraded"].extend(
+                    {"ticker": t, "type": "option", "reason": "option_price_fetch_failed"}
+                    for t in uncheckable
+                )
+                send_alert(msg)
+
+        # --- Auto-trim oversize positions ---
+        # Position-size circuit breaker is entry-only; this enforces it on
+        # held positions every monitor cycle so winners running or duplicate
+        # buys can't leave us above max_position_pct indefinitely.
+        try:
+            from lib.stock_engine import auto_trim_oversize_stocks
+            trims = auto_trim_oversize_stocks(client)
+            for t in trims:
+                summary["actions"].append({
+                    "action": "auto_trim", "ticker": t["ticker"],
+                    "shares_sold": t["shares_sold"],
+                    "from_pct": t["from_pct"],
+                })
+                summary["alerts"].append(
+                    f"⚖️  {t['ticker']}: AUTO-TRIM {t['shares_sold']}sh "
+                    f"({t['from_pct']:.1%} → ≤{t['to_pct_target']:.0%})"
+                )
+        except Exception as e:
+            log_event("monitor", "auto_trim_failed", {"error": str(e)[:200]})
 
         # --- Stock position monitoring (Phase 1) ---
         stock_positions = [p for p in open_positions if p.get("type") == "stock"]
@@ -261,6 +302,27 @@ def run_monitoring_check(client: AlpacaClient) -> dict:
                 # Fetch daily data for stock exit checks
                 stock_tickers = list(set(p.get("ticker") for p in stock_positions if p.get("ticker")))
                 stock_daily = client.get_bars(stock_tickers, timeframe="1Day", limit=50)
+
+                # Surface any ticker we can't run exit checks against —
+                # missing bars = stops/targets/exits silently skipped.
+                missing_bars = [t for t in stock_tickers if not (
+                    isinstance(stock_daily, dict) and stock_daily.get(t) is not None
+                    and len(stock_daily[t]) > 0
+                )]
+                if missing_bars:
+                    msg = (
+                        f"⚠️ DATA OUTAGE: stock bars missing for "
+                        f"{len(missing_bars)} ticker(s) — exit checks NOT run: "
+                        f"{', '.join(missing_bars)}"
+                    )
+                    summary["alerts"].append(msg)
+                    summary["degraded"].extend(
+                        {"ticker": t, "type": "stock", "reason": "bars_fetch_failed"}
+                        for t in missing_bars
+                    )
+                    log_event("monitor", "stock_bars_missing",
+                              {"tickers": missing_bars}, result="degraded")
+                    send_alert(msg)
 
                 exits = check_stock_exits(client, stock_daily)
                 for exit_signal in exits:
@@ -342,6 +404,18 @@ def run_monitoring_check(client: AlpacaClient) -> dict:
                 if bp.get("symbol") == ticker:
                     stock_price = float(bp.get("current_price", 0))
                     break
+
+            if not stock_price:
+                # Quietly skipping roll/early-close decisions when we have no
+                # stock price was the bite at finding #5. Make it visible so a
+                # broker outage is at least audible.
+                summary["degraded"].append({
+                    "ticker": ticker, "type": "option",
+                    "reason": "no_underlying_price",
+                })
+                log_event("monitor", "option_check_degraded",
+                          {"ticker": ticker, "reason": "no_underlying_price"},
+                          result="degraded")
 
             if stock_price:
                 roll = check_roll_candidate(pos, stock_price)

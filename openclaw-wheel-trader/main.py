@@ -709,8 +709,9 @@ def cmd_chaos():
 
     # Test 2: Duplicate order detection
     print("[2/5] Duplicate order prevention...")
-    from lib.order_gate import OrderIntent, step1_propose, _recent_intents
-    _recent_intents.clear()
+    from lib.order_gate import OrderIntent, step1_propose
+    from lib.order_dedup import reset_for_tests as _reset_dedup
+    _reset_dedup()
     intent = OrderIntent(
         ticker="CHAOS_TEST", side="sell_to_open", order_type="limit",
         asset_type="option", quantity=1, strike=100,
@@ -722,6 +723,7 @@ def cmd_chaos():
         results.append(("duplicate_prevention", "FAIL", "Allowed duplicate"))
     except ValueError:
         results.append(("duplicate_prevention", "PASS", "Blocked duplicate"))
+    _reset_dedup()  # leave the live store untouched
 
     # Test 3: Low score rejection
     print("[3/5] Low composite score rejection...")

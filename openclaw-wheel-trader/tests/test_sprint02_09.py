@@ -99,6 +99,14 @@ def tmp_data_dir(tmp_path):
 # ============================================================
 
 class TestCSPEngine:
+    @pytest.fixture(autouse=True)
+    def _stub_earnings_veto(self, monkeypatch):
+        """These tests use 2024 expirations which now trip the Wave 1 #4
+        fail-safe veto (Finnhub unreachable + expiration in fail-safe window).
+        They aren't testing earnings logic, so neutralize the veto here."""
+        monkeypatch.setattr("lib.csp_engine.earnings_veto",
+                            lambda ticker, expiration, **kw: False)
+
     def test_scan_skips_existing_csp(self, tmp_path, monkeypatch):
         """Should skip tickers with existing open CSPs."""
         from lib import csp_engine
@@ -284,6 +292,13 @@ class TestMonitor:
 # ============================================================
 
 class TestCCEngine:
+    @pytest.fixture(autouse=True)
+    def _stub_earnings_veto(self, monkeypatch):
+        """Same Wave 1 #4 reason as TestCSPEngine: neutralize the fail-safe
+        veto for tests that aren't exercising earnings logic."""
+        monkeypatch.setattr("lib.cc_engine.earnings_veto",
+                            lambda ticker, expiration, **kw: False)
+
     def test_find_assigned_positions(self, tmp_path, monkeypatch):
         """Should find positions that need covered calls."""
         from lib import cc_engine
@@ -838,6 +853,374 @@ class TestMain:
         captured = capsys.readouterr()
         assert "MIGRATION CHECKLIST" in captured.out
         assert "live_migration_approved" in captured.out
+
+
+# ============================================================
+# CRYPTO ORDER GATE TESTS (gap audit Wave 1 #1)
+# ============================================================
+
+class TestCryptoOrderGate:
+    """Crypto orders must flow through propose → validate → execute,
+    not bypass directly to alpaca trading client."""
+
+    def test_crypto_buy_routes_through_order_gate(self, tmp_path, monkeypatch):
+        from lib import crypto_engine
+
+        pos_file = tmp_path / "positions.json"
+        pos_file.write_text("[]")
+        monkeypatch.setattr(crypto_engine, "POSITIONS_PATH", pos_file)
+
+        calls = []
+        monkeypatch.setattr("lib.crypto_engine.step1_propose",
+                            lambda i: (calls.append("propose"), i)[-1])
+        monkeypatch.setattr("lib.crypto_engine.step2_validate",
+                            lambda intent, **kw: (calls.append("validate"),
+                                                  setattr(intent, "_validated", True), True)[-1])
+        monkeypatch.setattr("lib.crypto_engine.step3_execute",
+                            lambda i, c: (calls.append("execute"),
+                                          {"id": "ord_xyz", "status": "filled",
+                                           "filled_qty": "0.001",
+                                           "filled_avg_price": "100000"})[-1])
+
+        cand = {
+            "ticker": "BTC/USD", "notional": 100.0, "current_price": 100000.0,
+            "target_price": 115000.0, "stop_loss": 93000.0,
+            "trailing_stop_pct": 0.04, "composite_score": 10,
+        }
+        result = crypto_engine.execute_crypto_buy(
+            cand, MagicMock(),
+            portfolio_value=10000, current_daily_pnl=0, current_open_orders=0,
+        )
+
+        assert result is not None
+        assert result["order_id"] == "ord_xyz"
+        assert calls == ["propose", "validate", "execute"]
+
+    def test_crypto_close_skips_breakers_but_keeps_dedup(self, tmp_path, monkeypatch):
+        """Closing exits should NOT be blocked by daily-loss / open-orders caps,
+        but a duplicate close inside the dedup window must be blocked."""
+        from lib import crypto_engine
+        from lib.order_gate import OrderIntent
+
+        captured_orders = []
+        monkeypatch.setattr(
+            "lib.crypto_engine.submit_close",
+            lambda intent, client: (
+                captured_orders.append(intent),
+                {"id": f"close_{len(captured_orders)}", "status": "accepted"}
+            )[-1],
+        )
+
+        pos = {
+            "ticker": "ETH/USD", "type": "crypto", "status": "open",
+            "shares": 0.05, "entry_price": 2000.0, "stop_loss": 1860.0,
+            "target_price": 2300.0, "trailing_stop_pct": 0.04,
+        }
+        crypto_engine._close_crypto_position(pos, 1850.0, "stop_loss", MagicMock())
+
+        assert pos["status"] == "closed"
+        assert pos["exit_price"] == 1850.0
+        assert len(captured_orders) == 1
+        assert captured_orders[0].asset_type == "crypto"
+        assert captured_orders[0].side == "sell"
+
+    def test_submit_close_rejects_buys(self):
+        """submit_close is for closing sides only; buys must use the full pipeline."""
+        from lib.order_gate import OrderIntent, submit_close
+
+        buy = OrderIntent(
+            ticker="BTC/USD", side="buy", order_type="market",
+            asset_type="crypto", quantity=0.001, notional=100.0,
+            limit_price=100000, composite_score=10,
+        )
+        with pytest.raises(ValueError, match="closing sides"):
+            submit_close(buy, MagicMock())
+
+    def test_stock_buy_routes_through_order_gate(self, tmp_path, monkeypatch):
+        """Stock entries must propose+validate+execute via order_gate, not bypass."""
+        from lib import stock_engine
+
+        pos_file = tmp_path / "positions.json"
+        pos_file.write_text("[]")
+        monkeypatch.setattr(stock_engine, "POSITIONS_PATH", pos_file)
+        monkeypatch.setattr(stock_engine, "remember_trade_decision", lambda **kw: None)
+        monkeypatch.setattr(stock_engine, "diary_write", lambda a, e: None)
+
+        calls = []
+        monkeypatch.setattr("lib.stock_engine.step1_propose",
+                            lambda i: (calls.append("propose"), i)[-1])
+        monkeypatch.setattr("lib.stock_engine.step2_validate",
+                            lambda intent, **kw: (calls.append("validate"),
+                                                  setattr(intent, "_validated", True), True)[-1])
+        monkeypatch.setattr("lib.stock_engine.step3_execute",
+                            lambda i, c: (calls.append("execute"),
+                                          {"id": "ord_st1", "status": "accepted",
+                                           "symbol": i.ticker, "qty": str(i.quantity),
+                                           "side": "buy"})[-1])
+
+        client = MagicMock()
+        client.get_positions.return_value = []
+        client._get_trading_client.return_value.get_orders.return_value = []
+        client.limiter.wait_if_needed = lambda: None
+
+        candidate = {
+            "ticker": "NU", "shares": 5, "current_price": 14.50,
+            "target_price": 15.50, "stop_loss": 14.00,
+            "composite_score": 5, "trend_score": 2, "level_score": 1, "signal_score": 0,
+            "zone_level": 14.10, "zone_touches": 3, "pattern": None,
+        }
+        result = stock_engine.execute_stock_buy(
+            candidate, client, portfolio_value=10000,
+            current_daily_pnl=0, current_open_orders=0,
+        )
+
+        assert result is not None
+        assert result["id"] == "ord_st1"
+        assert calls == ["propose", "validate", "execute"]
+
+    def test_auto_trim_oversize_position(self, tmp_path, monkeypatch):
+        """Auto-trim must fire when a position drifts past max_pct + buffer
+        and submit a sell large enough to bring it back to max_pct."""
+        from lib import stock_engine
+
+        pos_file = tmp_path / "positions.json"
+        pos_file.write_text(json.dumps([{
+            "ticker": "BAC", "type": "stock", "status": "open",
+            "shares": 12, "entry_price": 52.86,
+        }]))
+        monkeypatch.setattr(stock_engine, "POSITIONS_PATH", pos_file)
+        monkeypatch.setattr(stock_engine, "diary_write", lambda a, e: None)
+        # Force settings to a known max_pct=0.30, buffer=0.02
+        monkeypatch.setattr(stock_engine, "_load_settings", lambda: {
+            "circuit_breakers": {"max_position_pct": 0.30, "auto_trim_buffer_pct": 0.02}
+        })
+
+        captured = []
+        monkeypatch.setattr(
+            "lib.stock_engine.submit_close",
+            lambda intent, client: (
+                captured.append(intent),
+                {"id": "trim_001", "status": "accepted",
+                 "symbol": intent.ticker, "qty": str(intent.quantity)}
+            )[-1],
+        )
+
+        client = MagicMock()
+        # 12 BAC @ $52.45 = $629.40; equity $1551 → 40.6% (over 32% trigger)
+        client.get_account.return_value = {"equity": "1551.00", "portfolio_value": "1551.00"}
+        client.get_positions.return_value = [{
+            "symbol": "BAC", "qty": "12", "market_value": "629.40",
+            "current_price": "52.45",
+        }]
+
+        trims = stock_engine.auto_trim_oversize_stocks(client)
+
+        assert len(trims) == 1
+        assert trims[0]["ticker"] == "BAC"
+        # Target = 30% of $1551 = $465.30; excess = $164.10; ceil(164.10/52.45) = 4
+        assert trims[0]["shares_sold"] == 4
+        assert len(captured) == 1
+        assert captured[0].asset_type == "equity"
+        assert captured[0].side == "sell"
+        assert captured[0].quantity == 4
+
+        # positions.json reconciled: BAC down to 8 shares
+        with open(pos_file) as f:
+            updated = json.load(f)
+        assert updated[0]["shares"] == 8
+
+    def test_auto_trim_skips_position_inside_cap(self, tmp_path, monkeypatch):
+        """Position at 27% (inside 30%+2% trigger) must NOT be trimmed."""
+        from lib import stock_engine
+
+        pos_file = tmp_path / "positions.json"
+        pos_file.write_text("[]")
+        monkeypatch.setattr(stock_engine, "POSITIONS_PATH", pos_file)
+        monkeypatch.setattr(stock_engine, "_load_settings", lambda: {
+            "circuit_breakers": {"max_position_pct": 0.30, "auto_trim_buffer_pct": 0.02}
+        })
+        monkeypatch.setattr("lib.stock_engine.submit_close",
+                            lambda intent, client: (_ for _ in ()).throw(
+                                AssertionError("should not have submitted")))
+
+        client = MagicMock()
+        client.get_account.return_value = {"equity": "1551.00"}
+        client.get_positions.return_value = [{
+            "symbol": "NU", "qty": "24", "market_value": "418.77",  # 27.0%
+            "current_price": "17.45",
+        }]
+        trims = stock_engine.auto_trim_oversize_stocks(client)
+        assert trims == []
+
+    def test_auto_trim_skips_crypto(self, tmp_path, monkeypatch):
+        """Crypto positions (symbols with '/') must be left to crypto_engine."""
+        from lib import stock_engine
+
+        monkeypatch.setattr(stock_engine, "_load_settings", lambda: {
+            "circuit_breakers": {"max_position_pct": 0.30, "auto_trim_buffer_pct": 0.02}
+        })
+
+        client = MagicMock()
+        client.get_account.return_value = {"equity": "1000.00"}
+        client.get_positions.return_value = [{
+            "symbol": "ETH/USD", "qty": "0.2", "market_value": "500",  # 50%, would trigger
+            "current_price": "2500",
+        }]
+        # If submit_close were called this would raise — it must not be called
+        monkeypatch.setattr("lib.stock_engine.submit_close",
+                            lambda intent, client: (_ for _ in ()).throw(
+                                AssertionError("crypto must be skipped")))
+        trims = stock_engine.auto_trim_oversize_stocks(client)
+        assert trims == []
+
+    def test_stock_sell_uses_submit_close(self, tmp_path, monkeypatch):
+        """Stock exits must go through submit_close (dedup + log, no breakers)."""
+        from lib import stock_engine
+
+        pos_file = tmp_path / "positions.json"
+        pos_file.write_text(json.dumps([{
+            "ticker": "BAC", "type": "stock", "status": "open",
+            "shares": 4, "entry_price": 52.00, "stop_loss": 51.00,
+            "target_price": 57.00, "composite_score": 4,
+            "opened_at": "2026-04-28T15:00:00+00:00",
+        }]))
+        hist_file = tmp_path / "trade_history.json"
+        hist_file.write_text("[]")
+        monkeypatch.setattr(stock_engine, "POSITIONS_PATH", pos_file)
+        monkeypatch.setattr(stock_engine, "TRADE_HISTORY_PATH", hist_file)
+        monkeypatch.setattr(stock_engine, "diary_write", lambda a, e: None)
+
+        captured = []
+        monkeypatch.setattr(
+            "lib.stock_engine.submit_close",
+            lambda intent, client: (
+                captured.append(intent),
+                {"id": "close_xyz", "status": "accepted",
+                 "symbol": intent.ticker, "qty": str(intent.quantity)}
+            )[-1],
+        )
+
+        client = MagicMock()
+        client.get_positions.return_value = [{"symbol": "BAC", "current_price": "52.50"}]
+
+        result = stock_engine.execute_stock_sell("BAC", client, reason="manual_trim")
+
+        assert result is not None
+        assert len(captured) == 1
+        assert captured[0].asset_type == "equity"
+        assert captured[0].side == "sell"
+        assert captured[0].quantity == 4
+
+    def test_earnings_veto_safe_when_lookup_fails_in_window(self, monkeypatch):
+        """Wave 1 #4: if Finnhub doesn't respond AND expiration is within
+        ~1 earnings cycle, veto rather than trade blind."""
+        from lib import earnings_filter
+
+        # Simulate Finnhub returning no events with lookup_ok=False (failure)
+        monkeypatch.setattr(
+            "lib.earnings_filter.get_earnings_calendar_with_status",
+            lambda ticker, days_ahead: ([], False),
+        )
+
+        from datetime import date, timedelta
+        soon = (date.today() + timedelta(days=30)).isoformat()
+        # Default strict=False used to fail open. Now must veto.
+        assert earnings_filter.earnings_veto("AAPL", soon, strict=False) is True
+
+    def test_earnings_veto_far_dated_defers_to_strict(self, monkeypatch):
+        """Beyond the fail-safe window, far-dated options can still trade
+        when strict=False (legacy behavior preserved)."""
+        from lib import earnings_filter
+
+        monkeypatch.setattr(
+            "lib.earnings_filter.get_earnings_calendar_with_status",
+            lambda ticker, days_ahead: ([], False),
+        )
+
+        from datetime import date, timedelta
+        far = (date.today() + timedelta(days=90)).isoformat()
+        assert earnings_filter.earnings_veto("AAPL", far, strict=False) is False
+        assert earnings_filter.earnings_veto("AAPL", far, strict=True) is True
+
+    def test_earnings_veto_no_event_with_successful_lookup(self, monkeypatch):
+        """Confirmed empty earnings calendar must NOT veto (don't change happy path)."""
+        from lib import earnings_filter
+
+        monkeypatch.setattr(
+            "lib.earnings_filter.get_earnings_calendar_with_status",
+            lambda ticker, days_ahead: ([], True),
+        )
+
+        from datetime import date, timedelta
+        soon = (date.today() + timedelta(days=30)).isoformat()
+        assert earnings_filter.earnings_veto("AAPL", soon, strict=False) is False
+
+    def test_monitor_surfaces_missing_stock_bars(self, tmp_path, monkeypatch):
+        """Wave 1 #5: when bars come back empty for a held ticker, the
+        cycle must record a degraded entry and emit a loud alert
+        instead of silently skipping the stop check."""
+        from lib import monitor
+
+        pos_file = tmp_path / "positions.json"
+        pos_file.write_text(json.dumps([
+            {"ticker": "BAC", "type": "stock", "status": "open", "shares": 8,
+             "entry_price": 52.86, "stop_loss": 51.00, "target_price": 57.00},
+            {"ticker": "NU", "type": "stock", "status": "open", "shares": 24,
+             "entry_price": 14.50, "stop_loss": 14.00, "target_price": 15.50},
+        ]))
+        monkeypatch.setattr(monitor, "POSITIONS_PATH", pos_file)
+        monkeypatch.setattr(monitor, "send_alert", lambda msg: None)
+        monkeypatch.setattr(monitor, "diary_write", lambda *a, **k: None)
+
+        client = MagicMock()
+        client.get_account.return_value = {
+            "equity": "1551", "portfolio_value": "1551", "cash": "289",
+        }
+        client.get_positions.return_value = []
+        # Only BAC has bars — NU is missing (simulating an Alpaca timeout).
+        import pandas as pd
+        bac_bars = pd.DataFrame([{"close": 52.50, "high": 52.7, "low": 52.3,
+                                   "open": 52.6, "volume": 1000}])
+        client.get_bars.return_value = {"BAC": bac_bars, "NU": None}
+
+        # Bypass the heavy stock_engine/data_pipeline imports — we only care
+        # that monitor's outage detection fires.
+        monkeypatch.setattr("lib.stock_engine.check_stock_exits",
+                            lambda client, daily: [])
+        monkeypatch.setattr("lib.stock_engine.execute_stock_sell",
+                            lambda *a, **k: None)
+        monkeypatch.setattr("lib.stock_engine.execute_partial_stock_sell",
+                            lambda *a, **k: None)
+        monkeypatch.setattr("lib.stock_engine.auto_trim_oversize_stocks",
+                            lambda c: [])
+        monkeypatch.setattr("lib.data_pipeline.fetch_option_prices_for_positions",
+                            lambda c, p: {})
+
+        result = monitor.run_monitoring_check(client)
+
+        # NU missing bars → must surface in degraded list and alerts
+        degraded_tickers = [d["ticker"] for d in result.get("degraded", [])]
+        assert "NU" in degraded_tickers
+        assert any("DATA OUTAGE" in a and "NU" in a for a in result.get("alerts", []))
+
+    def test_step2_validate_handles_crypto_notional(self):
+        """Crypto buys carry notional, not strike or limit_price * qty."""
+        from lib.order_gate import OrderIntent, step2_validate
+
+        intent = OrderIntent(
+            ticker="SOL/USD", side="buy", order_type="market",
+            asset_type="crypto", quantity=1.5, notional=130.0,
+            limit_price=86.67, composite_score=10,
+        )
+        ok = step2_validate(
+            intent,
+            portfolio_value=10000.0,
+            current_daily_pnl=0.0,
+            current_open_orders=0,
+            min_composite_score=0,
+        )
+        assert ok is True
+        assert intent._validated is True
 
 
 # ============================================================

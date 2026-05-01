@@ -9,14 +9,13 @@ No single function call can place an order. This is by design.
 """
 
 import hashlib
-import json
-import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Literal
 
 from lib.audit import log_event
 from lib.circuit_breaker import run_all_checks, CircuitBreakerTripped
+from lib.order_dedup import check_and_record
 
 
 @dataclass
@@ -25,12 +24,13 @@ class OrderIntent:
     ticker: str
     side: Literal["sell_to_open", "buy_to_close", "buy", "sell"]
     order_type: Literal["limit", "market"]
-    asset_type: Literal["option", "equity"]
-    quantity: int
+    asset_type: Literal["option", "equity", "crypto"]
+    quantity: float                       # int for stock/option, float for crypto
     limit_price: float | None = None
     option_type: str | None = None       # "put" or "call"
     strike: float | None = None
     expiration: str | None = None        # YYYY-MM-DD
+    notional: float | None = None         # crypto buys: dollar amount instead of qty
     reason: str = ""
     composite_score: int = 0             # Trend + Level + Signal (0-9)
     created_at: str = ""
@@ -41,13 +41,15 @@ class OrderIntent:
         if not self.created_at:
             self.created_at = datetime.now(timezone.utc).isoformat()
         if not self.intent_hash:
-            # Hash to detect duplicate orders
-            hash_input = f"{self.ticker}:{self.side}:{self.strike}:{self.expiration}:{self.quantity}"
+            # Hash to detect duplicate orders. Includes notional so a buy and
+            # an immediately-following close (different qty) get distinct hashes.
+            hash_input = (
+                f"{self.ticker}:{self.side}:{self.strike}:{self.expiration}:"
+                f"{self.quantity}:{self.notional}"
+            )
             self.intent_hash = hashlib.sha256(hash_input.encode()).hexdigest()[:16]
 
 
-# Track recent intent hashes to prevent duplicates
-_recent_intents: dict[str, float] = {}  # hash -> timestamp
 DUPLICATE_WINDOW_SECONDS = 60
 
 
@@ -55,28 +57,22 @@ def step1_propose(intent: OrderIntent) -> OrderIntent:
     """
     Step 1: PROPOSE — Log the intent. No execution happens here.
     Returns the intent for Step 2.
+
+    Dedup uses a file-locked store (lib/order_dedup) so concurrent scan
+    and monitor processes share the same view. The previous in-RAM dict
+    only protected within one process and missed the BAC double-buy on
+    2026-04-28.
     """
-    # Check for duplicate within window
-    now = time.time()
-    if intent.intent_hash in _recent_intents:
-        last_time = _recent_intents[intent.intent_hash]
-        if now - last_time < DUPLICATE_WINDOW_SECONDS:
-            log_event("order_gate", "duplicate_blocked", {
-                "hash": intent.intent_hash,
-                "ticker": intent.ticker,
-                "seconds_since_last": round(now - last_time, 1),
-            }, result="blocked")
-            raise ValueError(
-                f"Duplicate order detected for {intent.ticker} within {DUPLICATE_WINDOW_SECONDS}s"
-            )
-
-    _recent_intents[intent.intent_hash] = now
-
-    # Clean up old entries
-    cutoff = now - DUPLICATE_WINDOW_SECONDS * 2
-    expired = [h for h, t in _recent_intents.items() if t < cutoff]
-    for h in expired:
-        del _recent_intents[h]
+    is_dup, age = check_and_record(intent.intent_hash, DUPLICATE_WINDOW_SECONDS)
+    if is_dup:
+        log_event("order_gate", "duplicate_blocked", {
+            "hash": intent.intent_hash,
+            "ticker": intent.ticker,
+            "seconds_since_last": round(age, 1),
+        }, result="blocked")
+        raise ValueError(
+            f"Duplicate order detected for {intent.ticker} within {DUPLICATE_WINDOW_SECONDS}s"
+        )
 
     log_event("order_gate", "step1_proposed", {
         "intent": asdict(intent),
@@ -91,6 +87,7 @@ def step2_validate(
     current_daily_pnl: float,
     current_open_orders: int,
     last_loss_time: datetime | None = None,
+    min_composite_score: int = 7,
 ) -> bool:
     """
     Step 2: VALIDATE — Run circuit breakers and score check.
@@ -99,6 +96,9 @@ def step2_validate(
     # Calculate order value
     if intent.asset_type == "option":
         order_value = (intent.strike or 0) * 100 * intent.quantity  # CSP collateral
+    elif intent.asset_type == "crypto":
+        # Crypto buys use notional (dollars). Sells use qty * limit_price (or 0).
+        order_value = float(intent.notional) if intent.notional else (intent.limit_price or 0) * intent.quantity
     else:
         order_value = (intent.limit_price or 0) * intent.quantity
 
@@ -119,15 +119,16 @@ def step2_validate(
         }, result="blocked")
         raise
 
-    # Check composite score threshold
-    if intent.composite_score < 7:
+    # Check composite score threshold (caller can lower for non-equity strategies
+    # like crypto where the score scale differs).
+    if intent.composite_score < min_composite_score:
         log_event("order_gate", "step2_low_score", {
             "hash": intent.intent_hash,
             "score": intent.composite_score,
-            "required": 7,
+            "required": min_composite_score,
         }, result="blocked")
         raise ValueError(
-            f"Composite score {intent.composite_score}/9 below minimum 7/9"
+            f"Composite score {intent.composite_score} below minimum {min_composite_score}"
         )
 
     log_event("order_gate", "step2_validated", {
@@ -137,6 +138,29 @@ def step2_validate(
 
     intent._validated = True
     return True
+
+
+def submit_close(intent: OrderIntent, alpaca_client) -> dict:
+    """
+    Submit a closing order (stop-loss exit, target hit, partial scale-out).
+
+    Closes go through propose (dedup + log) and execute, but skip breaker
+    validation: we never want a daily-loss or open-orders cap to block an
+    exit. Dedup is preserved so a duplicate close request inside the
+    DUPLICATE_WINDOW_SECONDS window still gets blocked.
+    """
+    if intent.side not in ("sell", "buy_to_close"):
+        raise ValueError(
+            f"submit_close only handles closing sides; got {intent.side}"
+        )
+    intent = step1_propose(intent)
+    log_event("order_gate", "step2_skipped_close", {
+        "hash": intent.intent_hash,
+        "ticker": intent.ticker,
+        "side": intent.side,
+    }, result="success")
+    intent._validated = True
+    return step3_execute(intent, alpaca_client)
 
 
 def step3_execute(intent: OrderIntent, alpaca_client) -> dict:

@@ -25,6 +25,13 @@ from lib.candlestick import get_latest_signal, scan_patterns
 from lib.iv_rank import calculate_historical_volatility
 from lib.memory_palace import diary_write, remember_trade_decision, get_current_regime
 from lib.circuit_breaker import check_paper_mode, check_daily_loss, CircuitBreakerTripped
+from lib.order_gate import (
+    OrderIntent,
+    step1_propose,
+    step2_validate,
+    step3_execute,
+    submit_close,
+)
 from lib.quant_screener import screen_universe, print_screening_report
 from lib.momentum import analyze_momentum
 
@@ -912,6 +919,7 @@ def execute_stock_buy(
     client: AlpacaClient,
     portfolio_value: float,
     current_daily_pnl: float = 0,
+    current_open_orders: int = 0,
 ) -> dict | None:
     """
     Execute a stock purchase through circuit breakers.
@@ -994,33 +1002,41 @@ def execute_stock_buy(
         "score": candidate["composite_score"],
     }, result="pending")
 
+    intent = OrderIntent(
+        ticker=ticker,
+        side="buy",
+        order_type="market",
+        asset_type="equity",
+        quantity=shares,
+        limit_price=price,                # sizing reference for step2_validate
+        reason=f"stock_scan_score_{candidate.get('composite_score', 0)}",
+        composite_score=int(candidate.get("composite_score", 0)),
+    )
+
     try:
-        from alpaca.trading.requests import MarketOrderRequest
-        from alpaca.trading.enums import OrderSide, TimeInForce
-
-        trading_client = client._get_trading_client()
-        client.limiter.wait_if_needed()
-
-        order = trading_client.submit_order(MarketOrderRequest(
-            symbol=ticker,
-            qty=shares,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY,
-        ))
-
-        response = {
-            "id": str(order.id),
-            "status": str(order.status),
-            "symbol": order.symbol,
-            "qty": str(order.qty),
-            "side": str(order.side),
-        }
+        intent = step1_propose(intent)
+        # Stock entries clear scoring upstream (allow_momentum_only=3+).
+        # Pass min_composite_score=0 here so the gate's score check (default 7,
+        # tuned for options) doesn't reject valid stock candidates.
+        step2_validate(
+            intent,
+            portfolio_value=portfolio_value,
+            current_daily_pnl=current_daily_pnl,
+            current_open_orders=current_open_orders,
+            min_composite_score=0,
+        )
+        response = step3_execute(intent, client)
 
         log_event("stock_engine", "executed", {
             "ticker": ticker, "order_id": response["id"],
             "status": response["status"],
         }, result="success")
 
+    except (CircuitBreakerTripped, ValueError) as e:
+        log_event("stock_engine", "blocked", {"ticker": ticker, "reason": str(e)[:200]},
+                  result="blocked")
+        diary_write("strategy_agent", f"{ticker}|STOCK_BLOCKED|{str(e)[:80]}")
+        return None
     except Exception as e:
         log_event("stock_engine", "failed", {"ticker": ticker, "error": str(e)}, result="failed")
         diary_write("strategy_agent", f"{ticker}|STOCK_FAILED|{e}")
@@ -1293,26 +1309,18 @@ def execute_stock_sell(
     broker_map = {p["symbol"]: p for p in broker_positions}
     exit_price = float(broker_map[ticker]["current_price"]) if ticker in broker_map else pos.get("entry_price", 0)
 
+    intent = OrderIntent(
+        ticker=ticker,
+        side="sell",
+        order_type="market",
+        asset_type="equity",
+        quantity=shares,
+        limit_price=exit_price,
+        reason=f"stock_close_{reason}",
+    )
+
     try:
-        from alpaca.trading.requests import MarketOrderRequest
-        from alpaca.trading.enums import OrderSide, TimeInForce
-
-        trading_client = client._get_trading_client()
-        client.limiter.wait_if_needed()
-
-        order = trading_client.submit_order(MarketOrderRequest(
-            symbol=ticker,
-            qty=shares,
-            side=OrderSide.SELL,
-            time_in_force=TimeInForce.DAY,
-        ))
-
-        response = {
-            "id": str(order.id),
-            "status": str(order.status),
-            "symbol": order.symbol,
-            "qty": str(order.qty),
-        }
+        response = submit_close(intent, client)
 
         # Calculate realized P/L
         entry_price = pos.get("entry_price", 0)
@@ -1415,27 +1423,19 @@ def execute_partial_stock_sell(
     broker_map = {bp["symbol"]: bp for bp in broker_positions}
     exit_price = float(broker_map[ticker]["current_price"]) if ticker in broker_map else pos.get("entry_price", 0)
 
+    intent = OrderIntent(
+        ticker=ticker,
+        side="sell",
+        order_type="market",
+        asset_type="equity",
+        quantity=shares_to_sell,
+        limit_price=exit_price,
+        reason=f"stock_partial_{reason}",
+    )
+
     try:
-        from alpaca.trading.requests import MarketOrderRequest
-        from alpaca.trading.enums import OrderSide, TimeInForce
-
-        trading_client = client._get_trading_client()
-        client.limiter.wait_if_needed()
-
-        order = trading_client.submit_order(MarketOrderRequest(
-            symbol=ticker,
-            qty=shares_to_sell,
-            side=OrderSide.SELL,
-            time_in_force=TimeInForce.DAY,
-        ))
-
-        response = {
-            "id": str(order.id),
-            "status": str(order.status),
-            "symbol": order.symbol,
-            "qty": str(order.qty),
-            "partial": True,
-        }
+        response = submit_close(intent, client)
+        response["partial"] = True
 
         # Update position — reduce shares, mark partial taken
         entry_price = pos.get("entry_price", 0)
@@ -1487,6 +1487,136 @@ def execute_partial_stock_sell(
             "ticker": ticker, "error": str(e)
         }, result="failed")
         return None
+
+
+def auto_trim_oversize_stocks(client: AlpacaClient) -> list[dict]:
+    """
+    Auto-correct positions that have drifted past max_position_pct.
+
+    The position-size circuit breaker only blocks NEW orders; once a position
+    grows past the cap (winners running, or duplicate buys before the
+    2026-04-28 dedup fix), nothing brings it back inside. This sweeps every
+    monitor cycle and trims the excess via order_gate.submit_close.
+
+    Returns a list of trim records, one per position trimmed.
+    """
+    settings = _load_settings()
+    cb = settings.get("circuit_breakers", {})
+    max_pct = float(cb.get("max_position_pct", 0.30))
+    buffer = float(cb.get("auto_trim_buffer_pct", 0.02))
+    trigger_pct = max_pct + buffer
+
+    try:
+        account = client.get_account()
+        equity = float(account.get("equity") or account.get("portfolio_value") or 0)
+        if equity <= 0:
+            return []
+        broker_positions = client.get_positions() or []
+    except Exception as e:
+        log_event("stock_engine", "auto_trim_skipped",
+                  {"reason": "broker_fetch_failed", "error": str(e)[:200]},
+                  result="degraded")
+        return []
+
+    trims: list[dict] = []
+    for bp in broker_positions:
+        symbol = str(bp.get("symbol") or bp.get("ticker") or "").upper()
+        # Skip crypto (different qty handling — covered by crypto_engine)
+        if not symbol or "/" in symbol:
+            continue
+
+        try:
+            qty = float(bp.get("qty", 0) or 0)
+            mv = float(bp.get("market_value", 0) or 0)
+            current_price = float(bp.get("current_price", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+
+        if qty < 1 or current_price <= 0 or mv <= 0:
+            continue
+
+        pct = mv / equity
+        if pct <= trigger_pct:
+            continue
+
+        target_value = equity * max_pct
+        excess_value = mv - target_value
+        shares_to_sell = int((excess_value / current_price) + 0.999)  # ceil
+        if shares_to_sell < 1:
+            continue
+        # Never trim more than we hold
+        shares_to_sell = min(shares_to_sell, int(qty))
+
+        log_event("stock_engine", "auto_trim_triggered", {
+            "ticker": symbol,
+            "current_pct": round(pct, 4),
+            "trigger_pct": round(trigger_pct, 4),
+            "target_pct": round(max_pct, 4),
+            "shares_held": qty,
+            "shares_to_sell": shares_to_sell,
+            "current_price": current_price,
+            "market_value": mv,
+            "equity": equity,
+        }, result="pending")
+
+        intent = OrderIntent(
+            ticker=symbol,
+            side="sell",
+            order_type="market",
+            asset_type="equity",
+            quantity=shares_to_sell,
+            limit_price=current_price,
+            reason=f"auto_trim_{pct:.1%}_to_{max_pct:.0%}",
+        )
+        try:
+            response = submit_close(intent, client)
+            # Best-effort positions.json reconciliation: decrement matching open
+            # entries by shares_to_sell. Broker is source of truth either way.
+            positions = _load_positions()
+            remaining = shares_to_sell
+            changed = False
+            for p in positions:
+                if remaining <= 0:
+                    break
+                if (p.get("ticker") == symbol and p.get("type") == "stock"
+                        and p.get("status") == "open"):
+                    held = int(p.get("shares", 0) or 0)
+                    if held <= 0:
+                        continue
+                    take = min(held, remaining)
+                    p["shares"] = held - take
+                    if p["shares"] == 0:
+                        p["status"] = "closed"
+                        p["closed_at"] = datetime.now(timezone.utc).isoformat()
+                        p["close_reason"] = "auto_trim"
+                        p["exit_price"] = current_price
+                    remaining -= take
+                    changed = True
+            if changed:
+                _save_positions(positions)
+
+            trims.append({
+                "ticker": symbol,
+                "shares_sold": shares_to_sell,
+                "from_pct": round(pct, 4),
+                "to_pct_target": round(max_pct, 4),
+                "order_id": response.get("id"),
+            })
+            log_event("stock_engine", "auto_trim_executed", {
+                "ticker": symbol,
+                "shares_sold": shares_to_sell,
+                "order_id": response.get("id"),
+                "from_pct": round(pct, 4),
+            }, result="success")
+            diary_write("risk_agent",
+                f"{symbol}|AUTO_TRIM|{shares_to_sell}sh|{pct:.1%}→{max_pct:.0%}")
+        except Exception as e:
+            log_event("stock_engine", "auto_trim_failed", {
+                "ticker": symbol,
+                "error": str(e)[:200],
+            }, result="failed")
+
+    return trims
 
 
 def run_stock_scan_and_execute(
@@ -1579,15 +1709,27 @@ def run_stock_scan_and_execute(
         if full_exits > 0:
             print(f"  🚀 Fast-recycle: allowing up to {effective_max_trades} buys this cycle (redeploying {full_exits} freed slots)")
 
+    # Snapshot open-order count once for the cycle so each candidate sees
+    # consistent state in step2_validate, and increment as we submit.
+    try:
+        current_open_orders = len(client.get_open_orders() or [])
+    except Exception:
+        current_open_orders = 0
+
     executed = 0
     for candidate in candidates:
         if executed >= effective_max_trades:
             break
 
-        resp = execute_stock_buy(candidate, client, portfolio_value)
+        resp = execute_stock_buy(
+            candidate, client, portfolio_value,
+            current_daily_pnl=0,
+            current_open_orders=current_open_orders,
+        )
         if resp:
             results.append({"action": "buy", "candidate": candidate, "order": resp})
             executed += 1
+            current_open_orders += 1
 
     log_event("stock_engine", "pipeline_complete", {
         "exits": len(exits), "buys": executed,

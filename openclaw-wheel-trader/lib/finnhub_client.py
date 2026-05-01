@@ -157,10 +157,18 @@ class EarningsEvent:
     revenue_actual: float | None
 
 
-def get_earnings_calendar(ticker: str, days_ahead: int = 60) -> list[EarningsEvent]:
-    """Return upcoming earnings events for a ticker within `days_ahead` days.
+def get_earnings_calendar_with_status(
+    ticker: str, days_ahead: int = 60
+) -> tuple[list[EarningsEvent], bool]:
+    """Same as get_earnings_calendar but also returns lookup_ok flag.
 
-    Returns [] if no key, API error, or no events.
+    lookup_ok is True iff Finnhub responded successfully (even with []).
+    lookup_ok is False if no API key, rate-limited, HTTP error, timeout,
+    or network failure — i.e., we cannot trust an empty result.
+
+    Callers that need to distinguish "definitely no earnings" from
+    "we don't know" should use this; legacy callers can stay on
+    get_earnings_calendar().
     """
     today = datetime.now(timezone.utc).date()
     end = today + timedelta(days=days_ahead)
@@ -170,7 +178,7 @@ def get_earnings_calendar(ticker: str, days_ahead: int = 60) -> list[EarningsEve
         ttl_seconds=6 * 3600,
     )
     if not data or not isinstance(data, dict):
-        return []
+        return [], False
 
     events = []
     for e in data.get("earningsCalendar", []) or []:
@@ -187,6 +195,17 @@ def get_earnings_calendar(ticker: str, days_ahead: int = 60) -> list[EarningsEve
         except Exception:
             continue
     events.sort(key=lambda x: x.date)
+    return events, True
+
+
+def get_earnings_calendar(ticker: str, days_ahead: int = 60) -> list[EarningsEvent]:
+    """Return upcoming earnings events for a ticker within `days_ahead` days.
+
+    Returns [] if no key, API error, or no events.
+    Use get_earnings_calendar_with_status() if you need to distinguish
+    "no earnings" from "lookup failed".
+    """
+    events, _ = get_earnings_calendar_with_status(ticker, days_ahead=days_ahead)
     return events
 
 

@@ -124,6 +124,72 @@ class AlpacaClient:
             )
         return self._option_data_client
 
+    def _get_crypto_data_client(self):
+        """Lazy-load the Alpaca crypto historical data client.
+
+        Crypto market data is FREE on Alpaca — no API key required. Trading
+        crypto still goes through the same TradingClient as stocks.
+        """
+        if not hasattr(self, "_crypto_data_client") or self._crypto_data_client is None:
+            from alpaca.data.historical import CryptoHistoricalDataClient
+            self._crypto_data_client = CryptoHistoricalDataClient()
+        return self._crypto_data_client
+
+    def get_crypto_bars(
+        self,
+        symbols: list[str],
+        timeframe: str = "1Day",
+        days_back: int = 365,
+    ) -> dict[str, "pd.DataFrame"]:
+        """Fetch crypto OHLCV bars from Alpaca.
+
+        Args:
+            symbols: list of slash-format symbols, e.g. ["BTC/USD", "ETH/USD"]
+            timeframe: "1Day", "4Hour", "1Hour"
+            days_back: history depth (default 365 for 1Y vol calc)
+
+        Returns:
+            {symbol: DataFrame[open, high, low, close, volume]}
+        """
+        import pandas as pd
+        from alpaca.data.requests import CryptoBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+
+        self.limiter.wait_if_needed()
+        client = self._get_crypto_data_client()
+
+        tf_map = {
+            "1Day": TimeFrame.Day,
+            "1Hour": TimeFrame.Hour,
+        }
+        tf = tf_map.get(timeframe, TimeFrame.Day)
+
+        start = datetime.now(timezone.utc) - timedelta(days=days_back)
+        req = CryptoBarsRequest(
+            symbol_or_symbols=symbols,
+            timeframe=tf,
+            start=start,
+        )
+
+        try:
+            bars = client.get_crypto_bars(req)
+            df = bars.df  # MultiIndex (symbol, timestamp)
+            if df.empty:
+                return {}
+            result = {}
+            for sym in symbols:
+                if sym in df.index.get_level_values("symbol"):
+                    sub = df.xs(sym, level="symbol").copy()
+                    sub.index = pd.to_datetime(sub.index)
+                    result[sym] = sub
+            return result
+        except Exception as e:
+            log_event("market_data", "crypto_bars_failed", {
+                "symbols": symbols,
+                "error": str(e)[:200],
+            }, result="failed")
+            return {}
+
     def get_bars(
         self,
         tickers: list[str],
@@ -407,8 +473,8 @@ class AlpacaClient:
         Submit an order to Alpaca.
         This should ONLY be called from order_gate.step3_execute.
 
-        Handles both equity and option orders. For options, builds the
-        OCC symbol and uses the appropriate order class.
+        Handles equity, option, and crypto orders. For options, builds the
+        OCC symbol. For crypto buys, uses notional (dollars) with TimeInForce.GTC.
         """
         self.limiter.wait_if_needed()
         client = self._get_trading_client()
@@ -435,7 +501,16 @@ class AlpacaClient:
         else:
             symbol = intent.ticker
 
-        if intent.order_type == "market":
+        if intent.asset_type == "crypto":
+            # Crypto: GTC required, supports notional buys, fractional qty sells.
+            tif = TimeInForce.GTC
+            kwargs = {"symbol": symbol, "side": side, "time_in_force": tif}
+            if intent.notional and intent.side == "buy":
+                kwargs["notional"] = round(float(intent.notional), 2)
+            else:
+                kwargs["qty"] = round(float(intent.quantity), 9)
+            request = MarketOrderRequest(**kwargs)
+        elif intent.order_type == "market":
             request = MarketOrderRequest(
                 symbol=symbol,
                 qty=intent.quantity,
@@ -457,8 +532,10 @@ class AlpacaClient:
             "id": str(order.id),
             "status": str(order.status),
             "symbol": order.symbol,
-            "qty": str(order.qty),
+            "qty": str(order.qty) if order.qty else None,
+            "notional": str(order.notional) if getattr(order, "notional", None) else None,
             "side": str(order.side),
+            "filled_qty": str(order.filled_qty) if order.filled_qty else "0",
             "filled_avg_price": str(order.filled_avg_price) if order.filled_avg_price else None,
         }
 
