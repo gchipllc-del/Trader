@@ -36,22 +36,24 @@ SETTINGS_PATH = Path(__file__).parent.parent / "config" / "settings.yaml"
 POSITIONS_PATH = Path(__file__).parent.parent / "data" / "positions.json"
 OPTIMIZATION_LOG = Path(__file__).parent.parent / "data" / "hermes_log.jsonl"
 
-# Safety bounds — Hermes can NEVER exceed these
+# Safety bounds — Hermes can NEVER exceed these.
+# 2026-05-01 widening pass: with Wave 1-3 guards in place (broker dedup,
+# auto-trim, fill polling, persistent dedup), Hermes can safely explore
+# more of the space without breakers ever silently stranding a position.
+# Each widening below stays inside the circuit-breaker ceiling.
 BOUNDS = {
-    "stop_loss_pct":         (0.02, 0.08),
-    "default_target_pct":    (0.05, 0.20),
-    "min_composite_score":   (2, 8),  # Capped at 8 — universe rarely scores >8.5/10
-                                       # so >8 starves the entry pipeline (saw this 2026-04-27)
-    "max_position_pct":      (0.10, 0.30),
-    "max_trades_per_scan":   (1, 5),
-    "trailing_stop_pct":     (0.0, 0.06),
-    "max_concurrent_positions": (2, 8),
-    "partial_exit_threshold": (0.08, 0.30),  # New: scale-out trigger (8%-30%)
-    "partial_exit_fraction":  (0.25, 0.75),  # New: % to sell at scale-out
-    # New polybot integration parameters
-    "kelly_fraction":         (0.10, 0.50),  # Fractional Kelly multiplier
-    "bayesian_min_win_prob":  (0.50, 0.75),  # Bayesian veto threshold
-    "correlation_threshold":  (0.50, 0.85),  # Price correlation flag point
+    "stop_loss_pct":         (0.02, 0.08),  # unchanged — 2-8% is the right range
+    "default_target_pct":    (0.05, 0.30),  # was 0.20 — let runners run with trailing stop
+    "min_composite_score":   (2, 8),        # universe rarely scores >8.5/10 (saw starvation 2026-04-27)
+    "max_position_pct":      (0.10, 0.30),  # tied to circuit_breakers.max_position_pct
+    "max_trades_per_scan":   (1, 7),        # was 5 — high-edge days fire more entries
+    "trailing_stop_pct":     (0.0, 0.08),   # was 0.06 — more flexibility
+    "max_concurrent_positions": (2, 10),    # was 8 — more book breadth as bankroll grows
+    "partial_exit_threshold": (0.05, 0.30), # was 0.08 — allow faster partials
+    "partial_exit_fraction":  (0.25, 0.75), # unchanged
+    "kelly_fraction":         (0.10, 0.50), # half-Kelly cap stays — full Kelly = ruin risk
+    "bayesian_min_win_prob":  (0.45, 0.75), # was 0.50 — slightly more permissive
+    "correlation_threshold":  (0.40, 0.85), # was 0.50 — more sensitive to clustering
 }
 
 # How much to adjust per optimization cycle (conservative steps)
