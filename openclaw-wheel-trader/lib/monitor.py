@@ -517,6 +517,11 @@ def run_monitoring_check(client: AlpacaClient) -> dict:
         # Hermes self-optimization (run after close — 4:10 PM ET)
         if now.hour == 20 and 10 <= now.minute <= 15:
             try:
+                # Load settings here — was a NameError on every Hermes window
+                # firing because run_monitoring_check never bound `settings`.
+                # Caught during 2026-05-01 verification: monitor.hermes_failed
+                # event fired with `"error": "name 'settings' is not defined"`.
+                settings = _load_settings()
                 hermes_cfg = settings.get("hermes", {})
                 if hermes_cfg.get("enabled") and hermes_cfg.get("run_after_close"):
                     from agents.hermes_optimizer import run_optimization
