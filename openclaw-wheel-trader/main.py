@@ -471,9 +471,9 @@ def cmd_scan():
         cash = account["cash"]
         phase = get_current_phase(portfolio)
 
-        # PDT check
+        # PDT check (uses broker's authoritative daytrade_count via client)
         from lib.pdt_guard import check_pdt
-        pdt = check_pdt(portfolio)
+        pdt = check_pdt(portfolio, client=client)
 
         print("=" * 55)
         print("  OPENCLAW WHEEL TRADER — SCAN")
@@ -796,11 +796,12 @@ def cmd_pdt():
     account = client.get_account()
     portfolio = account["portfolio_value"]
 
-    status = check_pdt(portfolio)
+    status = check_pdt(portfolio, client=client)
     print("📋 PDT STATUS")
     print("=" * 40)
     print(f"  Portfolio: ${portfolio:,.2f}")
-    print(f"  Day trades used (5d): {status['day_trades_used']}")
+    print(f"  Day trades used (5d): {status['day_trades_used']} "
+          f"(source: {status.get('source', '?')})")
     print(f"  Day trades remaining: {status['day_trades_remaining']}")
 
     if status["warning"]:

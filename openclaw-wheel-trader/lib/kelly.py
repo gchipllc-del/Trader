@@ -128,6 +128,8 @@ def kelly_position_size(
     kronos_expected_return: float | None = None,
     max_position_pct: float | None = None,
     fraction: float | None = None,
+    earnings_penalty: float = 1.0,
+    correlation_penalty: float = 1.0,
 ) -> dict:
     """
     Calculate Kelly-optimal position size in shares.
@@ -137,7 +139,9 @@ def kelly_position_size(
     2. Kronos forecast → adjusts win probability up/down
     3. Reward/risk from target + stop
     4. Fractional Kelly for safety
-    5. Caps by max_position_pct circuit breaker
+    5. Earnings + correlation penalties (multiplicative downsizers
+       computed by stock_engine gates 6 and 7)
+    6. Caps by max_position_pct circuit breaker
 
     Args:
         portfolio_value: Current portfolio $
@@ -148,6 +152,12 @@ def kelly_position_size(
         kronos_expected_return: Optional Kronos forecast (e.g., +0.05 = +5%)
         max_position_pct: Hard cap (default 0.30)
         fraction: Kelly multiplier (default 0.25)
+        earnings_penalty: 0.0-1.0 multiplier when earnings are inside the
+            soft-warn window (default 1.0 = no penalty). Set by
+            stock_engine._apply_earnings_proximity_check.
+        correlation_penalty: 0.0-1.0 multiplier when the candidate is
+            correlated with held positions (default 1.0 = no penalty).
+            Set by stock_engine._apply_correlation_gate.
 
     Returns:
         {
@@ -159,6 +169,8 @@ def kelly_position_size(
             "full_kelly": float,
             "fractional_kelly": float,
             "pct_of_portfolio": float,
+            "earnings_penalty": float,
+            "correlation_penalty": float,
             "reason": str,
         }
     """
@@ -198,18 +210,28 @@ def kelly_position_size(
 
     frac_k = fractional_kelly_stock(win_prob, reward_pct, risk_pct, fraction)
 
+    # Apply earnings + correlation penalties BEFORE the cap, so a
+    # correlated/earnings-soon candidate gets sized down even when raw
+    # Kelly would otherwise hit the max_position_pct ceiling.
+    penalized_frac_k = frac_k * earnings_penalty * correlation_penalty
+
     # Apply circuit breaker cap
     if max_position_pct is None:
         strategy = _load_strategy()
         max_position_pct = strategy.get("stock_params", {}).get("max_position_pct", 0.30)
 
-    pct_of_portfolio = min(frac_k, max_position_pct)
+    pct_of_portfolio = min(penalized_frac_k, max_position_pct)
     position_value = portfolio_value * pct_of_portfolio
     shares = int(position_value / current_price)
 
     reason = "kelly_sized"
-    if pct_of_portfolio == max_position_pct and frac_k > max_position_pct:
+    if pct_of_portfolio == max_position_pct and penalized_frac_k > max_position_pct:
         reason = f"capped_at_{max_position_pct:.0%}"
+    if earnings_penalty < 1.0 or correlation_penalty < 1.0:
+        reason += (
+            f"|penalties_applied(earn={earnings_penalty:.2f},"
+            f"corr={correlation_penalty:.2f})"
+        )
 
     return {
         "shares": shares,
@@ -221,7 +243,10 @@ def kelly_position_size(
         "reward_to_risk": round(reward_pct / risk_pct, 2),
         "full_kelly": round(full_k, 4),
         "fractional_kelly": round(frac_k, 4),
+        "penalized_kelly": round(penalized_frac_k, 4),
         "pct_of_portfolio": round(pct_of_portfolio, 4),
+        "earnings_penalty": round(earnings_penalty, 4),
+        "correlation_penalty": round(correlation_penalty, 4),
         "reason": reason,
     }
 

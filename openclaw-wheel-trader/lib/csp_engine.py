@@ -145,6 +145,36 @@ def execute_csp(
             f"{ticker}|CSP_SKIP|earnings|exp_{candidate.expiration}")
         return None
 
+    # Last-mile broker reconciliation — same fix pattern stock_engine got after
+    # the 2026-04-28 BAC double-buy. positions.json can be 5-30s stale across
+    # concurrent scan processes; the broker is the single source of truth.
+    # Reject if the broker already shows an OPEN option position with this
+    # exact OCC symbol (same strike + expiration + side).
+    try:
+        target_symbol = client._build_option_symbol(
+            ticker, candidate.expiration, "put", candidate.strike,
+        )
+        broker_positions = client.get_positions() or []
+        for bp in broker_positions:
+            sym = str(bp.get("symbol") or bp.get("ticker") or "").upper()
+            qty = float(bp.get("qty", 0) or 0)
+            if sym == target_symbol.upper() and qty != 0:
+                log_event("csp_engine", "duplicate_csp_blocked", {
+                    "ticker": ticker, "strike": candidate.strike,
+                    "expiration": candidate.expiration,
+                    "reason": "broker_position_exists",
+                })
+                diary_write("strategy_agent",
+                    f"{ticker}|CSP_BLOCKED|duplicate_at_broker|"
+                    f"{candidate.strike}P_{candidate.expiration}")
+                return None
+    except Exception as e:
+        # Don't gate trades on broker connectivity issues — order_dedup's
+        # file-locked hash store is still in front of step3 so a same-cycle
+        # dup still gets caught. Just log and continue.
+        log_event("csp_engine", "broker_reconcile_failed",
+                  {"ticker": ticker, "error": str(e)[:200]}, result="degraded")
+
     # Build reasoning string for memory
     reasoning = (
         f"Selling {ticker} {candidate.strike}P exp {candidate.expiration} "

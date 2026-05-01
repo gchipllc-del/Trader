@@ -962,6 +962,11 @@ class TestCryptoOrderGate:
         client.get_positions.return_value = []
         client._get_trading_client.return_value.get_orders.return_value = []
         client.limiter.wait_if_needed = lambda: None
+        # Wave 2 #10: poll returns a clean fill so the gate path completes.
+        client.wait_for_fill.return_value = {
+            "id": "ord_st1", "status": "filled",
+            "filled_qty": "5", "filled_avg_price": "14.50",
+        }
 
         candidate = {
             "ticker": "NU", "shares": 5, "current_price": 14.50,
@@ -1202,6 +1207,286 @@ class TestCryptoOrderGate:
         degraded_tickers = [d["ticker"] for d in result.get("degraded", [])]
         assert "NU" in degraded_tickers
         assert any("DATA OUTAGE" in a and "NU" in a for a in result.get("alerts", []))
+
+    def test_stock_buy_records_actual_filled_qty_not_intended(self, tmp_path, monkeypatch):
+        """Wave 2 #10: a partial fill (5 of 10 shares) must record shares=5
+        in positions.json, not 10. Otherwise the next scale-out tries to
+        sell shares we don't own."""
+        from lib import stock_engine
+
+        pos_file = tmp_path / "positions.json"
+        pos_file.write_text("[]")
+        monkeypatch.setattr(stock_engine, "POSITIONS_PATH", pos_file)
+        monkeypatch.setattr(stock_engine, "remember_trade_decision", lambda **kw: None)
+        monkeypatch.setattr(stock_engine, "diary_write", lambda a, e: None)
+
+        monkeypatch.setattr("lib.stock_engine.step1_propose", lambda i: i)
+        monkeypatch.setattr("lib.stock_engine.step2_validate",
+                            lambda intent, **kw: setattr(intent, "_validated", True) or True)
+        monkeypatch.setattr("lib.stock_engine.step3_execute",
+                            lambda i, c: {"id": "ord_partial", "status": "pending_new",
+                                          "symbol": i.ticker, "qty": str(i.quantity),
+                                          "side": "buy", "filled_qty": "0"})
+
+        client = MagicMock()
+        client.get_positions.return_value = []
+        client._get_trading_client.return_value.get_orders.return_value = []
+        client.limiter.wait_if_needed = lambda: None
+        # Broker reports 5-of-10 partial fill on the polled status.
+        client.wait_for_fill.return_value = {
+            "id": "ord_partial", "status": "filled",
+            "filled_qty": "5", "filled_avg_price": "100.00",
+        }
+
+        candidate = {
+            "ticker": "TST", "shares": 10, "current_price": 100.0,
+            "target_price": 110.0, "stop_loss": 95.0,
+            "composite_score": 5, "trend_score": 2, "level_score": 1, "signal_score": 0,
+            "zone_level": 100.0, "zone_touches": 3, "pattern": None,
+        }
+        stock_engine.execute_stock_buy(
+            candidate, client, portfolio_value=10000,
+            current_daily_pnl=0, current_open_orders=0,
+        )
+        with open(pos_file) as f:
+            saved = json.load(f)
+        assert len(saved) == 1
+        assert saved[0]["shares"] == 5
+        assert saved[0]["entry_price"] == 100.00
+
+    def test_stock_buy_returns_none_on_rejection(self, tmp_path, monkeypatch):
+        """If poll comes back with status=rejected, no position is recorded."""
+        from lib import stock_engine
+
+        pos_file = tmp_path / "positions.json"
+        pos_file.write_text("[]")
+        monkeypatch.setattr(stock_engine, "POSITIONS_PATH", pos_file)
+        monkeypatch.setattr(stock_engine, "diary_write", lambda a, e: None)
+
+        monkeypatch.setattr("lib.stock_engine.step1_propose", lambda i: i)
+        monkeypatch.setattr("lib.stock_engine.step2_validate",
+                            lambda intent, **kw: setattr(intent, "_validated", True) or True)
+        monkeypatch.setattr("lib.stock_engine.step3_execute",
+                            lambda i, c: {"id": "ord_rej", "status": "pending_new",
+                                          "symbol": i.ticker, "qty": str(i.quantity),
+                                          "side": "buy", "filled_qty": "0"})
+
+        client = MagicMock()
+        client.get_positions.return_value = []
+        client._get_trading_client.return_value.get_orders.return_value = []
+        client.limiter.wait_if_needed = lambda: None
+        client.wait_for_fill.return_value = {
+            "id": "ord_rej", "status": "rejected", "filled_qty": "0",
+        }
+
+        candidate = {
+            "ticker": "TST", "shares": 10, "current_price": 100.0,
+            "target_price": 110.0, "stop_loss": 95.0,
+            "composite_score": 5, "trend_score": 2, "level_score": 1, "signal_score": 0,
+            "zone_level": 100.0, "zone_touches": 3, "pattern": None,
+        }
+        result = stock_engine.execute_stock_buy(
+            candidate, client, portfolio_value=10000,
+            current_daily_pnl=0, current_open_orders=0,
+        )
+        assert result is None
+        with open(pos_file) as f:
+            saved = json.load(f)
+        assert saved == []
+
+    def test_crypto_buy_returns_none_when_order_rejected(self, tmp_path, monkeypatch):
+        """Wave 2 #9: rejected/expired crypto orders must not create zombie
+        positions.json entries."""
+        from lib import crypto_engine
+
+        pos_file = tmp_path / "positions.json"
+        pos_file.write_text("[]")
+        monkeypatch.setattr(crypto_engine, "POSITIONS_PATH", pos_file)
+
+        monkeypatch.setattr("lib.crypto_engine.step1_propose", lambda i: i)
+        monkeypatch.setattr("lib.crypto_engine.step2_validate",
+                            lambda intent, **kw: setattr(intent, "_validated", True) or True)
+        monkeypatch.setattr("lib.crypto_engine.step3_execute",
+                            lambda i, c: {"id": "crypto_rej", "status": "pending_new",
+                                          "filled_qty": "0"})
+
+        client = MagicMock()
+        client.wait_for_fill.return_value = {
+            "id": "crypto_rej", "status": "rejected", "filled_qty": "0",
+        }
+        cand = {
+            "ticker": "BTC/USD", "notional": 100.0, "current_price": 100000.0,
+            "target_price": 115000.0, "stop_loss": 93000.0,
+            "trailing_stop_pct": 0.04, "composite_score": 10,
+        }
+        result = crypto_engine.execute_crypto_buy(
+            cand, client, portfolio_value=10000,
+            current_daily_pnl=0, current_open_orders=0,
+        )
+        assert result is None
+        with open(pos_file) as f:
+            saved = json.load(f)
+        assert saved == []
+
+    def test_pdt_count_uses_broker_when_client_passed(self, tmp_path, monkeypatch):
+        """Wave 2 #8: pdt_guard should prefer the broker's daytrade_count
+        over a positions.json scan, since concurrent fills can lag JSON
+        but Alpaca tracks the FINRA count atomically."""
+        from lib import pdt_guard
+
+        # Set positions.json to a count of 1 (one same-day round trip).
+        pos_file = tmp_path / "positions.json"
+        pos_file.write_text(json.dumps([{
+            "ticker": "TST", "type": "stock", "status": "closed",
+            "opened_at": "2026-04-30T14:00:00+00:00",
+            "closed_at": "2026-04-30T20:00:00+00:00",
+        }]))
+        monkeypatch.setattr(pdt_guard, "POSITIONS_PATH", pos_file)
+
+        # Broker says 3 (more recent fills not yet in positions.json).
+        client = MagicMock()
+        client.get_account.return_value = {"daytrade_count": 3,
+                                           "portfolio_value": 1000}
+
+        # With client → broker count of 3 wins.
+        assert pdt_guard.count_day_trades(client=client) == 3
+        # Without client → falls back to positions.json count of 1.
+        assert pdt_guard.count_day_trades(client=None) == 1
+
+    def test_pdt_falls_back_when_broker_call_errors(self, tmp_path, monkeypatch):
+        """If the broker call raises, pdt_guard must fall back to positions.json
+        rather than crash the trade pipeline."""
+        from lib import pdt_guard
+
+        pos_file = tmp_path / "positions.json"
+        pos_file.write_text(json.dumps([{
+            "ticker": "TST", "type": "stock", "status": "closed",
+            "opened_at": "2026-04-30T14:00:00+00:00",
+            "closed_at": "2026-04-30T20:00:00+00:00",
+        }]))
+        monkeypatch.setattr(pdt_guard, "POSITIONS_PATH", pos_file)
+
+        client = MagicMock()
+        client.get_account.side_effect = RuntimeError("alpaca down")
+        # Should NOT raise; should fall back to positions.json count of 1.
+        assert pdt_guard.count_day_trades(client=client) == 1
+
+    def test_csp_blocked_when_broker_already_holds_position(self, tmp_path, monkeypatch):
+        """Wave 2 #7: same fix as the 2026-04-28 BAC double-buy. CSP execute
+        must reject when the broker already shows the exact OCC symbol open,
+        not just rely on positions.json (which can be 5-30s stale across
+        concurrent scan processes)."""
+        from lib import csp_engine
+
+        pos_file = tmp_path / "positions.json"
+        pos_file.write_text("[]")
+        monkeypatch.setattr(csp_engine, "POSITIONS_PATH", pos_file)
+        monkeypatch.setattr("lib.csp_engine.earnings_veto", lambda *a, **kw: False)
+        monkeypatch.setattr("lib.csp_engine.diary_write", lambda a, e: None)
+
+        # If step1_propose is called, the test fails — broker dedup should
+        # short-circuit before that point.
+        called = []
+        monkeypatch.setattr("lib.csp_engine.step1_propose",
+                            lambda i: (called.append(i), i)[-1])
+
+        # Mock OCC builder + broker getter so the executor sees a duplicate.
+        client = MagicMock()
+        client._build_option_symbol = lambda t, e, ot, s: "AAPL250516P00170000"
+        client.get_positions.return_value = [
+            {"symbol": "AAPL250516P00170000", "qty": "-1"},
+        ]
+
+        candidate = make_candidate(ticker="AAPL", strike=170)
+        candidate.expiration = "2025-05-16"
+
+        # Mock consensus to approve so we know the only thing that can
+        # block us is the broker dedup.
+        import agents.consensus
+        monkeypatch.setattr(agents.consensus, "seek_consensus",
+                            lambda c, pv, **kw: {"approved": True, "decision": "APPROVED"})
+
+        result = csp_engine.execute_csp(
+            candidate, client, portfolio_value=100000,
+            current_daily_pnl=0, current_open_orders=0,
+        )
+        assert result is None
+        assert called == []  # propose was never reached
+
+    def test_cc_blocked_when_broker_already_holds_position(self, tmp_path, monkeypatch):
+        """Same dedup parity for covered calls."""
+        from lib import cc_engine
+
+        pos_file = tmp_path / "positions.json"
+        pos_file.write_text("[]")
+        monkeypatch.setattr(cc_engine, "POSITIONS_PATH", pos_file)
+        monkeypatch.setattr("lib.cc_engine.earnings_veto", lambda *a, **kw: False)
+        monkeypatch.setattr("lib.cc_engine.diary_write", lambda a, e: None)
+        monkeypatch.setattr("lib.cc_engine.check_dividend_conflict",
+                            lambda t, e: False)
+
+        called = []
+        monkeypatch.setattr("lib.cc_engine.step1_propose",
+                            lambda i: (called.append(i), i)[-1])
+
+        client = MagicMock()
+        client._build_option_symbol = lambda t, e, ot, s: "AAPL250516C00180000"
+        client.get_positions.return_value = [
+            {"symbol": "AAPL250516C00180000", "qty": "-1"},
+        ]
+
+        candidate = make_candidate(ticker="AAPL", trade_type="cc", strike=180)
+        candidate.expiration = "2025-05-16"
+        position = {"cost_basis": 167}
+
+        import agents.consensus
+        monkeypatch.setattr(agents.consensus, "seek_consensus",
+                            lambda c, pv, **kw: {"approved": True, "decision": "APPROVED"})
+
+        result = cc_engine.execute_cc(
+            candidate, position, client, portfolio_value=100000,
+            current_daily_pnl=0, current_open_orders=0,
+        )
+        assert result is None
+        assert called == []
+
+    def test_kelly_applies_earnings_and_correlation_penalties(self):
+        """Wave 2 #6: penalties were only applied on the Bayesian path.
+        Default Kelly path silently ignored them. After the fix, both
+        paths multiply through earnings_penalty × correlation_penalty
+        before the max_position_pct cap."""
+        from lib.kelly import kelly_position_size
+
+        baseline = kelly_position_size(
+            portfolio_value=10000.0,
+            current_price=100.0,
+            target_price=120.0,
+            stop_loss=95.0,
+            composite_score=8,
+            fraction=0.25,
+        )
+        assert baseline["earnings_penalty"] == 1.0
+        assert baseline["correlation_penalty"] == 1.0
+        assert baseline["fractional_kelly"] == baseline["penalized_kelly"]
+
+        penalized = kelly_position_size(
+            portfolio_value=10000.0,
+            current_price=100.0,
+            target_price=120.0,
+            stop_loss=95.0,
+            composite_score=8,
+            fraction=0.25,
+            earnings_penalty=0.5,
+            correlation_penalty=0.5,
+        )
+        # 0.5 × 0.5 = 0.25 → quartered, not full Kelly
+        expected = round(baseline["fractional_kelly"] * 0.25, 4)
+        assert penalized["penalized_kelly"] == expected
+        # Sizing is reduced (assuming we weren't already capped to ~0)
+        assert penalized["pct_of_portfolio"] <= baseline["pct_of_portfolio"]
+        assert penalized["shares"] <= baseline["shares"]
+        # Reason annotates the penalty
+        assert "penalties_applied" in penalized["reason"]
 
     def test_step2_validate_handles_crypto_notional(self):
         """Crypto buys carry notional, not strike or limit_price * qty."""

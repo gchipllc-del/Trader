@@ -192,6 +192,32 @@ def execute_cc(
             f"{ticker}|CC_SKIP|dividend_conflict|exp_{candidate.expiration}")
         return None
 
+    # Last-mile broker reconciliation — same fix pattern stock_engine got after
+    # the 2026-04-28 BAC double-buy. positions.json can be stale across
+    # concurrent scan processes; reject if the broker already shows an OPEN
+    # option position with this exact OCC symbol (same strike + expiration).
+    try:
+        target_symbol = client._build_option_symbol(
+            ticker, candidate.expiration, "call", candidate.strike,
+        )
+        broker_positions = client.get_positions() or []
+        for bp in broker_positions:
+            sym = str(bp.get("symbol") or bp.get("ticker") or "").upper()
+            qty = float(bp.get("qty", 0) or 0)
+            if sym == target_symbol.upper() and qty != 0:
+                log_event("cc_engine", "duplicate_cc_blocked", {
+                    "ticker": ticker, "strike": candidate.strike,
+                    "expiration": candidate.expiration,
+                    "reason": "broker_position_exists",
+                })
+                diary_write("strategy_agent",
+                    f"{ticker}|CC_BLOCKED|duplicate_at_broker|"
+                    f"{candidate.strike}C_{candidate.expiration}")
+                return None
+    except Exception as e:
+        log_event("cc_engine", "broker_reconcile_failed",
+                  {"ticker": ticker, "error": str(e)[:200]}, result="degraded")
+
     reasoning = (
         f"Selling {ticker} {candidate.strike}C exp {candidate.expiration} "
         f"for ${candidate.premium} premium. "

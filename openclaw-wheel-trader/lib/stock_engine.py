@@ -856,6 +856,11 @@ def _apply_kelly_sizing(candidates: list[dict], portfolio_value: float, kelly_cf
         try:
             from lib.kelly import kelly_position_size
 
+            # Penalties set upstream by _apply_earnings_proximity_check (gate 6)
+            # and _apply_correlation_gate (gate 7). Default 1.0 = no penalty.
+            earnings_penalty = float(candidate.get("earnings_penalty", 1.0))
+            correlation_penalty = float(candidate.get("correlation_penalty", 1.0))
+
             # Use Bayesian win prob if available, else composite-derived
             composite_score = candidate["composite_score"]
 
@@ -867,12 +872,15 @@ def _apply_kelly_sizing(candidates: list[dict], portfolio_value: float, kelly_cf
                 composite_score=composite_score,
                 kronos_expected_return=candidate.get("kronos_expected_return"),
                 fraction=fraction,
+                earnings_penalty=earnings_penalty,
+                correlation_penalty=correlation_penalty,
             )
 
-            # If Bayesian gave us a more accurate win_prob, override Kelly's composite-derived one
+            # If Bayesian gave us a more accurate win_prob, override Kelly's
+            # composite-derived one (still applying the same penalties so the
+            # Bayesian path can't sidestep correlation/earnings downsizing).
             bayesian_wp = candidate.get("bayesian_win_prob")
             if bayesian_wp is not None and bayesian_wp > 0:
-                # Recompute Kelly with Bayesian prob
                 from lib.kelly import fractional_kelly_stock
                 reward_pct = sizing.get("reward_pct", 0)
                 risk_pct = sizing.get("risk_pct", 0)
@@ -880,13 +888,14 @@ def _apply_kelly_sizing(candidates: list[dict], portfolio_value: float, kelly_cf
                     frac_k = fractional_kelly_stock(bayesian_wp, reward_pct, risk_pct, fraction)
                     strategy = _load_strategy()
                     max_pct = strategy.get("stock_params", {}).get("max_position_pct", 0.30)
-                    pct = min(frac_k, max_pct)
-                    # Apply correlation + earnings penalties if flagged
-                    pct *= candidate.get("correlation_penalty", 1.0)
-                    pct *= candidate.get("earnings_penalty", 1.0)
+                    penalized_frac_k = frac_k * earnings_penalty * correlation_penalty
+                    pct = min(penalized_frac_k, max_pct)
 
                     sizing["win_prob"] = round(bayesian_wp, 4)
                     sizing["fractional_kelly"] = round(frac_k, 4)
+                    sizing["penalized_kelly"] = round(penalized_frac_k, 4)
+                    sizing["earnings_penalty"] = round(earnings_penalty, 4)
+                    sizing["correlation_penalty"] = round(correlation_penalty, 4)
                     sizing["pct_of_portfolio"] = round(pct, 4)
                     sizing["position_value"] = round(portfolio_value * pct, 2)
                     sizing["shares"] = int(portfolio_value * pct / candidate["current_price"])
@@ -1027,9 +1036,50 @@ def execute_stock_buy(
         )
         response = step3_execute(intent, client)
 
+        # Wave 2 #10: poll for terminal status so positions.json records the
+        # ACTUAL filled qty, not the intended count. Without this, a partial
+        # fill or rejection would still write `shares=intended_shares` and
+        # the next scale-out would try to sell shares we don't own.
+        try:
+            final = client.wait_for_fill(response.get("id", ""), timeout_seconds=10)
+        except Exception as e:
+            log_event("stock_engine", "wait_for_fill_failed",
+                      {"ticker": ticker, "order_id": response.get("id"),
+                       "error": str(e)[:200]}, result="degraded")
+            final = response
+
+        final_status = final.get("status", "unknown")
+        filled_qty = int(float(final.get("filled_qty") or 0))
+        filled_avg_raw = final.get("filled_avg_price")
+        filled_avg = float(filled_avg_raw) if filled_avg_raw else price
+
+        if filled_qty <= 0 or final_status in ("rejected", "canceled",
+                                                "cancelled", "expired",
+                                                "suspended"):
+            log_event("stock_engine", "execute_no_fill", {
+                "ticker": ticker, "order_id": response.get("id"),
+                "status": final_status, "filled_qty": filled_qty,
+            }, result="failed")
+            diary_write("strategy_agent",
+                f"{ticker}|STOCK_NO_FILL|{final_status}|qty_{filled_qty}")
+            return None
+
+        # Update local vars so positions.json + memory record the truth.
+        if filled_qty != shares:
+            log_event("stock_engine", "partial_fill", {
+                "ticker": ticker, "intended": shares, "filled": filled_qty,
+                "order_id": response.get("id"),
+            }, result="success")
+        shares = filled_qty
+        price = filled_avg
+        response["filled_qty"] = str(filled_qty)
+        response["filled_avg_price"] = str(filled_avg)
+        response["status"] = final_status
+
         log_event("stock_engine", "executed", {
             "ticker": ticker, "order_id": response["id"],
-            "status": response["status"],
+            "status": final_status, "filled_qty": filled_qty,
+            "filled_avg_price": filled_avg,
         }, result="success")
 
     except (CircuitBreakerTripped, ValueError) as e:

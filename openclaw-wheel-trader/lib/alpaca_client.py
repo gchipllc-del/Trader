@@ -407,7 +407,7 @@ class AlpacaClient:
         return result
 
     def get_account(self) -> dict:
-        """Get account info (cash, portfolio value, buying power)."""
+        """Get account info (cash, portfolio value, buying power, PDT count)."""
         self.limiter.wait_if_needed()
         client = self._get_trading_client()
         account = client.get_account()
@@ -417,6 +417,13 @@ class AlpacaClient:
             "buying_power": float(account.buying_power),
             "equity": float(account.equity),
             "status": account.status,
+            # FINRA day-trade count over the last 5 business days, per the
+            # broker. Source of truth — positions.json can be stale across
+            # concurrent processes (Wave 2 #8 fix).
+            "daytrade_count": int(getattr(account, "daytrade_count", 0) or 0),
+            "pattern_day_trader": bool(
+                getattr(account, "pattern_day_trader", False)
+            ),
         }
 
     def get_positions(self) -> list[dict]:
@@ -538,6 +545,62 @@ class AlpacaClient:
             "filled_qty": str(order.filled_qty) if order.filled_qty else "0",
             "filled_avg_price": str(order.filled_avg_price) if order.filled_avg_price else None,
         }
+
+    def wait_for_fill(self, order_id: str, timeout_seconds: float = 10.0,
+                      poll_interval: float = 0.5) -> dict:
+        """
+        Poll an order until it reaches a terminal state, or until the timeout.
+
+        Wave 2 #9 + #10 fix: prevents recording an open position from the
+        post-submit response (which often shows status="pending_new" with
+        filled_qty=0) — without polling, positions.json would record the
+        intended share count even if the order is later rejected, leaving
+        a zombie entry that subsequent scans treat as held.
+
+        Terminal statuses: filled, partially_filled, canceled, expired,
+        rejected, suspended.
+
+        Returns the final order dict (same shape as submit_order); the
+        caller decides whether the fill is good enough to record.
+        Returns whatever the broker reports at timeout if no terminal
+        status is reached — caller should treat as "unknown" and audit.
+        """
+        import time as _time
+        terminal = {"filled", "partially_filled", "canceled", "cancelled",
+                    "expired", "rejected", "suspended", "done_for_day"}
+        deadline = _time.time() + max(0.5, timeout_seconds)
+
+        client = self._get_trading_client()
+        last = None
+        while _time.time() < deadline:
+            self.limiter.wait_if_needed()
+            try:
+                order = client.get_order_by_id(order_id)
+            except Exception as e:
+                log_event("alpaca_client", "wait_for_fill_poll_error",
+                          {"order_id": order_id, "error": str(e)[:200]},
+                          result="degraded")
+                _time.sleep(poll_interval)
+                continue
+            last = {
+                "id": str(order.id),
+                "status": str(order.status).split(".")[-1].lower(),
+                "symbol": str(order.symbol),
+                "qty": str(order.qty) if order.qty else None,
+                "filled_qty": str(order.filled_qty) if order.filled_qty else "0",
+                "filled_avg_price": str(order.filled_avg_price)
+                                     if order.filled_avg_price else None,
+                "side": str(order.side),
+            }
+            if last["status"] in terminal:
+                return last
+            _time.sleep(poll_interval)
+
+        # Timeout — return whatever we last saw, or a synthetic "unknown".
+        if last is None:
+            return {"id": order_id, "status": "unknown_timeout"}
+        last["status"] = last["status"] + "_timeout"
+        return last
 
     def cancel_all_orders(self) -> int:
         """KILL SWITCH: Cancel all open orders. Returns count cancelled."""

@@ -555,17 +555,39 @@ def execute_crypto_buy(
         response = step3_execute(intent, client)
 
         order_id = response.get("id", "")
-        filled_qty = float(response.get("filled_qty") or 0)
-        filled_avg_raw = response.get("filled_avg_price")
+
+        # Wave 2 #9: poll for terminal status before recording the position.
+        # The submit response often shows pending_new with filled_qty=0;
+        # blindly recording it leaves a zombie entry if the order is later
+        # rejected (e.g., insufficient buying power, market closed).
+        try:
+            final = client.wait_for_fill(order_id, timeout_seconds=10)
+        except Exception as e:
+            log_event("crypto_engine", "wait_for_fill_failed",
+                      {"ticker": sym, "order_id": order_id,
+                       "error": str(e)[:200]}, result="degraded")
+            final = response
+
+        status = final.get("status", "unknown")
+        filled_qty = float(final.get("filled_qty") or 0)
+        filled_avg_raw = final.get("filled_avg_price")
         filled_avg = float(filled_avg_raw) if filled_avg_raw else current_price
-        status = response.get("status", "submitted")
+
+        if filled_qty <= 0 or status in ("rejected", "canceled", "cancelled",
+                                          "expired", "suspended"):
+            log_event("crypto_engine", "execute_no_fill", {
+                "ticker": sym, "order_id": str(order_id), "status": status,
+                "filled_qty": filled_qty,
+            }, result="failed")
+            print(f"     NO FILL: {sym} order_id={order_id} status={status}")
+            return None
 
         positions = _load_positions()
         positions.append({
             "ticker": sym,
             "type": "crypto",
             "status": "open",
-            "shares": filled_qty if filled_qty > 0 else notional / current_price,
+            "shares": filled_qty,
             "entry_price": filled_avg,
             "target_price": candidate["target_price"],
             "stop_loss": candidate["stop_loss"],
