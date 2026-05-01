@@ -223,6 +223,146 @@ class TestOrderGate:
 # CROSS-PROCESS ORDER DEDUP (gap audit Wave 1 #2)
 # ============================================================
 
+class TestPhaseGating:
+    """Wave 3 #16: confirm portfolio_value drives phase selection
+    correctly so CSPs only unlock at $5k and full Wheel at $10k."""
+
+    def test_phase_thresholds(self):
+        from lib.stock_engine import (
+            get_current_phase, PHASE_2_THRESHOLD, PHASE_3_THRESHOLD,
+        )
+        assert PHASE_2_THRESHOLD == 5000
+        assert PHASE_3_THRESHOLD == 10000
+        assert get_current_phase(1500) == 1     # current bankroll
+        assert get_current_phase(4999) == 1
+        assert get_current_phase(5000) == 2     # CSPs unlock
+        assert get_current_phase(9999) == 2
+        assert get_current_phase(10000) == 3    # full Wheel
+        assert get_current_phase(50000) == 3
+
+
+class TestMissedCycleWatchdog:
+    """Wave 3 #17: missed monitor cycles must drive the kill-switch
+    counter. Previously record_missed_check() existed but had no live
+    callers — the kill-switch path was effectively dead."""
+
+    @pytest.fixture(autouse=True)
+    def _temp_heartbeat(self, tmp_path, monkeypatch):
+        from lib import monitor
+        monkeypatch.setattr(monitor, "HEARTBEAT_PATH",
+                            tmp_path / "heartbeat.json")
+        monitor._missed_checks = 0  # reset module global
+
+    def test_no_misses_when_cycle_runs_on_time(self):
+        from lib import monitor
+        from datetime import datetime, timezone, timedelta
+        # Simulate a heartbeat 60s ago — well within the 180s default interval
+        recent = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+        monitor.HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        monitor.HEARTBEAT_PATH.write_text(json.dumps({"last_check_at": recent}))
+
+        before = monitor._missed_checks
+        monitor._check_for_missed_cycles()
+        assert monitor._missed_checks == before  # nothing recorded
+
+    def test_records_misses_after_a_long_gap(self, monkeypatch):
+        from lib import monitor
+        from datetime import datetime, timezone, timedelta
+        # 600s gap, 180s interval → 3 missed cycles (600/180 - 1 = 2.33 → 2)
+        old = (datetime.now(timezone.utc) - timedelta(seconds=600)).isoformat()
+        monitor.HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        monitor.HEARTBEAT_PATH.write_text(json.dumps({"last_check_at": old}))
+        monkeypatch.setattr(monitor, "_load_settings",
+                            lambda: {"monitoring": {
+                                "check_interval_seconds": 180,
+                                "missed_check_alert": 3,
+                                "missed_check_kill": 10,
+                            }})
+
+        monitor._check_for_missed_cycles()
+        assert monitor._missed_checks == 2
+
+    def test_first_ever_run_records_no_misses(self):
+        from lib import monitor
+        # No heartbeat file exists yet — nothing to compare.
+        monitor._check_for_missed_cycles()
+        assert monitor._missed_checks == 0
+
+
+class TestPositionsStore:
+    """Wave 3 #15: positions.json mutations must serialize across
+    processes. Without the lock, two concurrent appenders each read
+    N → write N+1, losing one of the two new entries."""
+
+    @pytest.fixture(autouse=True)
+    def _temp_store(self, tmp_path, monkeypatch):
+        from lib import positions_store
+        monkeypatch.setattr(positions_store, "POSITIONS_PATH",
+                            tmp_path / "positions.json")
+
+    def test_save_load_roundtrip(self):
+        from lib import positions_store
+        positions_store.save_positions([{"ticker": "AAPL", "shares": 1}])
+        assert positions_store.load_positions() == [{"ticker": "AAPL", "shares": 1}]
+
+    def test_load_returns_empty_for_missing_file(self):
+        from lib import positions_store
+        assert positions_store.load_positions() == []
+
+    def test_load_recovers_from_corrupted_json(self, tmp_path):
+        from lib import positions_store
+        positions_store.POSITIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        positions_store.POSITIONS_PATH.write_text("{not valid json")
+        # Returns [] rather than crashing the trade pipeline.
+        assert positions_store.load_positions() == []
+
+    def test_mutate_persists_changes(self):
+        from lib import positions_store
+        with positions_store.mutate_positions() as positions:
+            positions.append({"ticker": "MSFT", "shares": 5})
+        assert positions_store.load_positions() == [
+            {"ticker": "MSFT", "shares": 5}
+        ]
+
+    def test_concurrent_appends_do_not_lose_writes(self):
+        """Simulate two processes appending to the SAME positions.json
+        via mutate_positions. Both writes must survive — no overwrite."""
+        from lib import positions_store
+        import threading
+
+        positions_store.save_positions([])
+        results = []
+
+        def append(ticker):
+            with positions_store.mutate_positions() as positions:
+                positions.append({"ticker": ticker})
+                results.append(ticker)
+
+        # 20 threads, distinct tickers — none should be lost.
+        threads = [threading.Thread(target=append, args=(f"T{i}",))
+                   for i in range(20)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+
+        final = positions_store.load_positions()
+        assert len(final) == 20
+        assert sorted(p["ticker"] for p in final) == sorted(results)
+
+    def test_mutate_aborts_write_on_exception(self):
+        """If the caller raises inside the with block, the on-disk file
+        must remain at its pre-mutation state — no half-written JSON."""
+        from lib import positions_store
+        positions_store.save_positions([{"ticker": "INITIAL"}])
+        try:
+            with positions_store.mutate_positions() as positions:
+                positions.append({"ticker": "WOULD_BE_LOST"})
+                raise RuntimeError("simulated failure mid-mutation")
+        except RuntimeError:
+            pass
+        # File should still hold the original entry.
+        assert positions_store.load_positions() == [{"ticker": "INITIAL"}]
+
+
 class TestOrderDedup:
     """The dedup store must be file-locked and survive across processes,
     so two concurrent scans cannot each clear the same intent hash."""

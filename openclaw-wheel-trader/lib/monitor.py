@@ -25,21 +25,28 @@ from lib.memory_palace import (
 )
 from lib.alpaca_client import AlpacaClient
 
-POSITIONS_PATH = Path(__file__).parent.parent / "data" / "positions.json"
 CONFIG_PATH = Path(__file__).parent.parent / "config" / "settings.yaml"
 STRATEGY_PATH = Path(__file__).parent.parent / "config" / "wheel_strategy.yaml"
 
+# File-locked positions store (Wave 3 #15).
+from lib.positions_store import (
+    POSITIONS_PATH,
+    load_positions as _store_load,
+    save_positions as _store_save,
+    mutate_positions as _store_mutate,
+)
+
+
+def mutate_positions():
+    return _store_mutate(POSITIONS_PATH)
+
 
 def _load_positions() -> list[dict]:
-    if not POSITIONS_PATH.exists():
-        return []
-    with open(POSITIONS_PATH) as f:
-        return json.load(f)
+    return _store_load(POSITIONS_PATH)
 
 
 def _save_positions(positions: list[dict]):
-    with open(POSITIONS_PATH, "w") as f:
-        json.dump(positions, f, indent=2)
+    _store_save(positions, POSITIONS_PATH)
 
 
 def _load_settings() -> dict:
@@ -57,6 +64,59 @@ def _load_strategy() -> dict:
 # ============================================================
 
 _missed_checks = 0
+HEARTBEAT_PATH = Path(__file__).parent.parent / "data" / "heartbeat.json"
+
+
+def _record_heartbeat():
+    """Persist a timestamp marking the start of this monitor cycle so
+    the next firing can detect missed cycles in between."""
+    HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    HEARTBEAT_PATH.write_text(json.dumps({
+        "last_check_at": datetime.now(timezone.utc).isoformat(),
+    }))
+
+
+def _check_for_missed_cycles():
+    """
+    Wave 3 #17: actually drive the kill-switch watchdog. Compares the
+    timestamp from the last cycle to now; if the gap exceeds 1.5×
+    the configured interval, count it as one or more missed checks.
+
+    Mac asleep, launchd outage, machine reboot, etc. are exactly what
+    this is for. A genuinely-on-time cycle records 0 misses.
+    """
+    if not HEARTBEAT_PATH.exists():
+        return  # First cycle ever; nothing to compare against.
+    try:
+        prev = json.loads(HEARTBEAT_PATH.read_text())
+        last_iso = prev.get("last_check_at", "")
+        if not last_iso:
+            return
+        last = datetime.fromisoformat(last_iso.replace("Z", "+00:00"))
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return
+
+    settings = _load_settings()
+    interval = max(60, int(settings.get("monitoring", {})
+                                  .get("check_interval_seconds", 180)))
+    now = datetime.now(timezone.utc)
+    gap = (now - last).total_seconds()
+    misses = int(gap / interval) - 1
+    if misses <= 0:
+        return
+
+    log_event("monitor", "missed_cycles_detected", {
+        "gap_seconds": round(gap, 1),
+        "interval_seconds": interval,
+        "missed_cycles": misses,
+        "last_check_at": last_iso,
+    })
+    for _ in range(misses):
+        # record_missed_check() escalates internally to alert/kill
+        # at the configured thresholds and stops counting once the
+        # kill threshold is hit (Wave 3 #14).
+        if record_missed_check() == "KILLED":
+            break
 
 
 def reset_heartbeat():
@@ -74,6 +134,11 @@ def record_missed_check():
         log_event("monitor", "kill_threshold_reached", {"missed": _missed_checks})
         from lib.kill_switch import activate_kill_switch
         activate_kill_switch(reason=f"missed_{_missed_checks}_consecutive_checks")
+        # Wave 3 #14: reset the counter so a re-armed monitor (operator
+        # restarts trading after a kill) doesn't immediately re-trip on the
+        # very next missed check. The kill_switch itself is the durable
+        # halt — this counter is just the trigger.
+        _missed_checks = 0
         return "KILLED"
 
     if _missed_checks >= mon.get("missed_check_alert", 3):
@@ -216,10 +281,15 @@ def check_assignment(position: dict, broker_positions: list[dict]) -> dict | Non
 
 def run_monitoring_check(client: AlpacaClient) -> dict:
     """
-    Single monitoring check. Called every 5 minutes by cron.
+    Single monitoring check. Called every 3 minutes by launchd cron.
 
     Returns summary dict of actions taken.
     """
+    # Wave 3 #17: detect missed cycles from the previous heartbeat BEFORE
+    # resetting in-process state. If the gap was big enough, this can
+    # trip the kill switch.
+    _check_for_missed_cycles()
+    _record_heartbeat()
     reset_heartbeat()
     log_event("monitor", "check_started", {})
 

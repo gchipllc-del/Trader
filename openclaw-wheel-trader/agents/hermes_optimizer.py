@@ -108,9 +108,14 @@ def _clamp(value, param_name: str):
 # STEP 1: REVIEW — Analyze recent trade performance
 # ============================================================
 
-def review_trades(lookback_days: int = 14) -> dict:
+def review_trades(lookback_days: int = 14, trade_type: str = "stock") -> dict:
     """
-    Analyze closed trades from the last N days.
+    Analyze closed trades from the last N days for a specific strategy type.
+
+    Wave 3 #12: Hermes tunes `stock_params`, so CSP/CC trades must be
+    excluded from the input — their P/L distribution and stop/target
+    semantics differ. Pass trade_type="csp" or "cc" if/when those have
+    their own Hermes tuners.
 
     Returns performance metrics broken down by:
     - Overall win rate, avg win, avg loss
@@ -122,8 +127,16 @@ def review_trades(lookback_days: int = 14) -> dict:
     cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
 
     closed = []
+    skipped_other_types = 0
     for p in positions:
         if p.get("status") != "closed":
+            continue
+        # Filter to the strategy type Hermes is tuning (Wave 3 #12).
+        # Default "stock" type — older entries may have no `type` field;
+        # treat those as stock for backward compat.
+        ptype = p.get("type", "stock")
+        if ptype != trade_type:
+            skipped_other_types += 1
             continue
         closed_at = p.get("closed_at", "")
         if not closed_at:
@@ -137,7 +150,15 @@ def review_trades(lookback_days: int = 14) -> dict:
         closed.append(p)
 
     if not closed:
-        return {"total_trades": 0, "message": "No closed trades in lookback period"}
+        return {
+            "total_trades": 0,
+            "trade_type": trade_type,
+            "skipped_other_types": skipped_other_types,
+            "message": (
+                f"No closed {trade_type} trades in last {lookback_days}d "
+                f"(skipped {skipped_other_types} of other types)"
+            ),
+        }
 
     wins = []
     losses = []
@@ -393,17 +414,30 @@ def run_optimization(lookback_days: int = 14, dry_run: bool = False) -> dict:
     strategy = _load_strategy()
     current_params = strategy.get("stock_params", {})
 
-    # Step 1: Review
-    review = review_trades(lookback_days)
+    # Step 1: Review (stock-only — Wave 3 #12)
+    review = review_trades(lookback_days, trade_type="stock")
 
     # Step 2: Diagnose
     recommendations = diagnose(review, current_params)
 
     # Step 3: Tune
-    if dry_run or review["total_trades"] < 3:
+    skip_reason = None
+    if dry_run:
         changes = {}
+        skip_reason = "dry_run"
+    elif review["total_trades"] < 3:
+        changes = {}
+        skip_reason = (
+            f"insufficient_trades: have {review['total_trades']} closed stock "
+            f"trades in last {lookback_days}d, need 3"
+        )
+    elif not recommendations:
+        changes = {}
+        skip_reason = "no_recommendations: metrics within tolerance bands"
     else:
         changes = apply_adjustments(recommendations)
+        if not changes:
+            skip_reason = "all_adjustments_at_bounds: recommendations would push past hermes_bounds"
 
     # Step 4: Log
     report = {
@@ -413,22 +447,33 @@ def run_optimization(lookback_days: int = 14, dry_run: bool = False) -> dict:
         "review": review,
         "recommendations": recommendations,
         "changes": changes,
+        "skip_reason": skip_reason,
         "params_after": strategy.get("stock_params", {}),
     }
 
     _log_optimization(report)
 
+    # Wave 3 #11: always emit a diagnosis line to the audit trail so an
+    # operator can answer "why didn't Hermes change anything?" without
+    # spelunking through trade history.
     log_event("hermes", "optimization_complete", {
         "trades_reviewed": review["total_trades"],
+        "trade_type": review.get("trade_type", "stock"),
+        "skipped_other_types": review.get("skipped_other_types", 0),
         "recommendations": len(recommendations),
         "changes_applied": len(changes),
+        "skip_reason": skip_reason,
         "win_rate": review.get("win_rate", 0),
         "expectancy": review.get("expectancy", 0),
     })
 
-    diary_write("hermes_agent",
+    diary_summary = (
         f"OPT|trades_{review['total_trades']}|wr_{review.get('win_rate', 0):.0%}|"
-        f"exp_{review.get('expectancy', 0):+.2%}|changes_{len(changes)}")
+        f"exp_{review.get('expectancy', 0):+.2%}|changes_{len(changes)}"
+    )
+    if skip_reason:
+        diary_summary += f"|skip_{skip_reason.split(':')[0]}"
+    diary_write("hermes_agent", diary_summary)
 
     return report
 

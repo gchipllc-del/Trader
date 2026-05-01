@@ -28,20 +28,25 @@ from lib.memory_palace import (
 from lib.alpaca_client import AlpacaClient
 from lib.earnings_filter import earnings_veto, next_earnings_date
 
-POSITIONS_PATH = Path(__file__).parent.parent / "data" / "positions.json"
+# File-locked positions store (Wave 3 #15).
+from lib.positions_store import (
+    POSITIONS_PATH,
+    load_positions as _store_load,
+    save_positions as _store_save,
+    mutate_positions as _store_mutate,
+)
+
+
+def mutate_positions():
+    return _store_mutate(POSITIONS_PATH)
 
 
 def _load_positions() -> list[dict]:
-    if not POSITIONS_PATH.exists():
-        return []
-    with open(POSITIONS_PATH) as f:
-        return json.load(f)
+    return _store_load(POSITIONS_PATH)
 
 
 def _save_positions(positions: list[dict]):
-    POSITIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(POSITIONS_PATH, "w") as f:
-        json.dump(positions, f, indent=2)
+    _store_save(positions, POSITIONS_PATH)
 
 
 def scan_for_csps(

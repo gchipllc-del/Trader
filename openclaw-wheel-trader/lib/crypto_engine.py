@@ -49,7 +49,19 @@ from lib.order_gate import (
 )
 
 CONFIG_PATH = Path(__file__).parent.parent / "config" / "wheel_strategy.yaml"
-POSITIONS_PATH = Path(__file__).parent.parent / "data" / "positions.json"
+# File-locked positions store (Wave 3 #15). POSITIONS_PATH is module-local
+# so tests can monkeypatch it.
+from lib.positions_store import (
+    POSITIONS_PATH,
+    load_positions as _store_load,
+    save_positions as _store_save,
+    mutate_positions as _store_mutate,
+)
+
+
+def mutate_positions():
+    """Module-local mutate that honors crypto_engine.POSITIONS_PATH overrides."""
+    return _store_mutate(POSITIONS_PATH)
 
 
 def _load_strategy() -> dict:
@@ -58,18 +70,14 @@ def _load_strategy() -> dict:
 
 
 def _load_positions() -> list[dict]:
-    if not POSITIONS_PATH.exists():
-        return []
-    try:
-        with open(POSITIONS_PATH, "r") as f:
-            return json.load(f) or []
-    except Exception:
-        return []
+    """Locked snapshot of positions.json (Wave 3 #15 — see positions_store)."""
+    return _store_load(POSITIONS_PATH)
 
 
 def _save_positions(positions: list[dict]) -> None:
-    with open(POSITIONS_PATH, "w") as f:
-        json.dump(positions, f, indent=2, default=str)
+    """Atomic-overwrite under exclusive lock. Prefer mutate_positions()
+    over a load + save pair to avoid the read-then-write race."""
+    _store_save(positions, POSITIONS_PATH)
 
 
 # ── Indicators ───────────────────────────────────────────────────
@@ -582,22 +590,23 @@ def execute_crypto_buy(
             print(f"     NO FILL: {sym} order_id={order_id} status={status}")
             return None
 
-        positions = _load_positions()
-        positions.append({
-            "ticker": sym,
-            "type": "crypto",
-            "status": "open",
-            "shares": filled_qty,
-            "entry_price": filled_avg,
-            "target_price": candidate["target_price"],
-            "stop_loss": candidate["stop_loss"],
-            "trailing_stop_pct": candidate["trailing_stop_pct"],
-            "order_id": str(order_id),
-            "opened_at": datetime.now(timezone.utc).isoformat(),
-            "composite_score": score,
-            "notional_at_entry": notional,
-        })
-        _save_positions(positions)
+        # Append under exclusive lock to avoid clobbering concurrent
+        # stock_engine / monitor writes (Wave 3 #15).
+        with mutate_positions() as positions:
+            positions.append({
+                "ticker": sym,
+                "type": "crypto",
+                "status": "open",
+                "shares": filled_qty,
+                "entry_price": filled_avg,
+                "target_price": candidate["target_price"],
+                "stop_loss": candidate["stop_loss"],
+                "trailing_stop_pct": candidate["trailing_stop_pct"],
+                "order_id": str(order_id),
+                "opened_at": datetime.now(timezone.utc).isoformat(),
+                "composite_score": score,
+                "notional_at_entry": notional,
+            })
 
         log_event("crypto_engine", "executed", {
             "ticker": sym,

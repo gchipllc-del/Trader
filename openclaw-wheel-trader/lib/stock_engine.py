@@ -35,9 +35,23 @@ from lib.order_gate import (
 from lib.quant_screener import screen_universe, print_screening_report
 from lib.momentum import analyze_momentum
 
-POSITIONS_PATH = Path(__file__).parent.parent / "data" / "positions.json"
 CONFIG_PATH = Path(__file__).parent.parent / "config" / "settings.yaml"
 STRATEGY_PATH = Path(__file__).parent.parent / "config" / "wheel_strategy.yaml"
+
+# File-locked positions store (Wave 3 #15). POSITIONS_PATH is module-local
+# so tests can monkeypatch it; the load/save wrappers honor whatever value
+# this module currently has.
+from lib.positions_store import (
+    POSITIONS_PATH,
+    load_positions as _store_load,
+    save_positions as _store_save,
+    mutate_positions as _store_mutate,
+)
+
+
+def mutate_positions():
+    """Module-local mutate that honors stock_engine.POSITIONS_PATH overrides."""
+    return _store_mutate(POSITIONS_PATH)
 
 # Phase thresholds
 PHASE_2_THRESHOLD = 5000   # Start selling CSPs on cheap stocks
@@ -55,16 +69,11 @@ def _load_strategy() -> dict:
 
 
 def _load_positions() -> list[dict]:
-    if not POSITIONS_PATH.exists():
-        return []
-    with open(POSITIONS_PATH) as f:
-        return json.load(f)
+    return _store_load(POSITIONS_PATH)
 
 
 def _save_positions(positions: list[dict]):
-    POSITIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(POSITIONS_PATH, "w") as f:
-        json.dump(positions, f, indent=2)
+    _store_save(positions, POSITIONS_PATH)
 
 
 def get_current_phase(portfolio_value: float) -> int:
@@ -1092,21 +1101,21 @@ def execute_stock_buy(
         diary_write("strategy_agent", f"{ticker}|STOCK_FAILED|{e}")
         return None
 
-    # Track position
-    positions = _load_positions()
-    positions.append({
-        "ticker": ticker,
-        "type": "stock",
-        "status": "open",
-        "shares": shares,
-        "entry_price": price,
-        "target_price": candidate["target_price"],
-        "stop_loss": candidate["stop_loss"],
-        "order_id": response["id"],
-        "opened_at": datetime.now(timezone.utc).isoformat(),
-        "composite_score": candidate["composite_score"],
-    })
-    _save_positions(positions)
+    # Track position under exclusive lock so a concurrent crypto-monitor
+    # or scan can't race the read-modify-write and clobber this append.
+    with mutate_positions() as positions:
+        positions.append({
+            "ticker": ticker,
+            "type": "stock",
+            "status": "open",
+            "shares": shares,
+            "entry_price": price,
+            "target_price": candidate["target_price"],
+            "stop_loss": candidate["stop_loss"],
+            "order_id": response["id"],
+            "opened_at": datetime.now(timezone.utc).isoformat(),
+            "composite_score": candidate["composite_score"],
+        })
 
     # Memory
     remember_trade_decision(

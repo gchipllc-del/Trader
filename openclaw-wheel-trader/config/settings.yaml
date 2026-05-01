@@ -16,6 +16,10 @@ circuit_breakers:
   # $1500 the dollar floor still holds the line at -$150 absolute.
   max_daily_loss: -150
   max_daily_loss_pct: -0.10
+  # Hard absolute ceiling enforced by check_position_size in run_all_checks.
+  # Must be >= the highest per-asset cap (wheel_strategy.yaml stock_params /
+  # crypto_params .max_position_pct). If you raise either of those, raise
+  # this too — otherwise the breaker silently caps below the strategy.
   max_position_pct: 0.30        # 30% of portfolio per position (concentrated growth mode)
   auto_trim_buffer_pct: 0.02    # Auto-trim when position > max + buffer (so 32%) — prevents oversize drift
   max_sector_pct: 0.50          # 50% of portfolio per sector (allow conviction bets)
