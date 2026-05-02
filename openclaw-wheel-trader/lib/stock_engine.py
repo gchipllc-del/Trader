@@ -957,6 +957,42 @@ def execute_stock_buy(
         diary_write("strategy_agent", f"{ticker}|STOCK_BLOCKED|{e}")
         return None
 
+    # Bear adversarial stress test — adapted from TauricResearch/TradingAgents
+    # bull/bear debate. Veto overwhelmingly bearish setups; downsize moderate.
+    try:
+        from agents.bear_agent import BearAgent
+        from lib.memory_palace import get_current_regime
+        bear_review = BearAgent().review(candidate, regime=get_current_regime() or "unknown")
+        if bear_review["action"] == "VETO":
+            log_event("stock_engine", "bear_veto", {
+                "ticker": ticker,
+                "score": bear_review["score"],
+                "signals": [s["name"] for s in bear_review["signals"]],
+            }, result="blocked")
+            diary_write("strategy_agent",
+                f"{ticker}|STOCK_BEAR_VETO|score_{bear_review['score']}/10")
+            return None
+        # DOWNSIZE → multiply intended shares by the bear's size_multiplier.
+        size_mult = float(bear_review.get("size_multiplier", 1.0))
+        if size_mult < 1.0:
+            new_shares = int(shares * size_mult)
+            if new_shares < 1:
+                log_event("stock_engine", "bear_downsize_to_zero", {
+                    "ticker": ticker, "original_shares": shares,
+                    "size_multiplier": size_mult,
+                }, result="blocked")
+                return None
+            log_event("stock_engine", "bear_downsize", {
+                "ticker": ticker, "original_shares": shares,
+                "new_shares": new_shares, "size_multiplier": size_mult,
+                "score": bear_review["score"],
+            })
+            shares = new_shares
+    except Exception as e:
+        # Bear is advisory — never block trading on bear's own failure.
+        log_event("stock_engine", "bear_review_failed",
+                  {"ticker": ticker, "error": str(e)[:200]}, result="degraded")
+
     # Position size check
     position_value = price * shares
     settings = _load_settings()

@@ -22,14 +22,16 @@ import yaml
 from agents.strategy_agent import StrategyAgent
 from agents.risk_agent import RiskAgent
 from agents.compliance_agent import ComplianceAgent
+from agents.bear_agent import BearAgent
 from lib.audit import log_event
-from lib.memory_palace import diary_write
+from lib.memory_palace import diary_write, get_current_regime
 from lib.screener import WheelCandidate
 
 
 strategy = StrategyAgent()
 risk = RiskAgent()
 compliance = ComplianceAgent()
+bear = BearAgent()
 
 STRATEGY_PATH = Path(__file__).parent.parent / "config" / "wheel_strategy.yaml"
 
@@ -189,7 +191,29 @@ def seek_consensus(
             "reason": compliance_review["reason"],
         }
 
-    # Step 4: LLM advisory vote (non-blocking unless config explicitly enables veto)
+    # Step 4: Bear adversarial stress test (deterministic, no LLM cost).
+    # Inspired by TauricResearch/TradingAgents bull/bear debate — adapted
+    # to our flat consensus. Vetoes overwhelmingly bearish setups before
+    # we spend an LLM call on them.
+    bear_review = bear.review(candidate, regime=get_current_regime() or "unknown")
+    if bear_review["action"] == "VETO":
+        log_event("consensus", "vetoed_by_bear", {
+            "ticker": candidate.ticker,
+            "score": bear_review["score"],
+            "signals": [s["name"] for s in bear_review["signals"]],
+        })
+        return {
+            "approved": False,
+            "proposal": proposal,
+            "risk_review": risk_review,
+            "compliance_review": compliance_review,
+            "bear_review": bear_review,
+            "decision": "VETOED",
+            "blocking_agent": "bear_agent",
+            "reason": bear_review["reasoning"],
+        }
+
+    # Step 5: LLM advisory vote (non-blocking unless config explicitly enables veto)
     llm_review = _llm_advisory_vote(candidate, cost_basis)
     if llm_review.get("ran"):
         log_event("consensus", "llm_advisory", {
@@ -237,7 +261,11 @@ def seek_consensus(
         "proposal": proposal,
         "risk_review": risk_review,
         "compliance_review": compliance_review,
+        "bear_review": bear_review,
         "llm_review": llm_review,
         "decision": "EXECUTE",
         "blocking_agent": None,
+        # Sizing multiplier from bear: 1.0 = pass, 0.5 = downsize, 0.0 = veto
+        # (caller multiplies their Kelly fraction by this).
+        "size_multiplier": bear_review.get("size_multiplier", 1.0),
     }
