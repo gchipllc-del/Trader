@@ -3,6 +3,7 @@ Circuit Breakers — hard limits that cannot be bypassed.
 If any breaker trips, trading halts until conditions clear or human intervenes.
 """
 
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -12,10 +13,33 @@ from lib.audit import log_event
 
 CONFIG_PATH = Path(__file__).parent.parent / "config" / "settings.yaml"
 
+# Settings cache to avoid re-reading the YAML file on every breaker call
+# (audit finding 2026-05-01 #6: under high order volume the disk-read
+# inside check_daily_loss became a meaningful bottleneck and risked stale
+# reads under concurrent edits). 60-second TTL is short enough that an
+# operator config change still propagates quickly.
+_SETTINGS_CACHE: dict = {"data": None, "loaded_at": 0.0}
+_SETTINGS_TTL_SECONDS = 60
+
 
 def _load_settings() -> dict:
+    now = time.time()
+    if (_SETTINGS_CACHE["data"] is not None
+            and now - _SETTINGS_CACHE["loaded_at"] < _SETTINGS_TTL_SECONDS):
+        return _SETTINGS_CACHE["data"]
     with open(CONFIG_PATH, "r") as f:
-        return yaml.safe_load(f)
+        data = yaml.safe_load(f)
+    _SETTINGS_CACHE["data"] = data
+    _SETTINGS_CACHE["loaded_at"] = now
+    return data
+
+
+def invalidate_settings_cache() -> None:
+    """Force the next _load_settings() call to re-read from disk.
+    Call this after a programmatic settings change (e.g. Hermes optimizer
+    rewriting strategy.yaml — though that uses a separate file)."""
+    _SETTINGS_CACHE["data"] = None
+    _SETTINGS_CACHE["loaded_at"] = 0.0
 
 
 class CircuitBreakerTripped(Exception):
@@ -37,19 +61,51 @@ def check_paper_mode(settings: dict | None = None):
         )
 
 
-def check_daily_loss(current_daily_pnl: float, settings: dict | None = None) -> bool:
-    """Check if daily loss limit has been breached."""
+def check_daily_loss(
+    current_daily_pnl: float,
+    settings: dict | None = None,
+    portfolio_value: float | None = None,
+) -> bool:
+    """Check if daily loss limit has been breached.
+
+    The effective limit is the MORE RESTRICTIVE of:
+      - max_daily_loss      (fixed dollar floor, always applied)
+      - max_daily_loss_pct  (equity-relative, applied iff portfolio_value given)
+
+    Backward compatible: callers that don't pass portfolio_value get the
+    legacy dollar-only behaviour, which is what the existing test suite
+    expects. New callers (stock_engine, order_gate) pass the live equity
+    so the breaker auto-scales as the bankroll grows.
+    """
     if settings is None:
         settings = _load_settings()
-    max_loss = settings["circuit_breakers"]["max_daily_loss"]
+    cb = settings["circuit_breakers"]
+    dollar_floor = cb["max_daily_loss"]
+
+    pct_limit_dollar = None
+    pct_limit = cb.get("max_daily_loss_pct")
+    if pct_limit is not None and portfolio_value is not None and portfolio_value > 0:
+        pct_limit_dollar = portfolio_value * pct_limit  # pct is negative, so this is negative
+
+    # Pick the tighter (less negative = stricter) of the two
+    if pct_limit_dollar is not None:
+        max_loss = max(dollar_floor, pct_limit_dollar)
+        limit_source = "pct" if max_loss == pct_limit_dollar else "dollar_floor"
+    else:
+        max_loss = dollar_floor
+        limit_source = "dollar_floor"
 
     if current_daily_pnl <= max_loss:
         log_event("circuit_breaker", "daily_loss_breached", {
             "current_pnl": current_daily_pnl,
             "max_loss": max_loss,
+            "limit_source": limit_source,
+            "portfolio_value": portfolio_value,
+            "dollar_floor": dollar_floor,
+            "pct_limit": pct_limit,
         }, result="blocked")
         raise CircuitBreakerTripped(
-            f"HALTED: Daily P/L ${current_daily_pnl:.2f} breached limit ${max_loss}"
+            f"HALTED: Daily P/L ${current_daily_pnl:.2f} breached limit ${max_loss:.2f} ({limit_source})"
         )
     return True
 
@@ -145,7 +201,7 @@ def run_all_checks(
     settings = _load_settings()
 
     check_paper_mode(settings)
-    check_daily_loss(current_daily_pnl, settings)
+    check_daily_loss(current_daily_pnl, settings, portfolio_value=portfolio_value)
     check_position_size(order_value, portfolio_value, settings)
     check_open_orders(current_open_orders, settings)
     check_contracts_per_order(contracts, settings)

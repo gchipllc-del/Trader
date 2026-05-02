@@ -32,10 +32,9 @@ def _load_settings() -> dict:
 
 
 def _load_positions() -> list[dict]:
-    if not POSITIONS_PATH.exists():
-        return []
-    with open(POSITIONS_PATH) as f:
-        return json.load(f)
+    """Locked snapshot via the canonical store (audit finding #5)."""
+    from lib.positions_store import load_positions as _store_load
+    return _store_load(POSITIONS_PATH)
 
 
 def count_day_trades(lookback_days: int = 5, client=None) -> int:

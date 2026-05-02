@@ -67,7 +67,12 @@ def _compute_iv_from_mid(
         if 0.03 <= iv <= 5.0:
             return float(iv)
         return None
-    except Exception:
+    except Exception as e:
+        # IV solver failure is recoverable — caller decides what to do
+        # with None — but log so operators can see when py_vollib chokes
+        # (audit finding 2026-05-01 #9).
+        log_event("options_signals", "iv_solver_failed",
+                  {"error": str(e)[:200]}, result="degraded")
         return None
 
 

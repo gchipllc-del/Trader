@@ -505,8 +505,12 @@ def cmd_scan():
             earnings = refresh_earnings_calendar(tickers)
             if earnings:
                 print(f"\n  📅 Earnings dates loaded: {', '.join(f'{t}={d}' for t, d in earnings.items())}")
-        except Exception:
-            pass  # Non-critical — trades still filtered by KG fallback
+        except Exception as e:
+            # Non-critical — trades still filtered by KG fallback. Audit
+            # finding 2026-05-01 #4: log so operators can see when the
+            # earnings refresh quietly degrades.
+            log_event("main", "earnings_refresh_failed",
+                      {"error": str(e)[:200]}, result="degraded")
 
         # Fetch market data for phase-appropriate tickers
         print(f"\n  Fetching data for {len(tickers)} tickers: {', '.join(tickers)}")
@@ -1345,8 +1349,11 @@ def cmd_llm(ticker: str = "SPY"):
             if kf is not None:
                 kronos_direction = kf.direction
                 kronos_expected_return = kf.expected_return
-        except Exception:
-            pass  # Kronos optional
+        except Exception as e:
+            # Kronos optional — log silently so operator can see when the
+            # forecasting layer is degraded (audit #4).
+            log_event("main", "kronos_unavailable",
+                      {"error": str(e)[:200]}, result="degraded")
 
         news = check_stock_sentiment(ticker)
 

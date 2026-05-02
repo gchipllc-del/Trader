@@ -15,9 +15,21 @@ from pathlib import Path
 LOG_DIR = Path(__file__).parent.parent / "logs"
 AUDIT_FILE = LOG_DIR / "audit_log.jsonl"
 
+# Audit log contains trade decisions, position state, order IDs — owner-only.
+SECURE_FILE_MODE = 0o600
+
 
 def _ensure_log_dir():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _ensure_secure_perms(path: Path) -> None:
+    """Apply 0o600 to the audit file. Idempotent; silent on permission errors."""
+    try:
+        if path.is_file() and (path.stat().st_mode & 0o777) != SECURE_FILE_MODE:
+            os.chmod(path, SECURE_FILE_MODE)
+    except OSError:
+        pass
 
 
 def _write_jsonl(event: dict):
@@ -30,6 +42,7 @@ def _write_jsonl(event: dict):
             f.flush()
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
+    _ensure_secure_perms(AUDIT_FILE)
 
 
 def log_event(

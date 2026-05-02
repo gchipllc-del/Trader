@@ -19,14 +19,25 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 import time
 from pathlib import Path
 
 DEDUP_FILE = Path(__file__).parent.parent / "data" / "intent_hashes.json"
+SECURE_FILE_MODE = 0o600
 
 
 def _ensure_parent():
     DEDUP_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _ensure_secure_perms(path: Path) -> None:
+    """Apply 0o600 to the dedup hash store. Idempotent; silent on errors."""
+    try:
+        if path.is_file() and (path.stat().st_mode & 0o777) != SECURE_FILE_MODE:
+            os.chmod(path, SECURE_FILE_MODE)
+    except OSError:
+        pass
 
 
 def _read_locked(f) -> dict[str, float]:
@@ -86,6 +97,7 @@ def check_and_record(intent_hash: str, window_seconds: int = 60) -> tuple[bool, 
             return False, 0.0
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
+    _ensure_secure_perms(DEDUP_FILE)
 
 
 def reset_for_tests():

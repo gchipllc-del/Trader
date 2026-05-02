@@ -38,6 +38,47 @@ class OrderIntent:
     _validated: bool = False             # Set by step2_validate
 
     def __post_init__(self):
+        # Validate quantity / notional BEFORE anything else (security audit
+        # finding 2026-05-01 #1+#2). A NaN, Inf, or absurdly large value
+        # would silently produce garbage in step2_validate's order_value
+        # arithmetic and bypass circuit-breaker checks.
+        try:
+            qty = float(self.quantity)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"OrderIntent.quantity must be numeric, got {self.quantity!r}"
+            )
+        if not (qty == qty):  # NaN check
+            raise ValueError("OrderIntent.quantity is NaN")
+        if qty <= 0:
+            raise ValueError(
+                f"OrderIntent.quantity must be > 0, got {qty}"
+            )
+        # Hard upper bound — no legitimate strategy needs > 1M units of
+        # anything; this catches accidental garbage (Inf, encoding errors).
+        if qty > 1_000_000:
+            raise ValueError(
+                f"OrderIntent.quantity exceeds sanity limit of 1e6, got {qty}"
+            )
+
+        if self.notional is not None:
+            try:
+                n = float(self.notional)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"OrderIntent.notional must be numeric, got {self.notional!r}"
+                )
+            if not (n == n):
+                raise ValueError("OrderIntent.notional is NaN")
+            if n <= 0:
+                raise ValueError(
+                    f"OrderIntent.notional must be > 0 if set, got {n}"
+                )
+            if n > 10_000_000:
+                raise ValueError(
+                    f"OrderIntent.notional exceeds sanity limit of $10M, got {n}"
+                )
+
         if not self.created_at:
             self.created_at = datetime.now(timezone.utc).isoformat()
         if not self.intent_hash:

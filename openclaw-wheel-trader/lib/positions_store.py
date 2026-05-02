@@ -26,11 +26,27 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
+import stat
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
 POSITIONS_PATH = Path(__file__).parent.parent / "data" / "positions.json"
+
+# Trade state contains position sizes, entry prices, and order IDs — owner-only.
+SECURE_FILE_MODE = 0o600
+
+
+def _ensure_secure_perms(path: Path) -> None:
+    """Apply 0o600 (owner read+write only) to the file if not already set.
+    Idempotent — silently skips if file doesn't exist or isn't a regular file."""
+    try:
+        if path.is_file() and (path.stat().st_mode & 0o777) != SECURE_FILE_MODE:
+            os.chmod(path, SECURE_FILE_MODE)
+    except OSError:
+        # Permission errors should not block trading; log via caller if needed.
+        pass
 
 
 def _resolve_path(path: Path | None) -> Path:
@@ -81,6 +97,7 @@ def save_positions(positions: list[dict], path: Path | None = None) -> None:
             f.flush()
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
+    _ensure_secure_perms(p)
 
 
 @contextmanager
@@ -117,3 +134,4 @@ def mutate_positions(path: Path | None = None) -> Iterator[list[dict]]:
             f.flush()
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
+    _ensure_secure_perms(p)
