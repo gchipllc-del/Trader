@@ -957,40 +957,51 @@ def execute_stock_buy(
         diary_write("strategy_agent", f"{ticker}|STOCK_BLOCKED|{e}")
         return None
 
-    # Bear adversarial stress test — adapted from TauricResearch/TradingAgents
-    # bull/bear debate. Veto overwhelmingly bearish setups; downsize moderate.
+    # Bull/Bear adversarial scoring — adapted from TauricResearch/TradingAgents
+    # researcher debate. Bear can VETO/DOWNSIZE; bull can BOOST when its case
+    # materially exceeds bear's. Asymmetric: bear always wins.
     try:
         from agents.bear_agent import BearAgent
+        from agents.bull_agent import BullAgent, combine_bull_bear
         from lib.memory_palace import get_current_regime
-        bear_review = BearAgent().review(candidate, regime=get_current_regime() or "unknown")
-        if bear_review["action"] == "VETO":
+        regime_now = get_current_regime() or "unknown"
+        bear_review = BearAgent().review(candidate, regime=regime_now)
+        bull_review = BullAgent().review(candidate, regime=regime_now)
+        combined = combine_bull_bear(bull_review, bear_review)
+        decision = combined["decision"]
+        size_mult = float(combined["size_multiplier"])
+
+        if decision == "VETO":
             log_event("stock_engine", "bear_veto", {
                 "ticker": ticker,
-                "score": bear_review["score"],
+                "bear_score": bear_review["score"],
+                "bull_score": bull_review["score"],
                 "signals": [s["name"] for s in bear_review["signals"]],
             }, result="blocked")
             diary_write("strategy_agent",
-                f"{ticker}|STOCK_BEAR_VETO|score_{bear_review['score']}/10")
+                f"{ticker}|STOCK_BEAR_VETO|bear_{bear_review['score']}/bull_{bull_review['score']}")
             return None
-        # DOWNSIZE → multiply intended shares by the bear's size_multiplier.
-        size_mult = float(bear_review.get("size_multiplier", 1.0))
-        if size_mult < 1.0:
+
+        if size_mult != 1.0:
             new_shares = int(shares * size_mult)
             if new_shares < 1:
-                log_event("stock_engine", "bear_downsize_to_zero", {
+                log_event("stock_engine", "combined_size_zero", {
                     "ticker": ticker, "original_shares": shares,
-                    "size_multiplier": size_mult,
+                    "size_multiplier": size_mult, "decision": decision,
                 }, result="blocked")
                 return None
-            log_event("stock_engine", "bear_downsize", {
-                "ticker": ticker, "original_shares": shares,
-                "new_shares": new_shares, "size_multiplier": size_mult,
-                "score": bear_review["score"],
+            log_event("stock_engine", "combined_resize", {
+                "ticker": ticker, "decision": decision,
+                "original_shares": shares, "new_shares": new_shares,
+                "size_multiplier": size_mult,
+                "bear_score": bear_review["score"],
+                "bull_score": bull_review["score"],
+                "delta": combined["delta"],
             })
             shares = new_shares
     except Exception as e:
-        # Bear is advisory — never block trading on bear's own failure.
-        log_event("stock_engine", "bear_review_failed",
+        # Bull/Bear are advisory — never block trading on their own failure.
+        log_event("stock_engine", "bull_bear_review_failed",
                   {"ticker": ticker, "error": str(e)[:200]}, result="degraded")
 
     # Position size check

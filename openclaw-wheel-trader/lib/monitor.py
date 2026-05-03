@@ -536,6 +536,30 @@ def run_monitoring_check(client: AlpacaClient) -> dict:
             except Exception as e:
                 log_event("monitor", "hermes_failed", {"error": str(e)})
 
+        # Fund manager portfolio-level review (TauricResearch Stage V analog).
+        # Runs every cycle but only alerts when actions are needed — keeps
+        # the operator looped in on sector / correlation / cash drift.
+        try:
+            from agents.fund_manager import FundManager
+            fm_review = FundManager().review_portfolio(
+                positions=open_positions,
+                bankroll=float(account.get("portfolio_value", 0) or 0),
+                cash=float(account.get("cash", 0) or 0),
+            )
+            if fm_review["actions"]:
+                for a in fm_review["actions"]:
+                    severity_emoji = {"info": "ℹ️", "warn": "⚠️", "critical": "🔴"}
+                    e = severity_emoji.get(a["severity"], "•")
+                    summary["alerts"].append(f"{e} FundMgr: {a['summary']}")
+                summary["actions"].append({
+                    "action": "fund_manager_review",
+                    "n_actions": len(fm_review["actions"]),
+                    "types": [a["type"] for a in fm_review["actions"]],
+                })
+        except Exception as e:
+            log_event("monitor", "fund_manager_failed", {"error": str(e)[:200]},
+                      result="degraded")
+
     except Exception as e:
         log_event("monitor", "check_failed", {"error": str(e)}, result="failed")
         summary["error"] = str(e)

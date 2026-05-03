@@ -475,6 +475,28 @@ def cmd_scan():
         from lib.pdt_guard import check_pdt
         pdt = check_pdt(portfolio, client=client)
 
+        # Risk personality selection (TauricResearch Risky/Neutral/Safe pattern,
+        # adapted to deterministic state-driven selection — no LLM debate cost).
+        from lib.risk_profile import select_profile, log_active_profile
+        from lib.memory_palace import get_current_regime as _regime
+        try:
+            baseline = json.load(open(Path(__file__).parent / "data" / "baseline_equity.json"))
+            baseline_equity = float(baseline.get("baseline_equity", portfolio))
+            daily_loss_pct = ((portfolio - baseline_equity) / baseline_equity
+                              if baseline_equity > 0 else 0.0)
+        except Exception:
+            daily_loss_pct = 0.0
+        active_profile = select_profile(
+            regime=_regime() or "unknown",
+            bankroll=portfolio,
+            daily_loss_pct=daily_loss_pct,
+        )
+        log_active_profile(active_profile, {
+            "bankroll": round(portfolio, 2),
+            "daily_loss_pct": round(daily_loss_pct, 4),
+            "regime": _regime() or "unknown",
+        })
+
         print("=" * 55)
         print("  OPENCLAW WHEEL TRADER — SCAN")
         print("=" * 55)
@@ -483,6 +505,7 @@ def cmd_scan():
             print(f"  ⚠️  {pdt['warning']}")
         else:
             print(f"  PDT: {pdt['day_trades_used']}/3 day trades used")
+        print(f"  Risk profile: {active_profile.name.upper()} — {active_profile.rationale}")
         print(f"  Phase {phase}: ", end="")
 
         if phase == 1:
