@@ -106,7 +106,13 @@ class FundManager:
             }
         """
         actions: list[FundManagerAction] = []
-        opens = [p for p in positions if p.get("status") == "open"]
+        # Core long-term holdings are excluded from portfolio-level review.
+        # The fund manager only proposes trims/rebalances; for hold_forever
+        # positions those proposals are by definition disallowed. Excluding
+        # them here also keeps sector/correlation math from flagging an
+        # intentional core exposure as a problem.
+        opens = [p for p in positions
+                 if p.get("status") == "open" and not p.get("hold_forever")]
         n = len(opens)
 
         if bankroll <= 0:
