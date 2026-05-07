@@ -55,6 +55,13 @@ stock_params:
   # Per-asset Kelly cap for stock entries. settings.yaml
   # circuit_breakers.max_position_pct is the hard ceiling — keep this <= that.
   max_position_pct: 0.3
+  # Floor on per-position sizing. With a small bankroll, Kelly often returns
+  # 3-7% which produces $50-$100 positions and tiny dollar P&L per win.
+  # Floor lifts those entries to a minimum stake so winning setups translate
+  # into meaningful compounding. Effective range = [min_position_pct,
+  # max_position_pct]. Edge case: if Kelly says "no trade" (shares == 0),
+  # the floor does NOT override that — gate-out signals are still respected.
+  min_position_pct: 0.10
   max_trades_per_scan: 3
   max_concurrent_positions: 5
   allow_momentum_only: true
@@ -75,8 +82,23 @@ stock_params:
   - 0.07
   - 0.1
   enable_scale_out: true
-  partial_exit_threshold: 0.1
+  # Lowered 0.10 → 0.07 to cycle capital faster on a small bankroll.
+  # At +7% the position takes half off, locking gains and freeing slot
+  # capital for the next setup. The runner still benefits from tiered
+  # trailing stops above. Trade-off: smaller per-trade max payout but
+  # higher trade frequency and faster compounding back into Phase 2.
+  partial_exit_threshold: 0.07
   partial_exit_fraction: 0.5
+# ────────────────────────────────────────────────────────────────
+# Core long-term holdings — algorithm BUYS them via the normal scan
+# (they must still pass quant + technical + bull/bear gates), but
+# once a position is opened, the exit logic skips it entirely.
+# Used for high-conviction multi-year holds: no stop, no target,
+# no trailing exit, no fund-manager rebalance trim. The only way
+# to exit is manual intervention.
+# Add tickers here AFTER you've decided. Empty by default — leaving
+# this empty means the feature is dormant and behavior is unchanged.
+core_holdings: []
 tickers_crypto:
 - BTC/USD
 - ETH/USD

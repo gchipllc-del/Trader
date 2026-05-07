@@ -858,8 +858,20 @@ def _apply_kelly_sizing(candidates: list[dict], portfolio_value: float, kelly_cf
 
     Replaces the naive max_position_pct sizing with mathematically-optimal
     Kelly sizing based on win probability and reward/risk ratio.
+
+    Floor: if `stock_params.min_position_pct` is set in wheel_strategy.yaml
+    and Kelly's recommendation is non-zero (i.e., the trade isn't gated
+    out), the position is clamped UP to that floor. This prevents a small
+    bankroll from generating trivially-small entries (3-7% positions with
+    $50 dollar P&L per winning trade). Floor never overrides a "no trade"
+    signal — if Kelly says shares=0, the trade is still skipped.
     """
     fraction = kelly_cfg.get("fraction", 0.25)
+    # Pull floor once per scan (cheap; same strategy already loaded for max_pct
+    # check inside the per-candidate loop, but reading here keeps the logic local).
+    _strategy_for_floor = _load_strategy()
+    min_pct = float(_strategy_for_floor.get("stock_params", {})
+                                       .get("min_position_pct", 0.0))
 
     for candidate in candidates:
         try:
@@ -909,15 +921,33 @@ def _apply_kelly_sizing(candidates: list[dict], portfolio_value: float, kelly_cf
                     sizing["position_value"] = round(portfolio_value * pct, 2)
                     sizing["shares"] = int(portfolio_value * pct / candidate["current_price"])
 
+            # Apply min_position_pct floor — only when Kelly returned a
+            # tradeable size. Never converts a "no trade" (shares == 0)
+            # into a trade. Clamp to max_position_pct ceiling so the floor
+            # can't accidentally exceed the per-asset cap.
+            if min_pct > 0 and sizing.get("shares", 0) > 0:
+                current_pct = float(sizing.get("pct_of_portfolio") or 0.0)
+                ceiling = float(_strategy_for_floor.get("stock_params", {})
+                                                  .get("max_position_pct", 0.30))
+                target_pct = max(current_pct, min(min_pct, ceiling))
+                if target_pct > current_pct:
+                    new_shares = int(portfolio_value * target_pct / candidate["current_price"])
+                    if new_shares > sizing["shares"]:
+                        sizing["pct_of_portfolio"] = round(target_pct, 4)
+                        sizing["position_value"] = round(portfolio_value * target_pct, 2)
+                        sizing["shares"] = new_shares
+                        sizing["floor_applied"] = True
+
             # Override the screener's default sizing with Kelly's
             if sizing.get("shares", 0) > 0:
                 candidate["kelly_sizing"] = sizing
                 candidate["shares"] = sizing["shares"]
                 candidate["position_value"] = sizing["position_value"]
+                floor_tag = " [FLOOR]" if sizing.get("floor_applied") else ""
                 print(f"  💰 {candidate['ticker']}: Kelly sized to "
                       f"{sizing['shares']} shares "
                       f"({sizing['pct_of_portfolio']*100:.1f}% of portfolio, "
-                      f"R/R {sizing.get('reward_to_risk', 0)}x)")
+                      f"R/R {sizing.get('reward_to_risk', 0)}x){floor_tag}")
             else:
                 print(f"  ⚠️  {candidate['ticker']}: Kelly says no trade — {sizing.get('reason', 'unknown')}")
                 # Keep original sizing if Kelly says 0
@@ -1148,10 +1178,18 @@ def execute_stock_buy(
         diary_write("strategy_agent", f"{ticker}|STOCK_FAILED|{e}")
         return None
 
+    # Long-term core-holding flag. If this ticker is on the core_holdings
+    # list, stamp `hold_forever: true` so the monitor's exit logic skips
+    # it (no stop, target, trailing-stop, scale-out, or fund-manager trim).
+    # The position can still be exited manually. Empty list (default) =
+    # feature dormant.
+    _core = set(_load_strategy().get("core_holdings", []) or [])
+    is_core = ticker.upper() in {t.upper() for t in _core}
+
     # Track position under exclusive lock so a concurrent crypto-monitor
     # or scan can't race the read-modify-write and clobber this append.
     with mutate_positions() as positions:
-        positions.append({
+        new_pos = {
             "ticker": ticker,
             "type": "stock",
             "status": "open",
@@ -1162,7 +1200,12 @@ def execute_stock_buy(
             "order_id": response["id"],
             "opened_at": datetime.now(timezone.utc).isoformat(),
             "composite_score": candidate["composite_score"],
-        })
+        }
+        if is_core:
+            new_pos["hold_forever"] = True
+            log_event("stock_engine", "core_holding_opened",
+                      {"ticker": ticker, "shares": shares, "price": price})
+        positions.append(new_pos)
 
     # Memory
     remember_trade_decision(
@@ -1211,6 +1254,17 @@ def check_stock_exits(
     """
     positions = _load_positions()
     stock_positions = [p for p in positions if p.get("type") == "stock" and p.get("status") == "open"]
+
+    # Core long-term holdings: skip exit checks entirely. The flag is set
+    # at position creation when the ticker is on `core_holdings` in
+    # wheel_strategy.yaml. We log the skip once per scan so operators can
+    # see them but the monitor doesn't propose an exit.
+    core_skipped = [p for p in stock_positions if p.get("hold_forever")]
+    if core_skipped:
+        log_event("stock_engine", "core_holdings_skipped_from_exit",
+                  {"tickers": [p.get("ticker") for p in core_skipped],
+                   "count": len(core_skipped)}, result="success")
+    stock_positions = [p for p in stock_positions if not p.get("hold_forever")]
 
     if not stock_positions:
         return []
@@ -1624,11 +1678,30 @@ def auto_trim_oversize_stocks(client: AlpacaClient) -> list[dict]:
                   result="degraded")
         return []
 
+    # Build a set of core long-term holdings so auto-trim never touches them.
+    # Even if a winner runs past max_position_pct, core_holdings are exempt
+    # — they're held for compounding, not for cap discipline.
+    core_holdings = {
+        t.upper() for t in (_load_strategy().get("core_holdings", []) or [])
+    }
+    # Also exempt any position explicitly stamped hold_forever in JSON
+    # (covers manual flagging or future entries from new sources).
+    held_core = {
+        str(p.get("ticker", "")).upper()
+        for p in _load_positions()
+        if p.get("status") == "open" and p.get("hold_forever")
+    }
+    skip_set = core_holdings | held_core
+
     trims: list[dict] = []
     for bp in broker_positions:
         symbol = str(bp.get("symbol") or bp.get("ticker") or "").upper()
         # Skip crypto (different qty handling — covered by crypto_engine)
         if not symbol or "/" in symbol:
+            continue
+        if symbol in skip_set:
+            log_event("stock_engine", "auto_trim_skipped_core",
+                      {"ticker": symbol}, result="success")
             continue
 
         try:
