@@ -557,8 +557,11 @@ class AlpacaClient:
         intended share count even if the order is later rejected, leaving
         a zombie entry that subsequent scans treat as held.
 
-        Terminal statuses: filled, partially_filled, canceled, expired,
-        rejected, suspended.
+        Terminal statuses: filled, canceled, expired, rejected, suspended,
+        done_for_day. NOTE: `partially_filled` is intentionally NOT terminal —
+        it means the order is still working and more fills may arrive in
+        milliseconds (especially for multi-share market orders). Returning
+        on partially_filled would record fewer shares than we actually own.
 
         Returns the final order dict (same shape as submit_order); the
         caller decides whether the fill is good enough to record.
@@ -566,7 +569,7 @@ class AlpacaClient:
         status is reached — caller should treat as "unknown" and audit.
         """
         import time as _time
-        terminal = {"filled", "partially_filled", "canceled", "cancelled",
+        terminal = {"filled", "canceled", "cancelled",
                     "expired", "rejected", "suspended", "done_for_day"}
         deadline = _time.time() + max(0.5, timeout_seconds)
 
