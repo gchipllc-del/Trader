@@ -258,6 +258,15 @@ TECHNICAL SIGNALS:
 RECENT HEADLINES:
 {headlines_str}
 
+## Step 0: Knowledge expansion (think before you score)
+Before producing the JSON, briefly enumerate to yourself:
+- What you actually know about {ticker} as a business (sector, recent earnings cadence, well-known catalysts).
+- What macro/sector regime applies right now (rate environment, sector rotation, recent index trend).
+- What you DON'T know — gaps in the data above (e.g., is there a binary catalyst inside the trade window? is the news sentiment driven by a single old article?).
+
+CRITICAL anti-fabrication rule: if you don't actually know a fact about this ticker (recent guidance, analyst targets, a specific catalyst date), DO NOT make one up. Either omit it or explicitly flag it as uncertain in `bearish_factors` (e.g., "unknown earnings proximity"). Hallucinated specifics that drive a high `win_probability` are worse than admitting ignorance.
+
+## Output
 Return your analysis as strict JSON (no markdown, no prose outside JSON):
 {{
   "win_probability": <float between 0 and 1>,
@@ -272,7 +281,7 @@ Guidance:
 - If Kronos forecast is negative and news sentiment < 0.4 → suggest "skip".
 - If R/R > 2:1 and composite >= 9/13 and no major red flags → suggest "buy".
 - Otherwise → "wait".
-- Put confidence LOW (< 0.4) if signals conflict or data is thin."""
+- Put confidence LOW (< 0.4) if signals conflict, data is thin, or your Step 0 surfaced material unknowns."""
 
     return system_prompt, user_prompt
 
