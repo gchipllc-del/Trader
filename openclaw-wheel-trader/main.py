@@ -1907,7 +1907,8 @@ def cmd_migrate():
 
 
 def cmd_longterm_pick(themes: str | None = None, top_n: int = 15,
-                       use_kronos: bool = True, save: str | None = None):
+                       use_kronos: bool = True, save: str | None = None,
+                       explicit_tickers: str | None = None):
     """Score a candidate universe for long-term core holdings and print
     a ranked dossier. The user picks which top-N to add to
     wheel_strategy.yaml.core_holdings.
@@ -1916,12 +1917,21 @@ def cmd_longterm_pick(themes: str | None = None, top_n: int = 15,
         score_universe, render_dossier, themes_to_tickers,
     )
 
-    tickers = themes_to_tickers(themes)
+    if explicit_tickers:
+        # Explicit list overrides themes — used for targeted re-runs
+        seen: set[str] = set()
+        tickers: list[str] = []
+        for t in (s.strip().upper() for s in explicit_tickers.split(",")):
+            if t and t not in seen:
+                seen.add(t)
+                tickers.append(t)
+    else:
+        tickers = themes_to_tickers(themes)
     if not tickers:
-        print("No tickers resolved from themes. Run with --themes all "
-              "or one of: ai_compute, energy_transition, defense_cyber, "
-              "healthcare_automation, fintech_rails, consumer_compounders, "
-              "industrial_automation.")
+        print("No tickers resolved. Run with --tickers TICKER1,TICKER2 or "
+              "--themes all (or one of: ai_compute, energy_transition, "
+              "defense_cyber, healthcare_automation, fintech_rails, "
+              "consumer_compounders, industrial_automation).")
         return
 
     print("=" * 70)
@@ -2032,6 +2042,10 @@ def main():
     parser.add_argument("--save", default=None,
                         help="longterm-pick: write the ranked dossier to this path "
                              "(JSON). Optional — output prints to stdout regardless.")
+    parser.add_argument("--tickers", default=None,
+                        help="longterm-pick: explicit comma-separated ticker list. "
+                             "Overrides --themes. Use for targeted re-runs (e.g., "
+                             "validating a short list with Kronos enabled).")
 
     args = parser.parse_args()
 
@@ -2141,6 +2155,7 @@ def main():
             top_n=args.top,
             use_kronos=not args.no_kronos,
             save=args.save,
+            explicit_tickers=args.tickers,
         )
 
 
