@@ -1906,6 +1906,70 @@ def cmd_migrate():
     print("  ⚠️  DO NOT skip steps. Each exists because something can go wrong.")
 
 
+def cmd_longterm_pick(themes: str | None = None, top_n: int = 15,
+                       use_kronos: bool = True, save: str | None = None):
+    """Score a candidate universe for long-term core holdings and print
+    a ranked dossier. The user picks which top-N to add to
+    wheel_strategy.yaml.core_holdings.
+    """
+    from lib.longterm_picker import (
+        score_universe, render_dossier, themes_to_tickers,
+    )
+
+    tickers = themes_to_tickers(themes)
+    if not tickers:
+        print("No tickers resolved from themes. Run with --themes all "
+              "or one of: ai_compute, energy_transition, defense_cyber, "
+              "healthcare_automation, fintech_rails, consumer_compounders, "
+              "industrial_automation.")
+        return
+
+    print("=" * 70)
+    print("  OPENCLAW LONG-TERM HOLDING PICKER")
+    print("=" * 70)
+    print(f"  Universe: {len(tickers)} tickers"
+          f"{' (themes: ' + themes + ')' if themes else ' (all themes)'}")
+    print(f"  Kronos AI: {'enabled' if use_kronos else 'disabled (faster)'}")
+    print(f"  Factor weights: Quality 35% / Growth 25% / Moat 15% / "
+          f"Momentum 15% / Valuation 10%")
+    print()
+    print("  Scoring... (yfinance fundamentals + Alpaca bars)")
+    print()
+
+    scores = score_universe(tickers, use_kronos=use_kronos)
+    print(render_dossier(scores, top_n=top_n))
+
+    if save:
+        out_path = Path(save)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w") as f:
+            json.dump([
+                {
+                    "rank": i + 1,
+                    "ticker": s.ticker,
+                    "composite": round(s.composite, 4),
+                    "quality": round(s.quality, 4),
+                    "growth": round(s.growth, 4),
+                    "moat": round(s.moat, 4),
+                    "momentum": round(s.momentum, 4),
+                    "valuation": round(s.valuation, 4),
+                    "sector": s.sector,
+                    "market_cap": s.market_cap,
+                    "why": s.why,
+                }
+                for i, s in enumerate(scores)
+            ], f, indent=2)
+        print(f"\n  💾 Saved full ranking to {out_path}")
+
+    print()
+    print("─" * 70)
+    print("  Next step: pick 4-5 names you believe in, then add them to:")
+    print("    config/wheel_strategy.yaml → core_holdings:")
+    print("  The normal scan will buy them via the standard gates;")
+    print("  once held, the exit logic skips them entirely (hold forever).")
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(description="OpenClaw Wheel Strategy Trader")
     parser.add_argument("command",
@@ -1918,7 +1982,8 @@ def main():
                                  "crypto-monitor", "backtest-stocks",
                                  "build-cache",
                                  "pairs-scan", "min-variance",
-                                 "anomaly", "postmortem", "digest", "dipbuy"],
+                                 "anomaly", "postmortem", "digest", "dipbuy",
+                                 "longterm-pick"],
                         help="Command to run")
     parser.add_argument("--signal", default="all",
                         help="build-cache: which signal to fill (kronos|news|llm|all)")
@@ -1955,6 +2020,18 @@ def main():
                         help="postmortem: target date (YYYY-MM-DD); default today")
     parser.add_argument("--telegram", action="store_true",
                         help="digest: also push to Telegram (needs TELEGRAM_BOT_TOKEN+CHAT_ID)")
+    parser.add_argument("--themes", default=None,
+                        help="longterm-pick: comma-separated themes (ai_compute, "
+                             "energy_transition, defense_cyber, healthcare_automation, "
+                             "fintech_rails, consumer_compounders, industrial_automation, "
+                             "or 'all'). Default: all.")
+    parser.add_argument("--top", type=int, default=15,
+                        help="longterm-pick: how many ranked rows to show (default 15)")
+    parser.add_argument("--no-kronos", action="store_true",
+                        help="longterm-pick: skip Kronos AI directional bias (faster)")
+    parser.add_argument("--save", default=None,
+                        help="longterm-pick: write the ranked dossier to this path "
+                             "(JSON). Optional — output prints to stdout regardless.")
 
     args = parser.parse_args()
 
@@ -2057,6 +2134,13 @@ def main():
             watchlist=args.watchlist,
             threshold=args.threshold if args.threshold != 4.0 else 0.55,
             persist=args.persist,
+        )
+    elif args.command == "longterm-pick":
+        cmd_longterm_pick(
+            themes=args.themes,
+            top_n=args.top,
+            use_kronos=not args.no_kronos,
+            save=args.save,
         )
 
 
