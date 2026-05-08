@@ -96,9 +96,18 @@ stock_params:
 # Used for high-conviction multi-year holds: no stop, no target,
 # no trailing exit, no fund-manager rebalance trim. The only way
 # to exit is manual intervention.
-# Add tickers here AFTER you've decided. Empty by default — leaving
-# this empty means the feature is dormant and behavior is unchanged.
-core_holdings: []
+#
+# Selected 2026-05-07 via `python main.py longterm-pick` (multi-factor
+# scoring: 35% Quality / 25% Growth / 15% Moat / 15% Momentum / 10%
+# Valuation, with Kronos AI 60-day directional bias enabled).
+# Composites at selection: TSM 0.932, MU 0.913, AVGO 0.887, META 0.868,
+# MSFT 0.818. Re-run the picker any time fundamentals shift.
+core_holdings:
+  - TSM    # Taiwan Semiconductor — chip foundry monopoly, AI tailwind
+  - MU     # Micron — memory cycle leader, +196% YoY revenue growth
+  - AVGO   # Broadcom — AI/networking + custom silicon, dividend
+  - META   # Meta — platform franchise, Kronos AI bullish 60d
+  - MSFT   # Microsoft — durable moat (46% op-margin), Kronos AI bullish 60d
 tickers_crypto:
 - BTC/USD
 - ETH/USD
