@@ -374,15 +374,25 @@ def cmd_backtest_stocks(days_back: int = 180, capital: float = 1500.0,
         "wider_target": {"default_target_pct": 0.15, "partial_exit_threshold": 0.07},
     }
 
+    # Each variant runs independently — a transient Alpaca outage on one
+    # must not throw away the hours already spent on the others. Catch and
+    # log the failure, then continue.
     results = {}
+    failures: dict[str, str] = {}
     for label, params in variants.items():
         print(f"\n=== Variant: {label} ===")
-        results[label] = run_backtest(
-            tickers=tickers, days_back=days_back, starting_capital=capital,
-            params=params, enable_kronos=enable_kronos, enable_news=enable_news,
-            enable_llm=enable_llm, enable_bayesian=enable_bayesian,
-        )
-        print(results[label].summary())
+        try:
+            results[label] = run_backtest(
+                tickers=tickers, days_back=days_back, starting_capital=capital,
+                params=params, enable_kronos=enable_kronos, enable_news=enable_news,
+                enable_llm=enable_llm, enable_bayesian=enable_bayesian,
+            )
+            print(results[label].summary())
+        except Exception as e:
+            failures[label] = str(e)
+            print(f"  ⚠ variant '{label}' failed: {e}")
+            log_event("backtest", "variant_failed",
+                      {"label": label, "error": str(e)[:300]}, result="degraded")
 
     print("\n" + "=" * 60)
     print(f"  COMPARISON SUMMARY ({sig_label})")
@@ -396,6 +406,8 @@ def cmd_backtest_stocks(days_back: int = 180, capital: float = 1500.0,
               f"{r.max_drawdown*100:.2f}%   "
               f"{r.total_trades:>4}     "
               f"{r.win_rate*100:.1f}%")
+    if failures:
+        print(f"\n  Variants that failed: {', '.join(failures)}")
     if results:
         spy = list(results.values())[0].spy_buy_hold_return
         print(f"\n  Buy-and-hold SPY: {spy*100:+.2f}%")
