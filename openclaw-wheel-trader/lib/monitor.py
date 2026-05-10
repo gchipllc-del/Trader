@@ -49,14 +49,35 @@ def _save_positions(positions: list[dict]):
     _store_save(positions, POSITIONS_PATH)
 
 
+# Module-level mtime caches — settings/strategy YAMLs are read many times
+# per monitor cycle (per-position helpers + heartbeat watchdog + Hermes).
+# Re-parse only when the file actually changes on disk. Tests that
+# monkeypatch _load_settings replace the function entirely, bypassing the
+# cache — that path is unaffected.
+_settings_cache: tuple[float, dict] | None = None
+_strategy_cache: tuple[float, dict] | None = None
+
+
 def _load_settings() -> dict:
+    global _settings_cache
+    mtime = CONFIG_PATH.stat().st_mtime
+    if _settings_cache is not None and _settings_cache[0] == mtime:
+        return _settings_cache[1]
     with open(CONFIG_PATH) as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+    _settings_cache = (mtime, cfg)
+    return cfg
 
 
 def _load_strategy() -> dict:
+    global _strategy_cache
+    mtime = STRATEGY_PATH.stat().st_mtime
+    if _strategy_cache is not None and _strategy_cache[0] == mtime:
+        return _strategy_cache[1]
     with open(STRATEGY_PATH) as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+    _strategy_cache = (mtime, cfg)
+    return cfg
 
 
 # ============================================================

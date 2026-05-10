@@ -45,6 +45,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from agents._signal_helpers import coerce_float as _coerce, extract_field as _extract
 from lib.audit import log_event
 from lib.memory_palace import diary_write
 
@@ -67,30 +68,6 @@ class BearSignal:
     name: str
     weight: int
     evidence: str
-
-
-def _coerce(value: Any, default: float = 0.0) -> float:
-    """Tolerant float coercion — bears never crash on a None/string field."""
-    try:
-        if value is None:
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _extract(candidate: Any, *keys: str, default: Any = None) -> Any:
-    """Read a field from either a dict or a dataclass-like object."""
-    if isinstance(candidate, dict):
-        for k in keys:
-            if k in candidate and candidate[k] is not None:
-                return candidate[k]
-        return default
-    for k in keys:
-        v = getattr(candidate, k, None)
-        if v is not None:
-            return v
-    return default
 
 
 class BearAgent:

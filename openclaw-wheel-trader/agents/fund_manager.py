@@ -54,17 +54,6 @@ class FundManagerAction:
     suggested_amount: float = 0.0   # dollars to trim, if applicable
 
 
-def _ticker_sector_map(positions: list[dict]) -> dict[str, str]:
-    """Group positions by sector. Falls back to 'unknown' if not tagged.
-
-    Sector data is set upstream by the screener (alpha_vantage_client). If
-    a position lacks it (e.g. crypto, older entries pre-tagging), we
-    bucket it as 'unknown' rather than guess.
-    """
-    return {p.get("ticker", "?"): str(p.get("sector", "unknown")).lower()
-            for p in positions if p.get("ticker")}
-
-
 class FundManager:
     """Reviews the entire open book once per cycle. Cannot execute; emits
     recommendations consumed by the monitor."""
@@ -126,6 +115,7 @@ class FundManager:
 
         # ── Sector concentration ────────────────────────────────────────
         sector_value: dict[str, float] = {}
+        sector_tickers: dict[str, list[str]] = {}
         for p in opens:
             sector = str(p.get("sector", "unknown")).lower()
             mv = float(p.get("entry_price", 0) or 0) * float(p.get("shares", 0) or 0)
@@ -133,14 +123,13 @@ class FundManager:
             if p.get("market_value"):
                 mv = float(p["market_value"])
             sector_value[sector] = sector_value.get(sector, 0.0) + mv
+            sector_tickers.setdefault(sector, []).append(p.get("ticker", "?"))
 
         sector_pct = {s: v / bankroll for s, v in sector_value.items()}
         for sector, pct in sector_pct.items():
             if sector == "unknown":
                 continue  # don't act on bucketed-unknowns
             if pct > max_sector_pct:
-                tickers = [p.get("ticker") for p in opens
-                           if str(p.get("sector", "")).lower() == sector]
                 excess = (pct - max_sector_pct) * bankroll
                 actions.append(FundManagerAction(
                     type="SECTOR_TRIM",
@@ -149,7 +138,7 @@ class FundManager:
                         f"Sector '{sector}' is {pct:.1%} of bankroll, "
                         f"over {max_sector_pct:.0%} limit — trim ~${excess:.0f}"
                     ),
-                    affected_tickers=tickers,
+                    affected_tickers=sector_tickers.get(sector, []),
                     suggested_amount=excess,
                 ))
 

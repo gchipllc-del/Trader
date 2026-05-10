@@ -22,28 +22,39 @@ import yaml
 from agents.strategy_agent import StrategyAgent
 from agents.risk_agent import RiskAgent
 from agents.compliance_agent import ComplianceAgent
-from agents.bear_agent import BearAgent
-from agents.bull_agent import BullAgent, combine_bull_bear
+from agents.bull_agent import adversarial_review
 from lib.audit import log_event
-from lib.memory_palace import diary_write, get_current_regime
+from lib.memory_palace import diary_write
 from lib.screener import WheelCandidate
 
 
 strategy = StrategyAgent()
 risk = RiskAgent()
 compliance = ComplianceAgent()
-bear = BearAgent()
-bull = BullAgent()
 
 STRATEGY_PATH = Path(__file__).parent.parent / "config" / "wheel_strategy.yaml"
 
+# Module-level cache for LLM config — re-parsed only when the YAML's mtime
+# changes. _llm_advisory_vote runs once per candidate inside a scan loop;
+# without this each candidate re-reads + re-parses the same file.
+_llm_cfg_cache: tuple[float, dict] | None = None
+
 
 def _load_llm_config() -> dict:
+    global _llm_cfg_cache
+    try:
+        mtime = STRATEGY_PATH.stat().st_mtime
+    except OSError:
+        return {}
+    if _llm_cfg_cache is not None and _llm_cfg_cache[0] == mtime:
+        return _llm_cfg_cache[1]
     try:
         with open(STRATEGY_PATH) as f:
-            return (yaml.safe_load(f) or {}).get("llm", {}) or {}
+            cfg = (yaml.safe_load(f) or {}).get("llm", {}) or {}
     except Exception:
         return {}
+    _llm_cfg_cache = (mtime, cfg)
+    return cfg
 
 
 def _llm_advisory_vote(
@@ -195,14 +206,12 @@ def seek_consensus(
 
     # Step 4: Bull/Bear adversarial scoring (deterministic, no LLM cost).
     # Inspired by TauricResearch/TradingAgents bullish/bearish researcher
-    # debate. Both agents read the same candidate fields; bear can VETO
-    # or DOWNSIZE, bull can suggest BOOST when its case materially
-    # exceeds bear's. combine_bull_bear is asymmetric: bear always wins
-    # ties — never let bull's enthusiasm override a bear veto.
-    regime_now = get_current_regime() or "unknown"
-    bear_review = bear.review(candidate, regime=regime_now)
-    bull_review = bull.review(candidate, regime=regime_now)
-    combined = combine_bull_bear(bull_review, bear_review)
+    # debate. Asymmetric — bear can VETO or DOWNSIZE, bull can only
+    # BOOST when its case materially exceeds bear's. Bear always wins ties.
+    review = adversarial_review(candidate)
+    bear_review = review["bear_review"]
+    bull_review = review["bull_review"]
+    combined = review["combined"]
 
     if combined["decision"] == "VETO":
         log_event("consensus", "vetoed_by_bear", {

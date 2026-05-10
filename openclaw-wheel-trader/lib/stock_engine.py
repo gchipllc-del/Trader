@@ -58,14 +58,34 @@ PHASE_2_THRESHOLD = 5000   # Start selling CSPs on cheap stocks
 PHASE_3_THRESHOLD = 10000  # Full Wheel on bigger tickers
 
 
+# Module-level mtime caches — both YAMLs are read 10+ times across a single
+# scan (per-ticker code paths consult thresholds, core-holdings sets, etc.).
+# Tests that monkeypatch _load_settings replace the function, bypassing
+# the cache entirely — that path is unaffected.
+_settings_cache: tuple[float, dict] | None = None
+_strategy_cache: tuple[float, dict] | None = None
+
+
 def _load_settings() -> dict:
+    global _settings_cache
+    mtime = CONFIG_PATH.stat().st_mtime
+    if _settings_cache is not None and _settings_cache[0] == mtime:
+        return _settings_cache[1]
     with open(CONFIG_PATH) as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+    _settings_cache = (mtime, cfg)
+    return cfg
 
 
 def _load_strategy() -> dict:
+    global _strategy_cache
+    mtime = STRATEGY_PATH.stat().st_mtime
+    if _strategy_cache is not None and _strategy_cache[0] == mtime:
+        return _strategy_cache[1]
     with open(STRATEGY_PATH) as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+    _strategy_cache = (mtime, cfg)
+    return cfg
 
 
 def _load_positions() -> list[dict]:
@@ -991,15 +1011,13 @@ def execute_stock_buy(
     # researcher debate. Bear can VETO/DOWNSIZE; bull can BOOST when its case
     # materially exceeds bear's. Asymmetric: bear always wins.
     try:
-        from agents.bear_agent import BearAgent
-        from agents.bull_agent import BullAgent, combine_bull_bear
-        from lib.memory_palace import get_current_regime
-        regime_now = get_current_regime() or "unknown"
-        bear_review = BearAgent().review(candidate, regime=regime_now)
-        bull_review = BullAgent().review(candidate, regime=regime_now)
-        combined = combine_bull_bear(bull_review, bear_review)
-        decision = combined["decision"]
-        size_mult = float(combined["size_multiplier"])
+        from agents.bull_agent import adversarial_review
+        review = adversarial_review(candidate)
+        decision = review["decision"]
+        size_mult = review["size_multiplier"]
+        bear_review = review["bear_review"]
+        bull_review = review["bull_review"]
+        combined = review["combined"]
 
         if decision == "VETO":
             log_event("stock_engine", "bear_veto", {

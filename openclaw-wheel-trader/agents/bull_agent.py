@@ -46,6 +46,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from agents._signal_helpers import coerce_float as _coerce, extract_field as _extract
 from lib.audit import log_event
 from lib.memory_palace import diary_write
 
@@ -69,30 +70,6 @@ class BullSignal:
     name: str
     weight: int
     evidence: str
-
-
-def _coerce(value: Any, default: float = 0.0) -> float:
-    """Tolerant float coercion — never crash on a None/string field."""
-    try:
-        if value is None:
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _extract(candidate: Any, *keys: str, default: Any = None) -> Any:
-    """Read a field from either a dict or a dataclass-like object."""
-    if isinstance(candidate, dict):
-        for k in keys:
-            if k in candidate and candidate[k] is not None:
-                return candidate[k]
-        return default
-    for k in keys:
-        v = getattr(candidate, k, None)
-        if v is not None:
-            return v
-    return default
 
 
 class BullAgent:
@@ -303,4 +280,48 @@ def combine_bull_bear(
         "reasoning": (
             f"bull {bull_score}/bear {bear_score} (delta {delta:+d}) → no adjustment"
         ),
+    }
+
+
+# ── Module-level singletons for adversarial_review ─────────────────
+# Constructed once. The agents are stateless wrt tickers; re-instantiating
+# per call (as stock_engine and consensus did historically) is wasteful.
+_BEAR = None
+_BULL = None
+
+
+def adversarial_review(candidate) -> dict:
+    """Run bear + bull review on the same candidate and combine.
+
+    Used by both consensus.seek_consensus and stock_engine entry paths.
+    Both call sites need the same combined decision, plus the individual
+    reviews for logging — return them all in one dict.
+
+    Returns:
+        {
+            "decision": "VETO" | "DOWNSIZE" | "BOOST" | "PASS",
+            "size_multiplier": float,
+            "bear_review": dict,
+            "bull_review": dict,
+            "combined": dict,
+        }
+    """
+    global _BEAR, _BULL
+    if _BEAR is None:
+        from agents.bear_agent import BearAgent
+        _BEAR = BearAgent()
+    if _BULL is None:
+        _BULL = BullAgent()
+
+    from lib.memory_palace import get_current_regime
+    regime = get_current_regime() or "unknown"
+    bear_review = _BEAR.review(candidate, regime=regime)
+    bull_review = _BULL.review(candidate, regime=regime)
+    combined = combine_bull_bear(bull_review, bear_review)
+    return {
+        "decision": combined["decision"],
+        "size_multiplier": float(combined["size_multiplier"]),
+        "bear_review": bear_review,
+        "bull_review": bull_review,
+        "combined": combined,
     }

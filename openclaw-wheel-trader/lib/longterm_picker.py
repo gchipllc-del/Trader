@@ -434,17 +434,41 @@ def _build_why(f: dict, q: float, g: float, m: float, mom: float, val: float) ->
     return " — ".join(bits)
 
 
-def score_universe(tickers: list[str], *, use_kronos: bool = True) -> list[TickerScore]:
-    """Score a list of tickers. Returns list sorted by composite DESC."""
+def score_universe(
+    tickers: list[str],
+    *,
+    use_kronos: bool = True,
+    max_workers: int = 5,
+) -> list[TickerScore]:
+    """Score a list of tickers in parallel. Returns list sorted by composite DESC.
+
+    Each ticker triggers an independent yfinance (+ optionally Alpaca/Kronos)
+    fetch — embarrassingly parallel. ``max_workers=5`` keeps us comfortably
+    under both providers' rate limits while giving a ~5x speedup on a
+    50-ticker universe.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     log_event("longterm_picker", "scoring_started",
-              {"n_tickers": len(tickers), "use_kronos": use_kronos})
+              {"n_tickers": len(tickers), "use_kronos": use_kronos,
+               "max_workers": max_workers})
     scores: list[TickerScore] = []
-    for t in tickers:
-        try:
-            scores.append(score_ticker(t, use_kronos=use_kronos))
-        except Exception as e:
-            log_event("longterm_picker", "ticker_failed",
-                      {"ticker": t, "error": str(e)[:200]}, result="degraded")
+    if not tickers:
+        return scores
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(score_ticker, t, use_kronos=use_kronos): t
+            for t in tickers
+        }
+        for fut in as_completed(futures):
+            t = futures[fut]
+            try:
+                scores.append(fut.result())
+            except Exception as e:
+                log_event("longterm_picker", "ticker_failed",
+                          {"ticker": t, "error": str(e)[:200]}, result="degraded")
+
     scores.sort(key=lambda s: s.composite, reverse=True)
     log_event("longterm_picker", "scoring_complete",
               {"n_scored": len(scores), "top_5": [s.ticker for s in scores[:5]]})
