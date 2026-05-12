@@ -199,10 +199,20 @@ def score_cc_candidate(
     iv_data: dict,
     cost_basis: float,
     config: dict,
+    original_purchase_price: float | None = None,
 ) -> WheelCandidate | None:
     """
     Score a call option as a Wheel CC candidate.
     Similar to CSP scoring but for calls at resistance zones, above cost basis.
+
+    Two floors are enforced on the strike:
+      * adjusted ``cost_basis`` (existing behavior, reduced by accumulated CC
+        premiums) — so each CC nets income above the running basis
+      * ``original_purchase_price`` (new, optional) — the unadjusted broker
+        fill price at the time of CSP assignment. Prevents the strike from
+        ratcheting below the actual capital invested as cost_basis drifts
+        down across multiple CC cycles. Falls back to cost_basis if not
+        provided (back-compat).
     """
     cc_cfg = config["cc"]
 
@@ -213,8 +223,14 @@ def score_cc_candidate(
     ask = option.get("ask", 0)
     strike = option.get("strike", 0)
 
-    # Must be above cost basis
+    # Must be above adjusted cost basis (running, includes CC-premium credit)
     if strike <= cost_basis:
+        return None
+    # Must also be above the original purchase price (hard floor that does
+    # not drift). Defaults to cost_basis if caller didn't pass it, which
+    # makes this a no-op for back-compat.
+    hard_floor = original_purchase_price if original_purchase_price is not None else cost_basis
+    if strike < hard_floor:
         return None
 
     if not (cc_cfg["delta_min"] <= delta <= cc_cfg["delta_max"]):
@@ -302,14 +318,36 @@ def score_cc_candidate(
     )
 
 
+def _risk_adjusted_yield(c: WheelCandidate) -> float:
+    """Annualized premium yield discounted by assignment-probability.
+
+    A 0.35-delta candidate ~35% likely to be assigned has its yield
+    weighted by ~0.65, vs a 0.20-delta candidate weighted by ~0.80.
+    Compare two candidates of identical raw annualized return: the
+    safer one ranks higher.
+
+    Pattern from alpacahq/options-wheel scoring — they use
+    ``(1 - |Δ|) * (250 / (dte + 5)) * (bid/strike)``; we already have
+    ``annualized_return`` precomputed, so the simpler equivalent is
+    ``annualized_return * (1 - |Δ|)``.
+    """
+    return float(c.annualized_return or 0) * max(0.0, 1.0 - abs(float(c.delta or 0)))
+
+
 def rank_candidates(candidates: list[WheelCandidate]) -> list[WheelCandidate]:
     """
-    Rank candidates by composite score, then annualized return.
+    Rank candidates by composite score, then risk-adjusted yield.
     Only returns tradeable candidates.
+
+    Tiebreaker change (alpacahq/options-wheel pattern): raw
+    annualized_return doesn't account for assignment probability, so a
+    juicy 0.35-delta candidate would outrank a safer 0.20-delta one at
+    equal raw yield. The risk-adjusted score multiplies yield by
+    ``(1 - |Δ|)`` so the safer trade wins ties.
     """
     tradeable = [c for c in candidates if c.tradeable]
     tradeable.sort(
-        key=lambda c: (c.composite_score, c.annualized_return),
+        key=lambda c: (c.composite_score, _risk_adjusted_yield(c)),
         reverse=True,
     )
     return tradeable

@@ -126,12 +126,36 @@ class AlpacaClient:
             "mode": settings.get("mode"),
         }, result="success")
 
+    # ── User-Agent identification ──────────────────────────────────
+    # Stamping every Alpaca request with a unique UA makes it easy to
+    # filter the bot's traffic in Alpaca's support / abuse logs when
+    # debugging rate-limit or order-routing issues. Pattern from
+    # alpacahq/options-wheel core/user_agent_mixin.py.
+    _USER_AGENT = "OPENCLAW-WHEEL"
+
+    @classmethod
+    def _ua_mixin(cls):
+        """Mixin that injects the bot's User-Agent into Alpaca SDK requests.
+
+        Built lazily so import-time failures in the alpaca SDK don't
+        bubble up to module load. Returns a mixin class; combine with
+        any concrete SDK client via multiple inheritance.
+        """
+        class _UAMixin:
+            def _get_default_headers(self) -> dict:
+                headers = super()._get_default_headers()
+                headers["User-Agent"] = cls._USER_AGENT
+                return headers
+        return _UAMixin
+
     def _get_trading_client(self):
         """Lazy-load the Alpaca trading client."""
         if self._trading_client is None:
             try:
                 from alpaca.trading.client import TradingClient
-                self._trading_client = TradingClient(
+                class _Stamped(self._ua_mixin(), TradingClient):
+                    pass
+                self._trading_client = _Stamped(
                     self.api_key, self.secret_key, paper=("paper" in self.base_url)
                 )
             except ImportError:
@@ -144,7 +168,9 @@ class AlpacaClient:
         """Lazy-load the Alpaca stock historical data client."""
         if self._stock_data_client is None:
             from alpaca.data.historical import StockHistoricalDataClient
-            self._stock_data_client = StockHistoricalDataClient(
+            class _Stamped(self._ua_mixin(), StockHistoricalDataClient):
+                pass
+            self._stock_data_client = _Stamped(
                 self.api_key, self.secret_key
             )
         return self._stock_data_client
@@ -153,7 +179,9 @@ class AlpacaClient:
         """Lazy-load the Alpaca option historical data client."""
         if self._option_data_client is None:
             from alpaca.data.historical import OptionHistoricalDataClient
-            self._option_data_client = OptionHistoricalDataClient(
+            class _Stamped(self._ua_mixin(), OptionHistoricalDataClient):
+                pass
+            self._option_data_client = _Stamped(
                 self.api_key, self.secret_key
             )
         return self._option_data_client
@@ -166,7 +194,9 @@ class AlpacaClient:
         """
         if not hasattr(self, "_crypto_data_client") or self._crypto_data_client is None:
             from alpaca.data.historical import CryptoHistoricalDataClient
-            self._crypto_data_client = CryptoHistoricalDataClient()
+            class _Stamped(self._ua_mixin(), CryptoHistoricalDataClient):
+                pass
+            self._crypto_data_client = _Stamped()
         return self._crypto_data_client
 
     def get_crypto_bars(
@@ -682,3 +712,51 @@ class AlpacaClient:
             "count": count,
         }, result="success")
         return count
+
+    def liquidate_wheel_book(self) -> dict:
+        """Planned wheel reset — close options first, then equity.
+
+        Unlike ``close_all_positions`` (which fires every close in
+        parallel), this sequences the unwind to avoid creating an
+        uncovered short call mid-process: if Alpaca closes shares
+        before the short call attached to them, the call goes naked
+        for a brief window. Sequence: options first → equity second.
+
+        Pattern lifted from alpacahq/options-wheel
+        core/broker_client.py.liquidate_all_positions.
+
+        Returns ``{"options_closed", "stocks_closed", "errors"}``.
+        """
+        client = self._get_trading_client()
+        self.limiter.wait_if_needed()
+        positions = list(client.get_all_positions())
+
+        from alpaca.trading.enums import AssetClass
+        options = [p for p in positions if getattr(p, "asset_class", None) == AssetClass.US_OPTION]
+        stocks = [p for p in positions if getattr(p, "asset_class", None) != AssetClass.US_OPTION]
+
+        result = {"options_closed": 0, "stocks_closed": 0, "errors": []}
+
+        for p in options:
+            try:
+                self.limiter.wait_if_needed()
+                client.close_position(p.symbol)
+                result["options_closed"] += 1
+            except Exception as e:
+                result["errors"].append(f"option:{p.symbol}: {e}")
+
+        for p in stocks:
+            try:
+                self.limiter.wait_if_needed()
+                client.close_position(p.symbol)
+                result["stocks_closed"] += 1
+            except Exception as e:
+                result["errors"].append(f"stock:{p.symbol}: {e}")
+
+        log_event("wheel_reset", "liquidation_complete", {
+            "options_closed": result["options_closed"],
+            "stocks_closed": result["stocks_closed"],
+            "errors": result["errors"][:3],
+        }, result="success" if not result["errors"] else "partial")
+
+        return result

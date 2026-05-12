@@ -632,6 +632,50 @@ def cmd_kill(reason: str = "manual_cli"):
         print("  ✅ Clean shutdown.")
 
 
+def cmd_wheel_reset(confirm: bool = False):
+    """Planned wheel reset — close options first, then equity. Use when
+    the bot has gotten into a weird state (illegal wheel stage, manual
+    positions added, recovery from a kill switch) and you want a
+    clean-slate restart. Unlike ``kill``, this is a planned operation —
+    cron and crontab are left alone, audit logs as a normal event.
+
+    Without ``--confirm``, prints what would be liquidated and exits.
+    """
+    from lib.alpaca_client import AlpacaClient
+    from lib.wheel_state import classify_book
+
+    client = AlpacaClient()
+    positions = client.get_positions()
+    if not positions:
+        print("✅ No positions held — nothing to reset.")
+        return
+
+    book = classify_book(positions, raise_on_illegal=False)
+    print(f"\n=== WHEEL RESET — {len(positions)} position(s) across {len(book)} underlying(s) ===")
+    for underlying, state in sorted(book.items()):
+        flags = " [ILLEGAL]" if state.stage == "illegal" else ""
+        print(f"  {underlying:6s} {state.stage}{flags}")
+        for leg in state.legs:
+            kind = leg.kind.upper()
+            print(f"    └─ {leg.symbol:20s} {kind:5s} qty={leg.qty:+g} mv=${leg.market_value:,.2f}")
+
+    if not confirm:
+        print("\n[DRY RUN] Re-run with --confirm to actually liquidate.")
+        print("         Order: cancel all open orders → close OPTIONS → close STOCKS.")
+        return
+
+    print("\n⚠️  Liquidating in order: options first, then equity ...")
+    cancelled = client.cancel_all_orders()
+    print(f"  Cancelled {cancelled} open order(s)")
+    result = client.liquidate_wheel_book()
+    print(f"  Closed {result['options_closed']} option position(s)")
+    print(f"  Closed {result['stocks_closed']} stock position(s)")
+    if result["errors"]:
+        print(f"  ⚠️  {len(result['errors'])} error(s): {result['errors'][:3]}")
+    else:
+        print("  ✅ Clean reset.")
+
+
 def cmd_backtest(ticker: str = "SPY", simulations: int = 500, capital: float = 0):
     """Run backtest with Monte Carlo simulation on real historical data."""
     from lib.alpaca_client import AlpacaClient
@@ -1995,7 +2039,8 @@ def cmd_longterm_pick(themes: str | None = None, top_n: int = 15,
 def main():
     parser = argparse.ArgumentParser(description="OpenClaw Wheel Strategy Trader")
     parser.add_argument("command",
-                        choices=["scan", "monitor", "backtest", "kill", "status",
+                        choices=["scan", "monitor", "backtest", "kill", "wheel-reset",
+                                 "status",
                                  "chaos", "migrate", "dashboard", "hermes", "pdt",
                                  "kronos", "news", "calibrate", "pred-scan",
                                  "forecast", "kelly", "llm", "correlation",
@@ -2020,6 +2065,8 @@ def main():
                         help="backtest-stocks: enable LLM forecast signal only")
     parser.add_argument("--ticker", default="SPY", help="Ticker for backtest/kronos/news")
     parser.add_argument("--reason", default="manual_cli", help="Reason for kill switch")
+    parser.add_argument("--confirm", action="store_true",
+                        help="wheel-reset: required to actually liquidate (dry-run otherwise)")
     parser.add_argument("--port", type=int, default=5051,
                         help="Dashboard web server port (default 5051; polybot uses 5050)")
     parser.add_argument("--full", action="store_true", help="Include quant scores in status output")
@@ -2096,6 +2143,8 @@ def main():
         cmd_monitor()
     elif args.command == "kill":
         cmd_kill(args.reason)
+    elif args.command == "wheel-reset":
+        cmd_wheel_reset(confirm=args.confirm)
     elif args.command == "backtest":
         cmd_backtest(args.ticker, simulations=args.simulations, capital=args.capital)
     elif args.command == "chaos":

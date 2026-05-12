@@ -437,6 +437,13 @@ def run_monitoring_check(client: AlpacaClient) -> dict:
                 pos["assigned_at"] = datetime.now(timezone.utc).isoformat()
                 pos["assigned_shares"] = assignment["shares"]
                 pos["cost_basis"] = assignment["avg_price"] - pos.get("premium_collected", 0)
+                # original_purchase_price is the unadjusted broker fill price —
+                # we use it as the HARD CC strike floor so future CCs can't
+                # ratchet below the actual capital we put in, even after
+                # premiums "net out" the running cost_basis. Wave-D
+                # alpacahq/options-wheel insight: cost_basis math is good
+                # for tax/P&L reporting, bad for assignment-risk decisions.
+                pos["original_purchase_price"] = float(assignment["avg_price"])
 
                 summary["actions"].append(assignment)
                 summary["alerts"].append(f"📋 {ticker}: ASSIGNED at {pos.get('strike')}")

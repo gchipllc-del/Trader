@@ -106,6 +106,12 @@ def scan_for_ccs(
     for pos in assigned:
         ticker = pos.get("ticker", "")
         cost_basis = pos.get("cost_basis", 0)
+        # Hard floor: prevent CC strikes from drifting below the original
+        # broker fill price, even after multiple CC cycles compound the
+        # cost-basis-adjusted-by-premium accounting. Back-compat: legacy
+        # positions without this field fall back to the current (adjusted)
+        # cost_basis — same behavior as before.
+        original_purchase_price = pos.get("original_purchase_price", cost_basis)
 
         if ticker not in daily_data or ticker not in options_chains:
             continue
@@ -119,6 +125,7 @@ def scan_for_ccs(
                 iv_data=iv_data.get(ticker, {}),
                 cost_basis=cost_basis,
                 config=config,
+                original_purchase_price=original_purchase_price,
             )
             if candidate:
                 # CLAUDE.md rule: never sell options expiring through an earnings date
