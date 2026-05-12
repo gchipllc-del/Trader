@@ -178,8 +178,14 @@ tickers:
 csp:
   delta_min: -0.35
   delta_max: -0.2
-  dte_min: 30
-  dte_max: 45
+  # Shifted from 30-45 to 21-28 (2026-05-12). Per-day theta capture
+  # is ~1.7× the previous band; gamma still manageable at 21+ DTE
+  # with the existing bull/bear, LLM, Kronos, Bayesian defense stack
+  # in front. See `python main.py wheel-dte-sweep` for the rationale.
+  # Watch list: realized assignment-into-loser frequency over the
+  # next 30 days; revert toward 28-35 if it materially rises.
+  dte_min: 21
+  dte_max: 28
   min_annualized_return: 0.12
   # Reject suspiciously rich premiums — corporate actions (special divs,
   # mergers, buyouts) and stale quotes can produce contracts that look
@@ -192,8 +198,11 @@ csp:
 cc:
   delta_min: 0.2
   delta_max: 0.35
-  dte_min: 30
-  dte_max: 45
+  # Shifted from 30-45 to 21-28 (2026-05-12). Same rationale as CSP
+  # band — match the CSP timing so wheel cycles complete in roughly
+  # one month instead of 1-1.5, and per-day theta on CCs ~1.7× higher.
+  dte_min: 21
+  dte_max: 28
   min_annualized_return: 0.1
   max_annualized_return: 1.5
   min_open_interest: 100
