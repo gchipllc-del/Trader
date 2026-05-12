@@ -113,6 +113,11 @@ def score_csp_candidate(
     annualized = (mid_price * 100 / collateral) * (365 / max(dte, 1))
     if annualized < csp_cfg["min_annualized_return"]:
         return None
+    max_ann = csp_cfg.get("max_annualized_return")
+    if max_ann is not None and annualized > max_ann:
+        # Likely bad data (stale quote, corporate action, special div) —
+        # reject to avoid putting capital behind a phantom yield.
+        return None
 
     # --- Trend Score (0-3) ---
     mtf = multi_timeframe_analysis(weekly_df, daily_df)
@@ -230,6 +235,10 @@ def score_cc_candidate(
 
     annualized = (mid_price * 100 / share_value) * (365 / max(dte, 1))
     if annualized < cc_cfg["min_annualized_return"]:
+        return None
+    max_ann = cc_cfg.get("max_annualized_return")
+    if max_ann is not None and annualized > max_ann:
+        # Likely bad data (stale quote, corporate action, special div).
         return None
 
     # --- Trend Score ---

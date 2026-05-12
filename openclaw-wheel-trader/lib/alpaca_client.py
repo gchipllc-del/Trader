@@ -353,21 +353,39 @@ class AlpacaClient:
             params["strike_price_lte"] = str(strike_price_lte)
 
         request = GetOptionContractsRequest(**params)
-        response = client.get_option_contracts(request)
 
-        contracts = []
-        for c in (response.option_contracts or []):
-            contracts.append({
-                "symbol": c.symbol,
-                "underlying": ticker,
-                "strike": float(c.strike_price),
-                "expiration": str(c.expiration_date),
-                "option_type": str(c.type).split(".")[-1].lower(),
-                "open_interest": int(c.open_interest) if c.open_interest else 0,
-                "status": str(c.status),
-            })
+        # Paginate: Alpaca returns a `next_page_token` when the result set
+        # is larger than a single page (current cap is around 100 rows).
+        # Without this loop, a broad chain scan silently truncates.
+        # Pattern mirrored from alpacahq/options-wheel core/broker_client.py.
+        contracts: list[dict] = []
+        page_token: str | None = None
+        while True:
+            if page_token:
+                request.page_token = page_token
+            response = _retry_on_network_error(
+                lambda: client.get_option_contracts(request)
+            )
+            for c in (response.option_contracts or []):
+                contracts.append({
+                    "symbol": c.symbol,
+                    "underlying": ticker,
+                    "strike": float(c.strike_price),
+                    "expiration": str(c.expiration_date),
+                    "option_type": str(c.type).split(".")[-1].lower(),
+                    "open_interest": int(c.open_interest) if c.open_interest else 0,
+                    "status": str(c.status),
+                })
+            page_token = getattr(response, "next_page_token", None)
+            if not page_token:
+                break
 
         return contracts
+
+    # Alpaca's option-data endpoints cap a single request at ~100 symbols
+    # — beyond that, results are silently truncated. Both get_option_quotes
+    # and get_option_snapshots iterate in 100-symbol chunks.
+    _OPTION_SYMBOL_BATCH = 100
 
     def get_option_quotes(self, option_symbols: list[str]) -> dict[str, dict]:
         """
@@ -384,20 +402,22 @@ class AlpacaClient:
 
         from alpaca.data.requests import OptionLatestQuoteRequest
 
-        self.limiter.wait_if_needed()
         client = self._get_option_data_client()
-
-        request = OptionLatestQuoteRequest(symbol_or_symbols=option_symbols)
-        quotes = client.get_option_latest_quote(request)
-
-        result = {}
-        for sym, q in quotes.items():
-            result[sym] = {
-                "bid": float(q.bid_price) if q.bid_price else 0,
-                "ask": float(q.ask_price) if q.ask_price else 0,
-                "bid_size": int(q.bid_size) if q.bid_size else 0,
-                "ask_size": int(q.ask_size) if q.ask_size else 0,
-            }
+        result: dict[str, dict] = {}
+        for i in range(0, len(option_symbols), self._OPTION_SYMBOL_BATCH):
+            batch = option_symbols[i:i + self._OPTION_SYMBOL_BATCH]
+            self.limiter.wait_if_needed()
+            request = OptionLatestQuoteRequest(symbol_or_symbols=batch)
+            quotes = _retry_on_network_error(
+                lambda: client.get_option_latest_quote(request)
+            )
+            for sym, q in quotes.items():
+                result[sym] = {
+                    "bid": float(q.bid_price) if q.bid_price else 0,
+                    "ask": float(q.ask_price) if q.ask_price else 0,
+                    "bid_size": int(q.bid_size) if q.bid_size else 0,
+                    "ask_size": int(q.ask_size) if q.ask_size else 0,
+                }
 
         return result
 
@@ -413,30 +433,32 @@ class AlpacaClient:
 
         from alpaca.data.requests import OptionSnapshotRequest
 
-        self.limiter.wait_if_needed()
         client = self._get_option_data_client()
-
-        request = OptionSnapshotRequest(symbol_or_symbols=option_symbols)
-        snapshots = client.get_option_snapshot(request)
-
-        result = {}
-        for sym, snap in snapshots.items():
-            entry = {
-                "bid": 0, "ask": 0,
-                "delta": 0, "gamma": 0, "theta": 0, "vega": 0,
-                "implied_volatility": 0,
-            }
-            if snap.latest_quote:
-                entry["bid"] = float(snap.latest_quote.bid_price or 0)
-                entry["ask"] = float(snap.latest_quote.ask_price or 0)
-            if snap.greeks:
-                entry["delta"] = float(snap.greeks.delta or 0)
-                entry["gamma"] = float(snap.greeks.gamma or 0)
-                entry["theta"] = float(snap.greeks.theta or 0)
-                entry["vega"] = float(snap.greeks.vega or 0)
-            if snap.implied_volatility is not None:
-                entry["implied_volatility"] = float(snap.implied_volatility)
-            result[sym] = entry
+        result: dict[str, dict] = {}
+        for i in range(0, len(option_symbols), self._OPTION_SYMBOL_BATCH):
+            batch = option_symbols[i:i + self._OPTION_SYMBOL_BATCH]
+            self.limiter.wait_if_needed()
+            request = OptionSnapshotRequest(symbol_or_symbols=batch)
+            snapshots = _retry_on_network_error(
+                lambda: client.get_option_snapshot(request)
+            )
+            for sym, snap in snapshots.items():
+                entry = {
+                    "bid": 0, "ask": 0,
+                    "delta": 0, "gamma": 0, "theta": 0, "vega": 0,
+                    "implied_volatility": 0,
+                }
+                if snap.latest_quote:
+                    entry["bid"] = float(snap.latest_quote.bid_price or 0)
+                    entry["ask"] = float(snap.latest_quote.ask_price or 0)
+                if snap.greeks:
+                    entry["delta"] = float(snap.greeks.delta or 0)
+                    entry["gamma"] = float(snap.greeks.gamma or 0)
+                    entry["theta"] = float(snap.greeks.theta or 0)
+                    entry["vega"] = float(snap.greeks.vega or 0)
+                if snap.implied_volatility is not None:
+                    entry["implied_volatility"] = float(snap.implied_volatility)
+                result[sym] = entry
 
         return result
 

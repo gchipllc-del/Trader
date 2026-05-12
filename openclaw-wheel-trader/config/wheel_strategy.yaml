@@ -181,6 +181,11 @@ csp:
   dte_min: 30
   dte_max: 45
   min_annualized_return: 0.12
+  # Reject suspiciously rich premiums — corporate actions (special divs,
+  # mergers, buyouts) and stale quotes can produce contracts that look
+  # like 200%+ annualized yield. Without a ceiling, the bad-data row
+  # ranks #1 and gets selected. Pattern from alpacahq/options-wheel.
+  max_annualized_return: 1.5
   min_open_interest: 100
   max_bid_ask_spread: 0.15
   strike_zone: support
@@ -190,6 +195,7 @@ cc:
   dte_min: 30
   dte_max: 45
   min_annualized_return: 0.1
+  max_annualized_return: 1.5
   min_open_interest: 100
   max_bid_ask_spread: 0.15
   strike_zone: resistance
