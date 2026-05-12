@@ -676,6 +676,101 @@ def cmd_wheel_reset(confirm: bool = False):
         print("  ✅ Clean reset.")
 
 
+def cmd_wheel_dte_sweep(days_back: int = 365, capital: float = 1500.0):
+    """A/B/C/D comparison of wheel performance across DTE bands.
+
+    Runs ``run_wheel_backtest`` against every Phase 1 ticker at four
+    DTE values that map to the policy decision: 35 (current), 28, 21,
+    14, 7. The premium model now scales with vol × √DTE, so per-day
+    theta is honest — short-DTE variants pay less per cycle but more
+    per day, exactly as in real options markets.
+
+    Use ``--lookback`` to override the 365-day window (longer = more
+    statistical confidence, but slower).
+    """
+    import yaml
+    import statistics
+    from lib.alpaca_client import AlpacaClient
+    from lib.backtest import run_wheel_backtest
+
+    cfg_path = Path(__file__).parent / "config" / "wheel_strategy.yaml"
+    with open(cfg_path) as f:
+        strategy = yaml.safe_load(f)
+    tickers = strategy.get("tickers", []) or strategy.get("tickers_phase1", [])
+
+    dte_variants = [35, 28, 21, 14, 7]
+
+    client = AlpacaClient()
+    print(f"\n=== WHEEL DTE SWEEP — {len(tickers)} tickers × {len(dte_variants)} DTE bands ===")
+    print(f"  Lookback:     {days_back} days")
+    print(f"  Starting cap: ${capital:,.0f}")
+    print(f"  Premium model: vol × √DTE (DTE-aware)")
+    print()
+
+    # Fetch bars once per ticker — reuse across DTE variants
+    bars: dict = {}
+    for t in tickers:
+        try:
+            df = client.get_bars([t], timeframe="1Day", limit=days_back + 50)
+            if isinstance(df, dict) and t in df and len(df[t]) > 50:
+                bars[t] = df[t]
+        except Exception as e:
+            print(f"  ⚠ skip {t}: {e}")
+
+    print(f"  Loaded bars for {len(bars)}/{len(tickers)} tickers\n")
+
+    # results[dte][ticker] = BacktestResult
+    results: dict[int, dict[str, "BacktestResult"]] = {dte: {} for dte in dte_variants}
+    for dte in dte_variants:
+        print(f"--- DTE = {dte} ---")
+        for t, df in bars.items():
+            try:
+                r = run_wheel_backtest(
+                    df, initial_capital=capital, dte=dte,
+                    put_delta=-0.25, call_delta=0.25,
+                )
+                results[dte][t] = r
+                print(f"  {t:6s} return={r.total_return:+.1%}  Sharpe={r.sharpe_ratio:+.2f}  "
+                      f"DD={r.max_drawdown:.1%}  trades={r.total_trades}  win={r.win_rate:.0%}")
+            except Exception as e:
+                print(f"  {t:6s} FAILED: {e}")
+
+    # Aggregate across tickers
+    print(f"\n{'=' * 70}")
+    print(f"  COMPARISON SUMMARY (mean across {len(bars)} tickers)")
+    print(f"{'=' * 70}")
+    print(f"{'DTE':<6}{'Return':<12}{'Sharpe':<10}{'Max DD':<10}{'Trades/yr':<12}{'Win %':<8}")
+    for dte in dte_variants:
+        rs = list(results[dte].values())
+        if not rs:
+            continue
+        years = days_back / 365.0
+        mean_return = statistics.mean(r.total_return for r in rs)
+        mean_sharpe = statistics.mean(r.sharpe_ratio for r in rs)
+        mean_dd = statistics.mean(r.max_drawdown for r in rs)
+        mean_trades_yr = statistics.mean(r.total_trades for r in rs) / max(years, 0.01)
+        mean_win = statistics.mean(r.win_rate for r in rs)
+        print(f"{dte:<6}{mean_return:+.1%}     {mean_sharpe:+.2f}     "
+              f"{mean_dd:.1%}     {mean_trades_yr:>5.0f}        {mean_win:.0%}")
+
+    print(f"\n  Recommendation: pick the row with the best risk-adjusted return")
+    print(f"  (highest Sharpe AND a max drawdown you can stomach).")
+
+    # Log for postmortem / audit
+    log_event("wheel_dte_sweep", "complete", {
+        "n_tickers": len(bars),
+        "dte_variants": dte_variants,
+        "days_back": days_back,
+        "summary": {
+            dte: {
+                "mean_return": round(statistics.mean(r.total_return for r in results[dte].values()), 4),
+                "mean_sharpe": round(statistics.mean(r.sharpe_ratio for r in results[dte].values()), 4),
+                "mean_dd": round(statistics.mean(r.max_drawdown for r in results[dte].values()), 4),
+            } for dte in dte_variants if results[dte]
+        },
+    })
+
+
 def cmd_backtest(ticker: str = "SPY", simulations: int = 500, capital: float = 0):
     """Run backtest with Monte Carlo simulation on real historical data."""
     from lib.alpaca_client import AlpacaClient
@@ -2040,7 +2135,7 @@ def main():
     parser = argparse.ArgumentParser(description="OpenClaw Wheel Strategy Trader")
     parser.add_argument("command",
                         choices=["scan", "monitor", "backtest", "kill", "wheel-reset",
-                                 "status",
+                                 "wheel-dte-sweep", "status",
                                  "chaos", "migrate", "dashboard", "hermes", "pdt",
                                  "kronos", "news", "calibrate", "pred-scan",
                                  "forecast", "kelly", "llm", "correlation",
@@ -2145,6 +2240,15 @@ def main():
         cmd_kill(args.reason)
     elif args.command == "wheel-reset":
         cmd_wheel_reset(confirm=args.confirm)
+    elif args.command == "wheel-dte-sweep":
+        # Use --lookback if explicitly passed (Hermes default is 14, which
+        # is way too short for a DTE sweep — needs ≥365 days of bars to
+        # exercise multiple wheel cycles per DTE band).
+        sweep_lookback = args.lookback if args.lookback >= 90 else 365
+        cmd_wheel_dte_sweep(
+            days_back=sweep_lookback,
+            capital=args.capital if args.capital else 1500.0,
+        )
     elif args.command == "backtest":
         cmd_backtest(args.ticker, simulations=args.simulations, capital=args.capital)
     elif args.command == "chaos":

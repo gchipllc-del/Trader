@@ -124,13 +124,58 @@ def simulate_cc_outcome(
         }
 
 
+def _estimated_premium(
+    underlying: float,
+    dte: int,
+    daily_returns: np.ndarray,
+    *,
+    delta_abs: float = 0.25,
+    is_put: bool = True,
+) -> float:
+    """Approximate the premium of a moderately-OTM option.
+
+    The simulation needs a premium that responds *correctly* to DTE so a
+    DTE sweep produces meaningful relative results. The previous flat
+    ``premium_rate = 0.015`` meant a 7-DTE put and a 35-DTE put had
+    identical modeled premium — short-DTE variants looked artificially
+    strong because they cycled 5× more often at the same modeled income.
+
+    Black-Scholes intuition (deep-OTM approximation):
+        premium ≈ S · σ · √T · f(|Δ|)
+
+    where S is the underlying price, σ is annualized realized vol from
+    the price series, T = DTE/365, and f(|Δ|) is a moneyness factor
+    (~0.20 for a 0.25-delta contract). This gets the *shape* right:
+    premium scales with √T and with vol, so longer-dated and
+    higher-vol contracts pay more per contract while shorter-dated
+    contracts pay more *per day* — which is the whole reason to compare
+    DTE bands.
+
+    Falls back to a flat-rate estimate (the historical default) if
+    realized-vol can't be estimated from the input.
+    """
+    if len(daily_returns) < 10:
+        return float(underlying) * 0.015  # back-compat fallback
+    annualized_vol = float(np.std(daily_returns)) * np.sqrt(252)
+    if annualized_vol <= 0 or not np.isfinite(annualized_vol):
+        return float(underlying) * 0.015
+    T = max(dte, 1) / 365.0
+    # Moneyness factor — empirically calibrated against typical OTM
+    # premiums for the 0.20-0.30 delta band Jesse trades. Calls (CC) are
+    # priced slightly cheaper than the equivalent put for the same |Δ|
+    # because of the cost-of-carry asymmetry; we ignore that and treat
+    # both symmetrically — close enough for DTE-comparison purposes.
+    f_delta = max(0.08, min(0.30, 0.20 + (0.25 - delta_abs) * 0.4))
+    return float(underlying) * annualized_vol * np.sqrt(T) * f_delta
+
+
 def run_wheel_backtest(
     daily_df: pd.DataFrame,
     initial_capital: float = 100000,
     put_delta: float = -0.25,
     call_delta: float = 0.25,
     dte: int = 35,
-    premium_rate: float = 0.015,  # Approximate premium as % of strike
+    premium_rate: float | None = None,  # deprecated; set non-None to force flat-rate (back-compat)
     slippage_per_contract: float = 5.0,
     assignment_fee: float = 0.0,
 ) -> BacktestResult:
@@ -141,8 +186,13 @@ def run_wheel_backtest(
     - Every `dte` days, sell a CSP
     - If assigned, sell CCs until called away
     - Track cumulative P/L
+
+    Premium model: by default, uses realized-vol × √DTE pricing (see
+    ``_estimated_premium``). Pass ``premium_rate`` non-None to force
+    the legacy flat-rate model (for back-compat with old callers).
     """
-    returns = daily_df["close"].pct_change().dropna().values
+    daily_returns = daily_df["close"].pct_change().dropna().values
+    returns = daily_returns
     prices = daily_df["close"].values
 
     capital = initial_capital
@@ -163,7 +213,13 @@ def run_wheel_backtest(
         if not holding_shares:
             # Sell CSP
             strike = current_price * (1 + put_delta * 0.1)  # OTM put
-            premium = strike * premium_rate
+            if premium_rate is not None:
+                premium = strike * premium_rate
+            else:
+                premium = _estimated_premium(
+                    strike, dte, daily_returns,
+                    delta_abs=abs(put_delta), is_put=True,
+                )
             exp_price = prices[min(i + dte, len(prices) - 1)]
 
             pnl = premium * 100 - slippage_per_contract
@@ -183,7 +239,16 @@ def run_wheel_backtest(
             # Sell CC
             strike = current_price * (1 - call_delta * 0.1)  # OTM call above
             strike = max(strike, cost_basis * 1.02)  # At least 2% above cost basis
-            premium = current_price * premium_rate * 0.8  # CC premium slightly less
+            if premium_rate is not None:
+                premium = current_price * premium_rate * 0.8  # CC premium slightly less
+            else:
+                # CCs are typically ~85% of the equivalent put premium for
+                # the same delta — apply the same vol-based model with a
+                # small discount.
+                premium = _estimated_premium(
+                    current_price, dte, daily_returns,
+                    delta_abs=abs(call_delta), is_put=False,
+                ) * 0.85
             exp_price = prices[min(i + dte, len(prices) - 1)]
 
             pnl = premium * 100 - slippage_per_contract
