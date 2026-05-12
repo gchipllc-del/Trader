@@ -16,6 +16,40 @@ from lib.audit import log_event
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "settings.yaml")
 
 
+def _retry_on_network_error(fn, *, attempts: int = 4, base_delay: float = 2.0):
+    """Run ``fn()`` with exponential-backoff retry on transient broker
+    network errors.
+
+    Targets the post-wake / brief-outage pattern where Alpaca's API
+    briefly refuses connections (Errno 61) right after the laptop
+    resumes. Without this, a single launchd cron firing during the
+    blip exits 1 and the operator sees a spurious failed-run alert.
+
+    Only catches :class:`requests.ConnectionError` and
+    :class:`requests.Timeout` — auth, 4xx, and 5xx are surfaced
+    immediately so real bugs aren't masked.
+    """
+    import requests  # local import — alpaca SDK pulls it in transitively
+    delay = base_delay
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except (requests.ConnectionError, requests.Timeout) as e:
+            last_exc = e
+            if attempt == attempts:
+                break
+            log_event("alpaca", "network_retry", {
+                "attempt": attempt,
+                "delay_seconds": delay,
+                "error": str(e)[:200],
+            }, result="degraded")
+            time.sleep(delay)
+            delay *= 2
+    assert last_exc is not None
+    raise last_exc
+
+
 class RateLimiter:
     """Sliding window rate limiter."""
 
@@ -410,7 +444,7 @@ class AlpacaClient:
         """Get account info (cash, portfolio value, buying power, PDT count)."""
         self.limiter.wait_if_needed()
         client = self._get_trading_client()
-        account = client.get_account()
+        account = _retry_on_network_error(client.get_account)
         return {
             "cash": float(account.cash),
             "portfolio_value": float(account.portfolio_value),
