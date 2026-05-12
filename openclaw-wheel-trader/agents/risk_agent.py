@@ -31,9 +31,23 @@ class RiskAgent:
 
     name = "risk_agent"
 
-    def review(self, proposal: dict, portfolio_value: float) -> dict:
+    def review(
+        self,
+        proposal: dict,
+        portfolio_value: float,
+        *,
+        broker_positions: list[dict] | None = None,
+    ) -> dict:
         """
         Review a trade proposal from Strategy Agent.
+
+        Args:
+            proposal: trade proposal dict from strategy_agent
+            portfolio_value: current account value
+            broker_positions: optional pre-fetched broker positions. If
+                passed, used for the capital-at-risk gate; if omitted,
+                the gate is skipped (back-compat). Callers that hold the
+                broker view should pass it.
 
         Returns:
             {
@@ -115,6 +129,44 @@ class RiskAgent:
         if not checks["score"]["pass"]:
             veto_reasons.append(f"Score {score}/9 below minimum 7")
 
+        # 6. Global capital-at-risk (NEW)
+        # Per-position and per-sector checks pass-fail trades individually,
+        # but a sequence of individually-OK CSPs can still sum to most of
+        # the account's cash. Cap total = (Σ short-put collateral) +
+        # (Σ long-share market value) + this proposal's new collateral,
+        # against a fraction of portfolio value. Pattern from
+        # alpacahq/options-wheel's MAX_RISK budget. Skipped if the caller
+        # didn't pass broker_positions (back-compat with tests / older
+        # callers that pass only proposal+portfolio_value).
+        if broker_positions is not None and portfolio_value > 0:
+            from lib.wheel_state import classify_book, total_capital_at_risk
+            book = classify_book(broker_positions, raise_on_illegal=False)
+            existing = total_capital_at_risk(book)
+            # Only short-put proposals add new collateral; CC and stock-buy
+            # proposals contribute differently (CC: no new collateral, stock
+            # buy: handled by stock_engine). For CSPs, "collateral" was
+            # already computed above.
+            new_collateral = collateral if action == "sell_csp" else 0.0
+            projected = existing["total"] + new_collateral
+            strategy = self._load_strategy()
+            max_car_pct = float(
+                strategy.get("risk", {}).get("max_capital_at_risk_pct", 0.80)
+            )
+            car_pct = projected / portfolio_value
+            checks["capital_at_risk"] = {
+                "existing_total": round(existing["total"], 2),
+                "new_collateral": round(new_collateral, 2),
+                "projected": round(projected, 2),
+                "projected_pct": round(car_pct, 4),
+                "max_pct": max_car_pct,
+                "pass": car_pct <= max_car_pct,
+            }
+            if not checks["capital_at_risk"]["pass"]:
+                veto_reasons.append(
+                    f"Capital-at-risk would hit {car_pct:.1%} (cap {max_car_pct:.0%}): "
+                    f"${existing['total']:,.0f} held + ${new_collateral:,.0f} new"
+                )
+
         # Decision
         approved = len(veto_reasons) == 0
         reason = "All risk checks passed" if approved else "; ".join(veto_reasons)
@@ -142,3 +194,14 @@ class RiskAgent:
         """Locked snapshot via the canonical store (audit finding #5)."""
         from lib.positions_store import load_positions as _store_load
         return _store_load(POSITIONS_PATH)
+
+    def _load_strategy(self) -> dict:
+        """Read wheel_strategy.yaml for risk-budget params. Tolerant to
+        missing file — returns empty dict so the gate quietly defaults."""
+        import yaml
+        path = Path(__file__).parent.parent / "config" / "wheel_strategy.yaml"
+        try:
+            with open(path) as f:
+                return yaml.safe_load(f) or {}
+        except Exception:
+            return {}

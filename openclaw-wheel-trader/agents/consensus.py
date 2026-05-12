@@ -125,6 +125,8 @@ def seek_consensus(
     candidate: WheelCandidate,
     portfolio_value: float,
     cost_basis: float | None = None,
+    *,
+    broker_positions: list[dict] | None = None,
 ) -> dict:
     """
     Run the 3-agent consensus process.
@@ -133,6 +135,10 @@ def seek_consensus(
         candidate: The screener's trade candidate
         portfolio_value: Current portfolio value for risk checks
         cost_basis: For covered calls, the share cost basis
+        broker_positions: Optional pre-fetched broker position list.
+            When provided, the risk agent runs the global
+            capital-at-risk gate (sum of short-put collateral +
+            long-share value) in addition to per-position checks.
 
     Returns:
         {
@@ -158,7 +164,9 @@ def seek_consensus(
         }
 
     # Step 2: Risk reviews
-    risk_review = risk.review(proposal, portfolio_value)
+    risk_review = risk.review(
+        proposal, portfolio_value, broker_positions=broker_positions,
+    )
 
     if not risk_review["approved"]:
         log_event("consensus", "vetoed_by_risk", {

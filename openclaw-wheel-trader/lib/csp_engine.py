@@ -155,6 +155,9 @@ def execute_csp(
     # concurrent scan processes; the broker is the single source of truth.
     # Reject if the broker already shows an OPEN option position with this
     # exact OCC symbol (same strike + expiration + side).
+    # Hoisted out of the try so the global capital-at-risk gate below can
+    # still see the snapshot even if the dup-check raises mid-loop.
+    broker_positions: list[dict] | None = None
     try:
         target_symbol = client._build_option_symbol(
             ticker, candidate.expiration, "put", candidate.strike,
@@ -192,9 +195,14 @@ def execute_csp(
         f"Pattern: {candidate.candlestick_pattern or 'none'}."
     )
 
-    # Agent consensus — strategy proposes, risk + compliance review
+    # Agent consensus — strategy proposes, risk + compliance review.
+    # Pass `broker_positions` so risk_agent can run the global
+    # capital-at-risk gate. Reuse the list we already fetched above for
+    # broker reconciliation — saves a duplicate API call.
     from agents.consensus import seek_consensus
-    consensus = seek_consensus(candidate, portfolio_value)
+    consensus = seek_consensus(
+        candidate, portfolio_value, broker_positions=broker_positions,
+    )
     if not consensus["approved"]:
         log_event("csp_engine", "consensus_rejected", {
             "ticker": ticker,
@@ -303,6 +311,24 @@ def run_csp_scan_and_execute(
     Called by the monitoring cron or manually.
     """
     log_event("csp_engine", "scan_started", {"tickers": list(daily_data.keys())})
+
+    # Pre-flight: derive the wheel state from broker positions and refuse
+    # to scan if anything is illegal (short equity, long options, uncovered
+    # short calls, etc.). Catching state drift here prevents the
+    # 2026-04-28 BAC double-buy class of bug — better to halt one scan
+    # than to compound the drift with another trade.
+    from lib.wheel_state import classify_book, IllegalWheelState
+    try:
+        classify_book(client.get_positions())
+    except IllegalWheelState as e:
+        log_event("csp_engine", "preflight_halt", {
+            "reason": str(e)[:300],
+            "illegal_underlyings": [
+                u for u, s in e.per_underlying.items() if s.stage == "illegal"
+            ],
+        }, result="failed")
+        diary_write("strategy_agent", f"CSP_SCAN_HALT|illegal_wheel_state|{str(e)[:120]}")
+        return []
 
     candidates = scan_for_csps(client, daily_data, weekly_data, options_chains, iv_data)
 

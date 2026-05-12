@@ -204,6 +204,13 @@ management:
   early_close_min_dte: 14
   roll_trigger_dte: 7
   roll_min_credit: 0.5
+risk:
+  # Global capital-at-risk ceiling: (Σ short-put collateral) + (Σ long-share
+  # market value) + the proposed new collateral must not exceed this
+  # fraction of portfolio_value. Defends against the "8 individually-OK
+  # CSPs each at 10% sum to 80% of cash" failure mode that the per-position
+  # gate alone misses. Adapted from alpacahq/options-wheel MAX_RISK.
+  max_capital_at_risk_pct: 0.80
 confirmation:
   min_composite_score: 7
   required_timeframes:

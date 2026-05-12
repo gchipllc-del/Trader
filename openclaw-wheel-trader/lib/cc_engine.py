@@ -83,6 +83,22 @@ def scan_for_ccs(
     """
     Scan assigned positions for covered call candidates.
     """
+    # Pre-flight: refuse to scan if broker state is illegal. An uncovered
+    # short call (the most likely CC-related drift) would otherwise let
+    # us layer a SECOND CC on top, doubling the risk.
+    from lib.wheel_state import classify_book, IllegalWheelState
+    try:
+        classify_book(client.get_positions())
+    except IllegalWheelState as e:
+        log_event("cc_engine", "preflight_halt", {
+            "reason": str(e)[:300],
+            "illegal_underlyings": [
+                u for u, s in e.per_underlying.items() if s.stage == "illegal"
+            ],
+        }, result="failed")
+        diary_write("strategy_agent", f"CC_SCAN_HALT|illegal_wheel_state|{str(e)[:120]}")
+        return []
+
     config = _load_strategy_config()
     assigned = find_assigned_positions()
     candidates = []
@@ -203,6 +219,8 @@ def execute_cc(
     # the 2026-04-28 BAC double-buy. positions.json can be stale across
     # concurrent scan processes; reject if the broker already shows an OPEN
     # option position with this exact OCC symbol (same strike + expiration).
+    # Hoisted so the global capital-at-risk gate below can reuse the snapshot.
+    broker_positions: list[dict] | None = None
     try:
         target_symbol = client._build_option_symbol(
             ticker, candidate.expiration, "call", candidate.strike,
@@ -235,9 +253,14 @@ def execute_cc(
         f"Pattern: {candidate.candlestick_pattern or 'none'}."
     )
 
-    # Agent consensus — strategy proposes, risk + compliance review
+    # Agent consensus — strategy proposes, risk + compliance review.
+    # Pass broker_positions through for the global capital-at-risk gate.
     from agents.consensus import seek_consensus
-    consensus = seek_consensus(candidate, portfolio_value, cost_basis=position.get("cost_basis"))
+    consensus = seek_consensus(
+        candidate, portfolio_value,
+        cost_basis=position.get("cost_basis"),
+        broker_positions=broker_positions,
+    )
     if not consensus["approved"]:
         log_event("cc_engine", "consensus_rejected", {
             "ticker": ticker,
