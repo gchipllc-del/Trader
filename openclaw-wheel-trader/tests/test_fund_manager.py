@@ -99,6 +99,132 @@ class TestFundManagerCashBuffer:
         assert len(cash_actions) == 1
 
 
+class TestFundManagerHRP:
+    """HRP rebalance check — added 2026-05-12 (PyPortfolioOpt integration)."""
+
+    def _stocks(self, *tickers_and_values):
+        """Helper to build stock position dicts.
+
+        Each arg is ``(ticker, market_value)``. Used by every HRP test.
+        """
+        return [
+            {"ticker": t, "type": "stock", "status": "open",
+             "sector": "tech", "shares": int(mv / 100), "entry_price": 100,
+             "market_value": float(mv)}
+            for t, mv in tickers_and_values
+        ]
+
+    def _returns_df(self, tickers, days=60, *, seed=0, drift=0.0001, scale=0.015):
+        """Build a synthetic returns DataFrame for the given tickers."""
+        import numpy as np
+        import pandas as pd
+        rng = np.random.default_rng(seed)
+        data = {
+            t: rng.normal(drift, scale, days) for t in tickers
+        }
+        return pd.DataFrame(data)
+
+    def test_hrp_skipped_when_no_returns_passed(self):
+        """Default review (no historical_returns kwarg) skips HRP cleanly."""
+        from agents.fund_manager import FundManager
+        positions = self._stocks(("NVDA", 3_000), ("AMD", 3_000), ("KO", 3_000))
+        review = FundManager().review_portfolio(
+            positions=positions, bankroll=10_000, cash=1_000,
+        )
+        assert all(a["type"] != "HRP_REBALANCE" for a in review["actions"])
+        assert review["stats"]["hrp_weights"] == {}
+
+    def test_hrp_skipped_when_under_3_stock_positions(self):
+        from agents.fund_manager import FundManager
+        positions = self._stocks(("NVDA", 3_000), ("AMD", 3_000))
+        rets = self._returns_df(["NVDA", "AMD"])
+        review = FundManager().review_portfolio(
+            positions=positions, bankroll=10_000, cash=4_000,
+            historical_returns=rets,
+        )
+        assert all(a["type"] != "HRP_REBALANCE" for a in review["actions"])
+        assert review["stats"]["hrp_weights"] == {}
+
+    def test_hrp_skipped_when_under_30_days_of_returns(self):
+        from agents.fund_manager import FundManager
+        positions = self._stocks(("NVDA", 3_000), ("AMD", 3_000), ("KO", 3_000))
+        rets = self._returns_df(["NVDA", "AMD", "KO"], days=20)
+        review = FundManager().review_portfolio(
+            positions=positions, bankroll=10_000, cash=1_000,
+            historical_returns=rets,
+        )
+        assert all(a["type"] != "HRP_REBALANCE" for a in review["actions"])
+
+    def test_hrp_skipped_when_returns_not_dataframe(self):
+        from agents.fund_manager import FundManager
+        positions = self._stocks(("NVDA", 3_000), ("AMD", 3_000), ("KO", 3_000))
+        review = FundManager().review_portfolio(
+            positions=positions, bankroll=10_000, cash=1_000,
+            historical_returns={"NVDA": [0.01, 0.02]},  # not a DataFrame
+        )
+        assert all(a["type"] != "HRP_REBALANCE" for a in review["actions"])
+
+    def test_hrp_emits_action_on_drift(self):
+        """One position is 60% of invested capital but HRP would weight it
+        far lower — expect an HRP_REBALANCE action targeting that ticker.
+        """
+        from agents.fund_manager import FundManager
+        # NVDA dominates the book: $7k of $10k invested = 70%
+        # KO and JPM split the rest at 15% each
+        positions = self._stocks(
+            ("NVDA", 7_000), ("KO", 1_500), ("JPM", 1_500),
+        )
+        rets = self._returns_df(["NVDA", "KO", "JPM"], days=60, scale=0.015)
+        review = FundManager().review_portfolio(
+            positions=positions, bankroll=10_000, cash=0,
+            historical_returns=rets,
+        )
+        hrp_actions = [a for a in review["actions"] if a["type"] == "HRP_REBALANCE"]
+        assert hrp_actions, f"expected HRP_REBALANCE action; got {review['actions']}"
+        # HRP w/ ~uncorrelated synthetic returns produces roughly equal
+        # weights, so NVDA at 70% will be flagged for trim.
+        nvda_actions = [a for a in hrp_actions if "NVDA" in a["affected_tickers"]]
+        assert nvda_actions, "expected NVDA to be flagged for trim"
+        assert "trim" in nvda_actions[0]["summary"].lower()
+
+    def test_hrp_stats_present_when_ran(self):
+        from agents.fund_manager import FundManager
+        positions = self._stocks(("NVDA", 3_000), ("AMD", 3_000), ("KO", 3_000))
+        rets = self._returns_df(["NVDA", "AMD", "KO"], days=60)
+        review = FundManager().review_portfolio(
+            positions=positions, bankroll=10_000, cash=1_000,
+            historical_returns=rets,
+        )
+        weights = review["stats"]["hrp_weights"]
+        assert weights, "expected hrp_weights to be populated"
+        assert set(weights.keys()) == {"NVDA", "AMD", "KO"}
+        # Weights sum to ~1.0 by HRP construction
+        assert abs(sum(weights.values()) - 1.0) < 0.01
+
+    def test_hrp_excludes_options_from_optimization(self):
+        """Options positions in the book are ignored by HRP — only stocks
+        get optimized."""
+        from agents.fund_manager import FundManager
+        positions = [
+            {"ticker": "NVDA", "type": "stock", "status": "open", "sector": "tech",
+             "shares": 30, "entry_price": 100, "market_value": 3_000},
+            {"ticker": "AMD", "type": "stock", "status": "open", "sector": "tech",
+             "shares": 20, "entry_price": 100, "market_value": 2_000},
+            {"ticker": "KO", "type": "stock", "status": "open", "sector": "consumer",
+             "shares": 25, "entry_price": 100, "market_value": 2_500},
+            # CSP — should NOT be in HRP optimization
+            {"ticker": "MSFT", "type": "csp", "status": "open", "sector": "tech",
+             "strike": 400, "market_value": -200},
+        ]
+        rets = self._returns_df(["NVDA", "AMD", "KO"], days=60)
+        review = FundManager().review_portfolio(
+            positions=positions, bankroll=10_000, cash=2_500,
+            historical_returns=rets,
+        )
+        weights = review["stats"]["hrp_weights"]
+        assert "MSFT" not in weights, "options should not appear in HRP weights"
+
+
 class TestFundManagerEdgeCases:
     def test_empty_book_passes(self):
         from agents.fund_manager import FundManager

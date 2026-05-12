@@ -28,6 +28,14 @@ Action types:
   REBALANCE          — single position drifted past max_position_pct
                        (already handled by auto_trim_oversize_stocks
                        but FM logs it as a portfolio observation)
+  HRP_REBALANCE      — position weight has drifted from the
+                       Hierarchical Risk Parity target by more than
+                       a configurable threshold. HRP allocates capital
+                       across positions based on their covariance
+                       structure without needing return forecasts —
+                       robust against correlation-regime shifts. Pattern
+                       from PyPortfolioOpt's HRPOpt; only fires when the
+                       caller supplies a historical returns matrix.
   HOLD               — book is balanced, no action
 
 The monitor calls fund_manager.review_portfolio() once per cycle. The
@@ -80,6 +88,8 @@ class FundManager:
         max_sector_pct: float = 0.50,
         max_correlation_group_count: int = 3,
         min_cash_buffer_pct: float = 0.05,
+        historical_returns: "pd.DataFrame | None" = None,
+        hrp_max_drift_pct: float = 0.15,
     ) -> dict:
         """
         Run all portfolio-level checks. Returns a structured review dict.
@@ -92,6 +102,15 @@ class FundManager:
             max_correlation_group_count: alarm if a single correlation_group
                 holds more than N positions
             min_cash_buffer_pct: alarm if cash < this fraction of bankroll
+            historical_returns: optional DataFrame of daily returns
+                (columns = tickers held, rows = days). When provided AND
+                ≥30 rows AND ≥3 tradeable positions, the fund manager
+                computes Hierarchical Risk Parity target weights and
+                emits HRP_REBALANCE actions for positions that have
+                drifted >``hrp_max_drift_pct`` from their target weight.
+                Skipped (no action, no error) when missing/insufficient.
+            hrp_max_drift_pct: minimum absolute weight drift from HRP
+                target that triggers an HRP_REBALANCE action.
 
         Returns:
             {
@@ -102,6 +121,7 @@ class FundManager:
                     "cash_pct": float,
                     "sector_concentration": dict[sector, pct],
                     "correlation_clusters": dict[group, count],
+                    "hrp_weights": dict[ticker, target_weight],  # if HRP ran
                 },
             }
         """
@@ -186,6 +206,20 @@ class FundManager:
                 ),
             ))
 
+        # ── Hierarchical Risk Parity rebalance ──────────────────────────
+        # HRP allocates capital across positions by clustering on the
+        # covariance structure — no return forecast needed, robust to
+        # the kind of correlation-regime shifts that break mean-variance.
+        # Only runs when the caller supplies a historical returns matrix
+        # (the monitor fetches it; tests can pass synthetic data).
+        hrp_weights: dict[str, float] = {}
+        hrp_actions, hrp_weights = self._hrp_rebalance(
+            opens=opens, bankroll=bankroll,
+            historical_returns=historical_returns,
+            max_drift_pct=hrp_max_drift_pct,
+        )
+        actions.extend(hrp_actions)
+
         # ── Compose summary ─────────────────────────────────────────────
         if not actions:
             summary = (
@@ -215,5 +249,105 @@ class FundManager:
                 "cash_pct": round(cash_pct, 4),
                 "sector_concentration": {k: round(v, 4) for k, v in sector_pct.items()},
                 "correlation_clusters": {k: len(v) for k, v in cluster_count.items()},
+                "hrp_weights": {k: round(v, 4) for k, v in hrp_weights.items()},
             },
         }
+
+    def _hrp_rebalance(
+        self,
+        *,
+        opens: list[dict],
+        bankroll: float,
+        historical_returns,
+        max_drift_pct: float,
+    ) -> tuple[list[FundManagerAction], dict[str, float]]:
+        """Compute HRP target weights and flag drifted positions.
+
+        Returns ``(actions, hrp_weights)``. Empty + empty dict when HRP
+        can't run (no return data, too few positions, too few days).
+        """
+        # ── Pre-conditions ───────────────────────────────────────────
+        if historical_returns is None:
+            return [], {}
+        try:
+            import pandas as pd  # local import — avoid module-load cost
+        except ImportError:
+            return [], {}
+        if not isinstance(historical_returns, pd.DataFrame):
+            return [], {}
+
+        # Need at least 3 stock positions with returns columns and ≥30 days
+        stock_positions = [
+            p for p in opens
+            if p.get("type") == "stock" and p.get("ticker") in historical_returns.columns
+        ]
+        if len(stock_positions) < 3:
+            return [], {}
+        tickers = [p["ticker"] for p in stock_positions]
+        rets = historical_returns[tickers].dropna()
+        if len(rets) < 30:
+            return [], {}
+
+        # ── HRP optimization ─────────────────────────────────────────
+        try:
+            from pypfopt import HRPOpt
+            opt = HRPOpt(returns=rets)
+            target_raw = opt.optimize()
+            target_weights = {t: float(w) for t, w in target_raw.items()}
+        except Exception as e:
+            log_event("fund_manager", "hrp_failed",
+                      {"error": str(e)[:200], "n_tickers": len(tickers)},
+                      result="degraded")
+            return [], {}
+
+        # ── Drift detection ──────────────────────────────────────────
+        # Express actual weights as a fraction of the *invested* portion
+        # (cash excluded) so the comparison is apples-to-apples with HRP,
+        # which always sums to 1.0 across the asset set.
+        invested_value = 0.0
+        actual_market_values: dict[str, float] = {}
+        for p in stock_positions:
+            mv = float(p.get("market_value", 0) or 0)
+            if not mv:
+                mv = float(p.get("entry_price", 0) or 0) * float(p.get("shares", 0) or 0)
+            actual_market_values[p["ticker"]] = mv
+            invested_value += mv
+
+        if invested_value <= 0:
+            return [], target_weights
+
+        actual_weights = {
+            t: mv / invested_value for t, mv in actual_market_values.items()
+        }
+
+        actions: list[FundManagerAction] = []
+        for ticker, target_w in target_weights.items():
+            actual_w = actual_weights.get(ticker, 0.0)
+            drift = actual_w - target_w
+            if abs(drift) < max_drift_pct:
+                continue
+            direction = "trim" if drift > 0 else "add"
+            # Dollar amount to move to bring weight in line. Bounded by
+            # the existing position market value when trimming.
+            dollar_delta = abs(drift) * invested_value
+            sev = "warn" if abs(drift) < (max_drift_pct + 0.10) else "critical"
+            actions.append(FundManagerAction(
+                type="HRP_REBALANCE",
+                severity=sev,
+                summary=(
+                    f"{ticker} weight {actual_w:.1%} vs HRP target "
+                    f"{target_w:.1%} (drift {drift:+.1%}) — {direction} "
+                    f"~${dollar_delta:.0f}"
+                ),
+                affected_tickers=[ticker],
+                suggested_amount=dollar_delta,
+            ))
+
+        log_event("fund_manager", "hrp_evaluated", {
+            "n_tickers": len(tickers),
+            "n_days": len(rets),
+            "target_weights": {k: round(v, 4) for k, v in target_weights.items()},
+            "n_drift_actions": len(actions),
+        })
+
+        return actions, target_weights

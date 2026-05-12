@@ -548,10 +548,34 @@ def run_monitoring_check(client: AlpacaClient) -> dict:
         # the operator looped in on sector / correlation / cash drift.
         try:
             from agents.fund_manager import FundManager
+            # Fetch ~90 days of daily returns for the long-stock book so
+            # the HRP rebalance check can run. Best-effort: if the fetch
+            # fails or there are <3 stock positions, HRP just doesn't fire.
+            hist_returns = None
+            stock_tickers_for_hrp = list({
+                p.get("ticker") for p in open_positions
+                if p.get("type") == "stock" and p.get("ticker")
+            })
+            if len(stock_tickers_for_hrp) >= 3:
+                try:
+                    import pandas as pd
+                    bars = client.get_bars(stock_tickers_for_hrp,
+                                           timeframe="1Day", limit=120)
+                    series_by_ticker = {}
+                    for t in stock_tickers_for_hrp:
+                        if isinstance(bars, dict) and t in bars and len(bars[t]) > 30:
+                            series_by_ticker[t] = bars[t]["close"].pct_change().dropna()
+                    if len(series_by_ticker) >= 3:
+                        hist_returns = pd.DataFrame(series_by_ticker).dropna()
+                except Exception as _hrp_e:
+                    log_event("monitor", "hrp_returns_fetch_failed",
+                              {"error": str(_hrp_e)[:200]}, result="degraded")
+
             fm_review = FundManager().review_portfolio(
                 positions=open_positions,
                 bankroll=float(account.get("portfolio_value", 0) or 0),
                 cash=float(account.get("cash", 0) or 0),
+                historical_returns=hist_returns,
             )
             if fm_review["actions"]:
                 for a in fm_review["actions"]:
