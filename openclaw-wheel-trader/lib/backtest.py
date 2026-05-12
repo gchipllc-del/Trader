@@ -207,8 +207,24 @@ def run_wheel_backtest(
     holding_shares = False
     cost_basis = 0
 
+    # Daily mark-to-market equity for drawdown tracking. Without this,
+    # held-share losses don't show up in max_drawdown — a CSP that
+    # assigns into a stock that drops 30% looks like a "win" in raw
+    # premium PnL. Equity = realized capital + unrealized P&L on any
+    # held shares marked at the latest price.
+    def _equity_at(price_idx: int) -> float:
+        if not holding_shares:
+            return capital
+        unrealized = (prices[price_idx] - cost_basis) * 100
+        return capital + unrealized
+
     while i < len(prices) - dte:
         current_price = prices[i]
+        # Trade-level PnL for the about-to-be-recorded cycle. Used by the
+        # win-rate calculation; we'll also adjust it for unrealized
+        # share losses when a CSP gets assigned (otherwise an assignment
+        # into a falling stock falsely counts as a "win").
+        trade_pnl: float
 
         if not holding_shares:
             # Sell CSP
@@ -222,19 +238,32 @@ def run_wheel_backtest(
                 )
             exp_price = prices[min(i + dte, len(prices) - 1)]
 
-            pnl = premium * 100 - slippage_per_contract
+            premium_pnl = premium * 100 - slippage_per_contract
             premiums_total += premium * 100
 
             if exp_price < strike:
-                # Assigned
+                # Assigned — cost basis is strike less premium received
                 cost_basis = strike - premium
                 holding_shares = True
                 assignments += 1
-                trades.append({"type": "csp_assigned", "pnl": pnl, "price": exp_price})
+                # The full economic PnL of this trade is premium income
+                # MINUS the immediate unrealized loss vs cost basis.
+                # That makes "assigned into a falling stock" correctly
+                # show as a losing trade.
+                unrealized_at_assignment = (exp_price - cost_basis) * 100
+                trade_pnl = premium_pnl + unrealized_at_assignment
+                trades.append({
+                    "type": "csp_assigned",
+                    "pnl": trade_pnl,
+                    "price": exp_price,
+                    "premium_pnl": premium_pnl,
+                    "unrealized_at_close": unrealized_at_assignment,
+                })
             else:
                 # Expired worthless — keep premium
-                capital += pnl
-                trades.append({"type": "csp_expired", "pnl": pnl, "price": exp_price})
+                capital += premium_pnl
+                trade_pnl = premium_pnl
+                trades.append({"type": "csp_expired", "pnl": trade_pnl, "price": exp_price})
         else:
             # Sell CC
             strike = current_price * (1 - call_delta * 0.1)  # OTM call above
@@ -251,31 +280,51 @@ def run_wheel_backtest(
                 ) * 0.85
             exp_price = prices[min(i + dte, len(prices) - 1)]
 
-            pnl = premium * 100 - slippage_per_contract
+            premium_pnl = premium * 100 - slippage_per_contract
             premiums_total += premium * 100
 
             if exp_price > strike:
-                # Called away
+                # Called away — realize cost-basis-to-strike gain plus premium.
                 cap_gain = (strike - cost_basis) * 100
-                capital += pnl + cap_gain
+                trade_pnl = premium_pnl + cap_gain
+                capital += trade_pnl
                 holding_shares = False
                 cycles += 1
-                trades.append({"type": "cc_called", "pnl": pnl + cap_gain, "price": exp_price})
+                trades.append({"type": "cc_called", "pnl": trade_pnl, "price": exp_price})
             else:
-                # Keep shares + premium
-                capital += pnl
-                cost_basis -= premium  # Reduce cost basis
-                trades.append({"type": "cc_expired", "pnl": pnl, "price": exp_price})
+                # Not called away — keep premium, hold shares to next cycle.
+                # cost_basis drops by the premium received (running CC accounting).
+                capital += premium_pnl
+                cost_basis -= premium
+                # Trade-level PnL for win-rate = premium income + the
+                # price change over the cycle (since we still hold the
+                # shares, the price move is the period's unrealized P&L).
+                # Sign-correct: if the stock fell more than the premium,
+                # the trade is correctly counted as a loss.
+                trade_pnl = premium_pnl + (exp_price - current_price) * 100
+                trades.append({"type": "cc_expired", "pnl": trade_pnl, "price": exp_price})
 
-        # Track drawdown
-        peak_capital = max(peak_capital, capital)
-        dd = (peak_capital - capital) / peak_capital
-        max_drawdown = max(max_drawdown, dd)
+        # Daily mark-to-market for drawdown across the cycle window.
+        # Walk the dte intermediate days, compute equity, update peak/dd.
+        # This is the key fix — previously drawdown only saw realized
+        # capital so held-share drops were invisible.
+        cycle_end = min(i + dte, len(prices))
+        for idx in range(i, cycle_end):
+            eq = _equity_at(idx)
+            peak_capital = max(peak_capital, eq)
+            dd = (peak_capital - eq) / peak_capital if peak_capital > 0 else 0
+            max_drawdown = max(max_drawdown, dd)
 
         i += dte
 
     # Calculate metrics
-    total_return = (capital - initial_capital) / initial_capital
+    # If we end while still holding shares, the *economic* return must
+    # include the unrealized P&L on those shares (previously this was
+    # only counted in drawdown, not the final figure).
+    final_equity = capital
+    if holding_shares and len(prices) > 0:
+        final_equity = capital + (prices[-1] - cost_basis) * 100
+    total_return = (final_equity - initial_capital) / initial_capital
     years = len(prices) / 252
     annualized = (1 + total_return) ** (1 / max(years, 0.1)) - 1
 
