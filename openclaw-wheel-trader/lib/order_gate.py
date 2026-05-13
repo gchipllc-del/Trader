@@ -143,6 +143,14 @@ def step2_validate(
     else:
         order_value = (intent.limit_price or 0) * intent.quantity
 
+    # The `max_contracts_per_order` breaker applies ONLY to option orders
+    # — for stocks/crypto, ``intent.quantity`` counts shares/units, not
+    # contracts, and accidentally tripping the option ceiling was blocking
+    # legitimate stock buys (e.g. 22 shares of AAL hitting the "max 2
+    # contracts" gate on 2026-05-13). Pass 0 for non-option asset types
+    # so the breaker becomes a no-op for them.
+    contracts_arg = intent.quantity if intent.asset_type == "option" else 0
+
     # Run all circuit breaker checks
     try:
         run_all_checks(
@@ -150,7 +158,7 @@ def step2_validate(
             portfolio_value=portfolio_value,
             current_daily_pnl=current_daily_pnl,
             current_open_orders=current_open_orders,
-            contracts=intent.quantity,
+            contracts=contracts_arg,
             last_loss_time=last_loss_time,
         )
     except CircuitBreakerTripped as e:
