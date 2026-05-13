@@ -109,7 +109,12 @@ def _clamp(value, param_name: str):
 # STEP 1: REVIEW — Analyze recent trade performance
 # ============================================================
 
-def review_trades(lookback_days: int = 14, trade_type: str = "stock") -> dict:
+def review_trades(
+    lookback_days: int = 14,
+    trade_type: str = "stock",
+    *,
+    end_offset_days: int = 0,
+) -> dict:
     """
     Analyze closed trades from the last N days for a specific strategy type.
 
@@ -118,6 +123,11 @@ def review_trades(lookback_days: int = 14, trade_type: str = "stock") -> dict:
     semantics differ. Pass trade_type="csp" or "cc" if/when those have
     their own Hermes tuners.
 
+    ``end_offset_days`` lets the walk-forward validator slide the
+    window into the past: ``end_offset_days=14`` looks at the period
+    14-(14+lookback_days) days ago. Default 0 = "ending now"
+    (existing behavior).
+
     Returns performance metrics broken down by:
     - Overall win rate, avg win, avg loss
     - By pattern (which candlestick signals work best)
@@ -125,7 +135,9 @@ def review_trades(lookback_days: int = 14, trade_type: str = "stock") -> dict:
     - Stop loss effectiveness (are stops too tight or too loose)
     """
     positions = _load_positions()
-    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    now = datetime.now(timezone.utc)
+    end = now - timedelta(days=end_offset_days)
+    start = end - timedelta(days=lookback_days)
 
     closed = []
     skipped_other_types = 0
@@ -144,7 +156,7 @@ def review_trades(lookback_days: int = 14, trade_type: str = "stock") -> dict:
             continue
         try:
             close_dt = datetime.fromisoformat(closed_at.replace("Z", "+00:00"))
-            if close_dt < cutoff:
+            if close_dt < start or close_dt > end:
                 continue
         except (ValueError, TypeError):
             continue
@@ -220,6 +232,99 @@ def review_trades(lookback_days: int = 14, trade_type: str = "stock") -> dict:
         "avg_loss_score": round(avg_loss_score, 1),
         "profit_factor": round(abs(avg_win * len(wins)) / abs(avg_loss * len(losses)), 2) if losses and avg_loss != 0 else 999,
     }
+
+
+# ============================================================
+# COMPOSITE SCORE — Single scalar for risk-adjusted performance
+# ============================================================
+
+def composite_score(review: dict) -> float:
+    """Risk-adjusted scalar that resists Hermes pumping aggression after
+    a single lucky window.
+
+    ``expectancy × √trades − 2 × drawdown_proxy``
+
+    The drawdown proxy is ``stop_out_rate × |avg_loss|`` — a strategy
+    that loses often AND loses big takes a double hit. Multi-objective
+    pattern lifted from Freqtrade's ``MultiMetricHyperOptLoss`` /
+    ``ProfitDrawDownHyperOptLoss``: a single number that captures both
+    profit and risk so independent univariate rules can't conflict
+    (e.g. raising both target_pct AND max_position_pct after one good
+    streak — which the per-rule heuristics in diagnose() previously did).
+
+    Returns 0.0 for empty windows (sample too small to score).
+    """
+    n = int(review.get("total_trades", 0) or 0)
+    if n == 0:
+        return 0.0
+    import math
+    expectancy = float(review.get("expectancy", 0.0) or 0.0)
+    avg_loss = float(review.get("avg_loss_pct", 0.0) or 0.0)
+    stop_outs = int(review.get("stop_outs", 0) or 0)
+    stop_out_rate = stop_outs / n
+    drawdown_proxy = stop_out_rate * abs(avg_loss)
+    return expectancy * math.sqrt(n) - 2.0 * drawdown_proxy
+
+
+# ============================================================
+# WALK-FORWARD — Cross-validate recommendations on two windows
+# ============================================================
+
+def walk_forward_recommendations(
+    *, lookback_days: int, trade_type: str = "stock", current_params: dict,
+) -> tuple[list[dict], dict]:
+    """Split the lookback into train (older 60%) + validate (newer 40%)
+    windows. Run diagnose() on each independently. Return only the
+    recommendations where BOTH windows agree on the direction.
+
+    This addresses the 2026-04-27 failure mode: a single bad streak in
+    the most recent window dominated the decision. With walk-forward,
+    a recommendation must hold across two non-overlapping windows
+    before it gets applied — natural overfit guard, no full simulator
+    required. Pattern from Freqtrade's `--analyze-per-epoch` and the
+    general walk-forward backtest discipline.
+
+    Returns ``(filtered_recs, info)`` where info has per-window stats
+    for the audit log.
+    """
+    # Skip walk-forward entirely on very short windows — not enough data
+    # to split. Falls back to the single-window behavior in run_optimization.
+    if lookback_days < 14:
+        return [], {"skipped": "lookback_too_short", "lookback_days": lookback_days}
+
+    train_days = max(7, int(lookback_days * 0.60))
+    validate_days = lookback_days - train_days
+    train_end_offset = validate_days  # train ends where validate starts
+    train_review = review_trades(train_days, trade_type, end_offset_days=train_end_offset)
+    validate_review = review_trades(validate_days, trade_type, end_offset_days=0)
+
+    train_recs = diagnose(train_review, current_params)
+    validate_recs = diagnose(validate_review, current_params)
+    validate_dirs = {r["param"]: r["direction"] for r in validate_recs}
+
+    # Keep only recommendations where the validate window agrees.
+    # If validate window has too few trades for diagnose to fire any
+    # recommendation, we drop everything — that's the conservative call
+    # (better to do nothing than overfit to the train half).
+    filtered = [
+        r for r in train_recs
+        if validate_dirs.get(r["param"]) == r["direction"]
+    ]
+
+    info = {
+        "train_trades": train_review.get("total_trades", 0),
+        "validate_trades": validate_review.get("total_trades", 0),
+        "train_score": round(composite_score(train_review), 4),
+        "validate_score": round(composite_score(validate_review), 4),
+        "train_rec_count": len(train_recs),
+        "validate_rec_count": len(validate_recs),
+        "kept_after_agreement": len(filtered),
+        "dropped_train_only": [
+            r["param"] for r in train_recs
+            if r["param"] not in validate_dirs or validate_dirs[r["param"]] != r["direction"]
+        ],
+    }
+    return filtered, info
 
 
 # ============================================================
@@ -401,27 +506,54 @@ def apply_adjustments(recommendations: list[dict]) -> dict:
 # STEP 4+5: OPTIMIZE — Full cycle with logging and validation
 # ============================================================
 
-def run_optimization(lookback_days: int = 14, dry_run: bool = False) -> dict:
+def run_optimization(
+    lookback_days: int = 14,
+    dry_run: bool = False,
+    *,
+    use_walk_forward: bool = True,
+) -> dict:
     """
     Full Hermes optimization cycle:
       1. Review recent trades
       2. Diagnose issues
-      3. Tune parameters (unless dry_run)
-      4. Log everything
-      5. Validate bounds
+      3. Walk-forward filter (keep only recommendations validated on both halves)
+      4. Tune parameters (unless dry_run)
+      5. Log everything
+      6. Validate bounds
 
     Returns full optimization report.
     """
     strategy = _load_strategy()
     current_params = strategy.get("stock_params", {})
 
-    # Step 1: Review (stock-only — Wave 3 #12)
+    # Step 1: Review (stock-only — Wave 3 #12). Full window for reporting.
     review = review_trades(lookback_days, trade_type="stock")
 
-    # Step 2: Diagnose
-    recommendations = diagnose(review, current_params)
+    # Step 2 + 3: Diagnose + walk-forward filter. With ≥14 days of lookback,
+    # we split into train (60%, older) + validate (40%, newer) and keep
+    # only recommendations where both windows agree on direction — natural
+    # overfit guard against the 2026-04-27 failure mode where a single
+    # bad streak in the most recent window dominated the decision.
+    wf_info: dict = {}
+    if use_walk_forward and lookback_days >= 14:
+        recommendations, wf_info = walk_forward_recommendations(
+            lookback_days=lookback_days,
+            trade_type="stock",
+            current_params=current_params,
+        )
+        full_recommendations = diagnose(review, current_params)
+        wf_info["full_window_rec_count"] = len(full_recommendations)
+    else:
+        recommendations = diagnose(review, current_params)
+        full_recommendations = recommendations
+        wf_info = {"skipped": "walk_forward_disabled_or_short_window"}
 
-    # Step 3: Tune
+    # Composite score of the full window — used purely for logging /
+    # operator visibility for now. Future work: gate apply_adjustments
+    # on a projected-score improvement.
+    full_score = composite_score(review)
+
+    # Step 4: Tune
     skip_reason = None
     if dry_run:
         changes = {}
@@ -434,19 +566,32 @@ def run_optimization(lookback_days: int = 14, dry_run: bool = False) -> dict:
         )
     elif not recommendations:
         changes = {}
-        skip_reason = "no_recommendations: metrics within tolerance bands"
+        # Distinguish "no recommendations at all" from "all recommendations
+        # dropped by walk-forward filter" so the operator can tell whether
+        # Hermes is happy or just being held back by lack of agreement.
+        if use_walk_forward and full_recommendations:
+            skip_reason = (
+                "walk_forward_disagreement: "
+                f"{len(full_recommendations)} candidate(s) dropped — "
+                f"train/validate windows didn't agree on direction"
+            )
+        else:
+            skip_reason = "no_recommendations: metrics within tolerance bands"
     else:
         changes = apply_adjustments(recommendations)
         if not changes:
             skip_reason = "all_adjustments_at_bounds: recommendations would push past hermes_bounds"
 
-    # Step 4: Log
+    # Step 5: Log
     report = {
         "cycle": "hermes_optimization",
         "lookback_days": lookback_days,
         "dry_run": dry_run,
         "review": review,
-        "recommendations": recommendations,
+        "composite_score": round(full_score, 4),
+        "walk_forward": wf_info,
+        "recommendations": recommendations,  # post-walk-forward filter
+        "full_window_recommendations": full_recommendations,
         "changes": changes,
         "skip_reason": skip_reason,
         "params_after": strategy.get("stock_params", {}),
