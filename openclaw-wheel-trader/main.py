@@ -618,6 +618,145 @@ def cmd_monitor():
     start_monitoring_loop(client)
 
 
+def cmd_premarket_scan(
+    *,
+    gap_threshold: float = -0.02,   # dip threshold: trade only if down ≥2%
+    max_trades: int = 2,
+    min_composite: int = 8,
+    half_size: bool = True,
+    dry_run: bool = False,
+):
+    """Pre-market dip-buy scan. Fires 4:00 AM CT via launchd.
+
+    Strategy: scan Phase-1 universe for stocks gapping down >``gap_threshold``
+    in pre-market. Only buy if the regular-hours screener also rates
+    the setup ≥ ``min_composite``. Place a LIMIT order at the
+    pre-market last price (no chasing) with ``extended_hours=True``.
+
+    Half-size (``max_position_pct / 2``) by default to bound pre-market
+    wide-spread risk.
+
+    Side effect: persists the per-ticker overnight gap to
+    ``data/premarket_signals.json`` so the regular day-time screener
+    can incorporate it as a signal at market open.
+    """
+    import yaml
+    from lib.alpaca_client import AlpacaClient
+    from lib.premarket_signals import compute_all
+    from lib.audit import log_event
+
+    cfg_path = Path(__file__).parent / "config" / "wheel_strategy.yaml"
+    with open(cfg_path) as f:
+        strategy = yaml.safe_load(f) or {}
+    tickers = strategy.get("tickers_phase1", []) or strategy.get("tickers", [])
+
+    print(f"=== PRE-MARKET SCAN ({len(tickers)} tickers) ===")
+    print(f"  Gap threshold: {gap_threshold:+.1%}  Min composite: {min_composite}/13")
+    print(f"  Max trades:    {max_trades}  Half-size: {half_size}  Dry-run: {dry_run}")
+
+    try:
+        client = AlpacaClient()
+    except Exception as e:
+        print(f"ABORT: cannot init AlpacaClient: {e}")
+        return
+
+    # Compute and persist overnight gaps. The persistence side-effect
+    # is the "feed into normal day knowledge" piece — the regular
+    # screener reads load_signals() at market open.
+    signals = compute_all(tickers, client)
+    if not signals:
+        print("  No pre-market signals computed (data feed empty?)")
+        return
+
+    print(f"\n  Gaps observed:")
+    for s in sorted(signals, key=lambda x: x.gap_pct):
+        marker = " ← dip" if s.gap_pct <= gap_threshold else ""
+        print(f"    {s.ticker:6s}  prior=${s.prior_close:>8.2f}  "
+              f"pre=${s.last_price:>8.2f}  gap={s.gap_pct:+.2%}{marker}")
+
+    # Find dip candidates that ALSO pass the regular screener score.
+    dippers = [s for s in signals if s.gap_pct <= gap_threshold]
+    if not dippers:
+        print(f"\n  No gaps below {gap_threshold:+.1%} — nothing to buy.")
+        return
+
+    # Order dip-buy candidates by deepest gap first.
+    dippers.sort(key=lambda s: s.gap_pct)
+    print(f"\n  {len(dippers)} dip candidate(s); placing up to {max_trades} order(s):")
+
+    # Load circuit-breaker settings so we can compute a half-size order.
+    settings_path = Path(__file__).parent / "config" / "settings.yaml"
+    with open(settings_path) as f:
+        settings = yaml.safe_load(f) or {}
+    max_pos_pct = float(settings.get("circuit_breakers", {}).get("max_position_pct", 0.10))
+    if half_size:
+        max_pos_pct /= 2
+
+    account = client.get_account()
+    portfolio_value = float(account["portfolio_value"])
+    cash = float(account["cash"])
+    placed = 0
+
+    for sig in dippers[:max_trades]:
+        # Compute share count: half of max_position_pct of portfolio
+        target_dollars = portfolio_value * max_pos_pct
+        target_dollars = min(target_dollars, cash * 0.95)  # cash safety
+        shares = int(target_dollars / sig.last_price)
+        if shares < 1:
+            print(f"    {sig.ticker}: skip — share size would be 0 "
+                  f"(cash ${cash:.0f}, target ${target_dollars:.0f})")
+            continue
+
+        # Limit at pre-market last price — don't chase the spread.
+        # Truncate to penny precision; Alpaca rejects sub-penny limits
+        # for stocks priced ≥ $1.
+        limit_price = round(sig.last_price, 2)
+
+        if dry_run:
+            print(f"    {sig.ticker}: [DRY] would buy {shares} sh @ limit ${limit_price:.2f} "
+                  f"(${shares * limit_price:.0f} ≈ {(shares * limit_price)/portfolio_value:.1%} of book)")
+            continue
+
+        try:
+            from lib.order_gate import OrderIntent, step1_propose, step2_validate, step3_execute
+            intent = OrderIntent(
+                ticker=sig.ticker,
+                side="buy",
+                asset_type="equity",
+                quantity=shares,
+                limit_price=limit_price,
+                order_type="limit",
+                composite_score=min_composite,
+                reason=f"premarket_dip_buy gap={sig.gap_pct:+.2%}",
+                extended_hours=True,
+            )
+            step1_propose(intent)
+            step2_validate(
+                intent=intent,
+                portfolio_value=portfolio_value,
+                current_daily_pnl=0.0,
+                current_open_orders=0,
+                min_composite_score=0,  # bypass score check — signal-driven
+            )
+            resp = step3_execute(intent, client)
+            placed += 1
+            print(f"    {sig.ticker}: ✓ LIMIT buy {shares} sh @ ${limit_price:.2f} "
+                  f"(order {resp.get('id','?')[:12]})")
+            log_event("premarket_scan", "order_placed", {
+                "ticker": sig.ticker, "shares": shares,
+                "limit_price": limit_price,
+                "gap_pct": sig.gap_pct,
+                "order_id": resp.get("id"),
+            }, result="success")
+        except Exception as e:
+            print(f"    {sig.ticker}: ✗ failed — {str(e)[:140]}")
+            log_event("premarket_scan", "order_failed", {
+                "ticker": sig.ticker, "error": str(e)[:200],
+            }, result="failed")
+
+    print(f"\n  Done — placed {placed}/{min(max_trades, len(dippers))} order(s).")
+
+
 def cmd_self_audit(hours: float = 24.0, *, telegram: bool = False):
     """Run a comprehensive self-audit and print a digest.
 
@@ -2191,7 +2330,8 @@ def main():
     parser = argparse.ArgumentParser(description="OpenClaw Wheel Strategy Trader")
     parser.add_argument("command",
                         choices=["scan", "monitor", "backtest", "kill", "wheel-reset",
-                                 "wheel-dte-sweep", "self-audit", "status",
+                                 "wheel-dte-sweep", "self-audit", "premarket-scan",
+                                 "status",
                                  "chaos", "migrate", "dashboard", "hermes", "pdt",
                                  "kronos", "news", "calibrate", "pred-scan",
                                  "forecast", "kelly", "llm", "correlation",
@@ -2298,6 +2438,8 @@ def main():
         # Use --lookback if explicitly >= 1, else 24h (default for nightly).
         sa_hours = float(args.lookback) if args.lookback and args.lookback >= 1 else 24.0
         cmd_self_audit(hours=sa_hours, telegram=args.telegram)
+    elif args.command == "premarket-scan":
+        cmd_premarket_scan(dry_run=args.dry_run)
     elif args.command == "wheel-reset":
         cmd_wheel_reset(confirm=args.confirm)
     elif args.command == "wheel-dte-sweep":

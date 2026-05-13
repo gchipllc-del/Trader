@@ -187,6 +187,24 @@ class BullAgent:
                 evidence=f"pattern={pattern}",
             ))
 
+        # Pre-market gap signal mirror: large gap-up overnight is the
+        # bull-side analog of bear_agent's overnight_gap_down. The
+        # premarket-scan cron persists the per-ticker gap; here we
+        # read it without re-fetching.
+        ticker_for_signals = _extract(candidate, "ticker")
+        if ticker_for_signals:
+            try:
+                from lib.premarket_signals import get_gap_for
+                gap = get_gap_for(str(ticker_for_signals))
+                if gap is not None and gap >= 0.03:
+                    signals.append(BullSignal(
+                        "overnight_gap_up",
+                        weight=1,
+                        evidence=f"premarket gap {gap:+.1%} — overnight news bullish",
+                    ))
+            except Exception:
+                pass
+
         score = sum(s.weight for s in signals)
         score = min(score, 10)
 

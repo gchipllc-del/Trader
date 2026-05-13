@@ -197,6 +197,26 @@ class BearAgent:
                 evidence=f"pattern={pattern}",
             ))
 
+        # Pre-market gap signal: if the bot's premarket-scan persisted a
+        # large overnight gap-down (≤ -3%) for this ticker, that's a
+        # genuine bear signal for the regular-hours setup — news-driven
+        # gaps frequently extend through the day. Reads from
+        # ``data/premarket_signals.json`` populated by cmd_premarket_scan
+        # — no extra API call. Signal expires after SIGNAL_TTL_HOURS.
+        ticker_for_signals = _extract(candidate, "ticker")
+        if ticker_for_signals:
+            try:
+                from lib.premarket_signals import get_gap_for
+                gap = get_gap_for(str(ticker_for_signals))
+                if gap is not None and gap <= -0.03:
+                    signals.append(BearSignal(
+                        "overnight_gap_down",
+                        weight=1,
+                        evidence=f"premarket gap {gap:+.1%} — overnight news bearish",
+                    ))
+            except Exception:
+                pass
+
         # Learning-loop signal: prior outcomes on this ticker. If we've
         # lost on >= 60% of the last 5+ resolved trades, weight the bear
         # case higher. Cheap deterministic read against MemPalace KG;
