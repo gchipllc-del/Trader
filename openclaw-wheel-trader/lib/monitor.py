@@ -744,10 +744,11 @@ def run_monitoring_check(client: AlpacaClient, *, timeout_seconds: int = 120) ->
     # pipeline-funnel anomalies (e.g. "many attempts, 0 executed" —
     # the pattern that hid the 2026-05-13 contracts/shares conflation
     # bug for half a day). Read-only, never blocks. Critical findings
-    # ride the same Telegram alert channel.
+    # ride the same Telegram alert channel. Pass the broker client so
+    # state-reconciliation + P&L-reconciliation can also fire.
     try:
         from lib.self_audit import run_self_audit
-        audit_result = run_self_audit(hours=4)
+        audit_result = run_self_audit(hours=4, broker_client=client)
         for a in audit_result.get("alerts", []):
             sev = a.get("severity", "info")
             summary["alerts"].append(
