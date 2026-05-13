@@ -197,6 +197,27 @@ class BearAgent:
                 evidence=f"pattern={pattern}",
             ))
 
+        # Learning-loop signal: prior outcomes on this ticker. If we've
+        # lost on >= 60% of the last 5+ resolved trades, weight the bear
+        # case higher. Cheap deterministic read against MemPalace KG;
+        # no LLM call. Pattern from TradingAgents v0.2.4 — "agents learn
+        # from past trades" realized as a numeric signal here.
+        ticker_for_history = _extract(candidate, "ticker")
+        if ticker_for_history:
+            try:
+                from lib.memory_palace import prior_loss_rate
+                losses, total, rate = prior_loss_rate(str(ticker_for_history),
+                                                     lookback_n=10)
+                if total >= 5 and rate >= 0.60:
+                    signals.append(BearSignal(
+                        "prior_loss_history",
+                        weight=1,
+                        evidence=f"{losses}/{total} recent trades lost "
+                                 f"({rate:.0%}) — pattern likely repeats",
+                    ))
+            except Exception:
+                pass  # never block on memory lookup failure
+
         score = sum(s.weight for s in signals)
         score = min(score, 10)  # clamp
 

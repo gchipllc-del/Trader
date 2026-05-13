@@ -259,8 +259,10 @@ def execute_csp(
         diary_write("strategy_agent", f"{ticker}|CSP_FAILED|execution|{e}")
         return None
 
-    # Success — remember everything
-    remember_trade_decision(
+    # Success — remember everything. Capture the drawer_id so the
+    # outcome can later be linked back to the original reasoning
+    # (learning-loop pattern from TradingAgents v0.2.4).
+    decision_drawer_id = remember_trade_decision(
         ticker=ticker,
         trade_type="csp",
         details={
@@ -280,7 +282,8 @@ def execute_csp(
         f"zone_{candidate.zone_level}|{candidate.candlestick_pattern or 'no_pattern'}"
     )
 
-    # Track position
+    # Track position — store decision_drawer_id so the outcome can be
+    # resolved against this specific decision at close time.
     positions = _load_positions()
     positions.append({
         "ticker": ticker,
@@ -292,6 +295,7 @@ def execute_csp(
         "order_id": response.get("id", ""),
         "opened_at": datetime.now(timezone.utc).isoformat(),
         "composite_score": candidate.composite_score,
+        "decision_drawer_id": decision_drawer_id,
     })
     _save_positions(positions)
 

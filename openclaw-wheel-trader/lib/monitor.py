@@ -22,6 +22,7 @@ from lib.audit import log_event
 from lib.memory_palace import (
     diary_write, kg_add, kg_invalidate, remember_trade_decision,
     remember_regime_change,
+    record_trade_outcome, reflect_on_outcome, search_memory,
 )
 from lib.alpaca_client import AlpacaClient
 
@@ -253,6 +254,100 @@ def check_roll_candidate(position: dict, current_price: float) -> dict | None:
     return None
 
 
+def _resolve_position_outcome(
+    pos: dict,
+    *,
+    exit_reason: str,
+    final_price: float | None = None,
+    final_pnl_dollars: float | None = None,
+) -> None:
+    """Bridge from a position-close event to the MemPalace learning loop.
+
+    Looks up the original decision_drawer_id on the position, computes
+    realized return + holding days, records an outcome drawer, and
+    fires an LLM reflection. All best-effort: failure here never blocks
+    trading or breaks the close detection that called us.
+    """
+    try:
+        drawer_id = pos.get("decision_drawer_id") or pos.get("cc_decision_drawer_id")
+        if not drawer_id:
+            return  # legacy position from before the learning loop landed
+
+        ticker = pos.get("ticker") or "?"
+        opened_at = pos.get("opened_at") or ""
+        holding_days = 0
+        if opened_at:
+            try:
+                opened = datetime.fromisoformat(opened_at.replace("Z", "+00:00"))
+                holding_days = max(0, (datetime.now(timezone.utc) - opened).days)
+            except (ValueError, TypeError):
+                pass
+
+        # Realized return: try the explicit P&L the caller supplied, else
+        # infer from strike + premium + final_price for typical exits.
+        realized = 0.0
+        if final_pnl_dollars is not None:
+            collateral = float(pos.get("strike", 0) or 0) * 100
+            realized = (final_pnl_dollars / collateral) if collateral > 0 else 0.0
+        elif exit_reason == "csp_assigned" and final_price is not None:
+            strike = float(pos.get("strike", 0) or 0)
+            premium = float(pos.get("premium_collected", 0) or 0)
+            cost_basis = strike - premium
+            if cost_basis > 0:
+                realized = (final_price - cost_basis) / cost_basis
+        elif exit_reason in ("csp_expired", "cc_expired"):
+            premium = float(pos.get("premium_collected", 0) or pos.get("cc_premium", 0) or 0)
+            strike = float(pos.get("strike", 0) or 0)
+            collateral = max(strike * 100, 1.0)
+            realized = (premium * 100) / collateral
+        elif exit_reason == "cc_called_away" and final_price is not None:
+            cost_basis = float(pos.get("cost_basis", 0) or 0)
+            premium = float(pos.get("cc_premium", 0) or 0)
+            strike = float(pos.get("cc_strike", 0) or final_price)
+            entry = cost_basis + premium  # original cost before CC adjust
+            if entry > 0:
+                realized = (strike - entry) / entry
+
+        outcome_id = record_trade_outcome(
+            ticker=ticker,
+            decision_drawer_id=drawer_id,
+            realized_return_pct=realized,
+            holding_days=holding_days,
+            exit_reason=exit_reason,
+            final_pnl_dollars=final_pnl_dollars,
+        )
+
+        # Best-effort LLM reflection — pull the original reasoning back
+        # from the palace and ask the LLM to write a short lesson.
+        try:
+            original = search_memory(ticker, wing=f"wing_{ticker.lower()}",
+                                     hall="hall_facts", n_results=20)
+            decision_content = next(
+                (o.get("content", "") for o in original
+                 if o.get("drawer_id") == drawer_id),
+                "",
+            )
+            if decision_content:
+                outcome_summary = (
+                    f"{exit_reason} after {holding_days} days, "
+                    f"realized return {realized:+.2%}"
+                )
+                reflect_on_outcome(
+                    decision_drawer_id=drawer_id,
+                    outcome_drawer_id=outcome_id,
+                    ticker=ticker,
+                    decision_reasoning=decision_content,
+                    outcome_summary=outcome_summary,
+                )
+        except Exception as e:
+            log_event("monitor", "reflection_failed",
+                      {"ticker": ticker, "error": str(e)[:200]}, result="degraded")
+    except Exception as e:
+        log_event("monitor", "resolve_outcome_failed",
+                  {"ticker": pos.get("ticker"), "error": str(e)[:200]},
+                  result="degraded")
+
+
 def check_assignment(position: dict, broker_positions: list[dict]) -> dict | None:
     """
     Detect if a CSP has been assigned (we now hold shares).
@@ -456,6 +551,16 @@ def run_monitoring_check(client: AlpacaClient) -> dict:
                 diary_write("strategy_agent",
                     f"{ticker}|ASSIGNED|{pos.get('strike')}|shares_{assignment['shares']}|"
                     f"cost_basis_{pos['cost_basis']:.2f}")
+
+                # Learning loop: resolve the CSP decision with its outcome.
+                # CSP assignment = strike was reached → outcome is the
+                # premium collected minus the immediate unrealized loss
+                # vs the assignment price. Future agents will see this
+                # outcome attached to the original reasoning.
+                _resolve_position_outcome(
+                    pos, exit_reason="csp_assigned",
+                    final_price=float(assignment["avg_price"]),
+                )
 
                 send_alert(f"📋 {ticker} CSP ASSIGNED\n"
                           f"Strike: {pos.get('strike')}\n"

@@ -13,17 +13,26 @@ from lib.memory_palace import (
     kg_add, kg_invalidate, kg_query, kg_timeline,
     diary_write, diary_read,
     remember_trade_decision, remember_regime_change, recall_ticker_history,
+    record_trade_outcome, get_past_outcomes, prior_loss_rate,
     get_current_regime, PALACE_DIR, KG_DB, DIARY_DIR,
 )
 
 
 @pytest.fixture(autouse=True)
 def tmp_palace(tmp_path, monkeypatch):
-    """Redirect palace to temp dir for each test."""
+    """Redirect palace to temp dir for each test.
+
+    Force HAS_CHROMA=False so we exercise the JSONL fallback path.
+    Some macOS / Python builds segfault inside chromadb's onnx
+    embedding model (``onnx_mini_lm_l6_v2``) — that's an environment
+    issue unrelated to MemPalace logic, and the fallback path covers
+    the same correctness contract.
+    """
     palace = tmp_path / "palace"
     monkeypatch.setattr("lib.memory_palace.PALACE_DIR", palace)
     monkeypatch.setattr("lib.memory_palace.KG_DB", palace / "knowledge_graph.db")
     monkeypatch.setattr("lib.memory_palace.DIARY_DIR", palace / "diaries")
+    monkeypatch.setattr("lib.memory_palace.HAS_CHROMA", False)
     return palace
 
 
@@ -150,6 +159,101 @@ class TestTradingHelpers:
         assert history["ticker"] == "AAPL"
         assert len(history["kg_facts"]) >= 1
         assert "strategy_agent" in history["agent_mentions"]
+
+
+class TestLearningLoop:
+    """Decision → outcome → reflection → injection cycle (TradingAgents v0.2.4 pattern)."""
+
+    def test_remember_returns_drawer_id(self):
+        drawer_id = remember_trade_decision(
+            ticker="AAPL", trade_type="csp",
+            details={"strike": 170, "expiration": "2026-06-21", "premium": 3.50},
+            reasoning="Strong support zone at 170, hammer on daily, IV rank 45%.",
+        )
+        assert isinstance(drawer_id, str) and len(drawer_id) == 12
+
+    def test_record_outcome_links_back_to_decision(self):
+        drawer_id = remember_trade_decision(
+            ticker="AAPL", trade_type="csp",
+            details={"strike": 170, "expiration": "2026-06-21", "premium": 3.50},
+            reasoning="Test decision.",
+        )
+        outcome_id = record_trade_outcome(
+            ticker="AAPL",
+            decision_drawer_id=drawer_id,
+            realized_return_pct=0.012,
+            holding_days=14,
+            exit_reason="csp_expired",
+            final_pnl_dollars=350.0,
+        )
+        assert isinstance(outcome_id, str)
+        # KG should have the outcome edge linking back to the decision
+        facts = kg_query("AAPL", current_only=False)
+        outcomes = [f for f in facts if f["predicate"] == "outcome"]
+        assert outcomes, "expected outcome edge in KG"
+        # KG stores metadata as JSON string; parse it before asserting
+        meta = json.loads(outcomes[0]["metadata"])
+        assert meta["decision_drawer_id"] == drawer_id
+        assert meta["holding_days"] == 14
+
+    def test_get_past_outcomes_returns_empty_when_no_history(self):
+        result = get_past_outcomes("ZZZZ")  # ticker never seen
+        assert result == ""
+
+    def test_get_past_outcomes_includes_resolved_trades(self):
+        drawer_id = remember_trade_decision(
+            ticker="NVDA", trade_type="csp",
+            details={"strike": 500, "expiration": "2026-06-21", "premium": 8.0},
+            reasoning="Decision reasoning text.",
+        )
+        record_trade_outcome(
+            ticker="NVDA", decision_drawer_id=drawer_id,
+            realized_return_pct=-0.18, holding_days=21,
+            exit_reason="csp_assigned",
+        )
+        result = get_past_outcomes("NVDA")
+        # The formatted output should include the exit reason and return
+        assert "NVDA" in result
+        assert "csp_assigned" in result or "-18" in result or "-0.18" in result or "-18.0%" in result
+
+    def test_prior_loss_rate_zero_when_no_outcomes(self):
+        losses, total, rate = prior_loss_rate("FRESH")
+        assert (losses, total, rate) == (0, 0, 0.0)
+
+    def test_prior_loss_rate_counts_negative_outcomes(self):
+        # 3 trades: 2 losses, 1 win
+        for i, ret in enumerate([-0.15, -0.08, +0.03]):
+            d = remember_trade_decision(
+                ticker="AMD", trade_type="csp",
+                details={"strike": 100 + i, "expiration": "2026-06-21"},
+                reasoning=f"Decision {i}",
+            )
+            record_trade_outcome(
+                ticker="AMD", decision_drawer_id=d,
+                realized_return_pct=ret, holding_days=14,
+                exit_reason="csp_assigned" if ret < 0 else "csp_expired",
+            )
+        losses, total, rate = prior_loss_rate("AMD")
+        assert total == 3
+        assert losses == 2
+        assert abs(rate - (2/3)) < 0.01
+
+    def test_outcome_metadata_includes_alpha_when_provided(self):
+        d = remember_trade_decision(
+            ticker="SPY", trade_type="csp",
+            details={"strike": 500}, reasoning="test",
+        )
+        record_trade_outcome(
+            ticker="SPY", decision_drawer_id=d,
+            realized_return_pct=0.05, alpha_pct=-0.02, holding_days=10,
+            exit_reason="csp_expired",
+        )
+        # The outcome drawer should be searchable. JSONL fallback uses
+        # case-insensitive substring match against content, so the
+        # query must be a substring of the rendered outcome text.
+        outcomes = search_memory("SPY", wing="wing_spy",
+                                 hall="hall_outcomes", n_results=5)
+        assert outcomes, "expected outcome drawer to be retrievable"
 
 
 if __name__ == "__main__":

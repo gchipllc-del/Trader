@@ -230,6 +230,20 @@ def _build_prompt(
     """Returns (system_prompt, user_prompt) pair."""
     headlines_str = "\n".join(f"- {h}" for h in (recent_headlines or [])[:5]) or "(none)"
 
+    # Past outcomes & reflections — the learning loop. Without this, every
+    # decision is made cold; with it, the LLM sees how prior setups on
+    # this ticker actually played out and any lessons recorded by the
+    # reflection pass after they closed.
+    try:
+        from lib.memory_palace import get_past_outcomes
+        past_context = get_past_outcomes(ticker)
+    except Exception:
+        past_context = ""
+    past_block = (
+        f"\n\nPRIOR OUTCOMES & LESSONS:\n{past_context}\n"
+        if past_context else ""
+    )
+
     system_prompt = (
         "You are a disciplined quantitative stock analyst advising a retail trader using "
         "The Wheel Strategy (CSPs, covered calls, and occasional swing stock trades). "
@@ -256,7 +270,7 @@ TECHNICAL SIGNALS:
 - News sentiment: {f"{news_sentiment:.2f}" if news_sentiment is not None else "n/a"} (0=bearish, 0.5=neutral, 1=bullish)
 
 RECENT HEADLINES:
-{headlines_str}
+{headlines_str}{past_block}
 
 ## Step 0: Knowledge expansion (think before you score)
 Before producing the JSON, briefly enumerate to yourself:

@@ -302,8 +302,9 @@ def execute_cc(
         diary_write("strategy_agent", f"{ticker}|CC_FAILED|{e}")
         return None
 
-    # Success — update position and memory
-    remember_trade_decision(
+    # Success — update position and memory. Capture the drawer_id so
+    # the outcome can later be linked back to the decision reasoning.
+    decision_drawer_id = remember_trade_decision(
         ticker=ticker,
         trade_type="cc",
         details={
@@ -326,6 +327,8 @@ def execute_cc(
             p["cc_order_id"] = response.get("id", "")
             # Reduce cost basis by CC premium
             p["cost_basis"] = p.get("cost_basis", 0) - candidate.premium
+            # Linkage for the learning loop
+            p["cc_decision_drawer_id"] = decision_drawer_id
             break
     _save_positions(positions)
 
@@ -380,6 +383,59 @@ def handle_call_assignment(ticker: str, position: dict):
     kg_invalidate(ticker, "assigned", f"{position.get('assigned_shares', 100)}_shares")
     kg_add(ticker, "wheel_completed", f"pnl_{total_pnl:.2f}",
            metadata={"put_strike": strike, "call_strike": cc_strike})
+
+    # Learning loop: resolve BOTH the original CSP decision (if linked)
+    # and the CC decision with their respective outcomes. Best-effort:
+    # any failure here is logged degraded and never blocks the cycle.
+    try:
+        from lib.memory_palace import (
+            record_trade_outcome, reflect_on_outcome, search_memory,
+        )
+        # CC outcome — called away, full capital gain realized
+        cc_drawer = position.get("cc_decision_drawer_id")
+        if cc_drawer and cc_strike > 0:
+            cc_return = capital_gain / (strike * 100) if strike > 0 else 0.0
+            cc_outcome_id = record_trade_outcome(
+                ticker=ticker,
+                decision_drawer_id=cc_drawer,
+                realized_return_pct=cc_return,
+                holding_days=0,  # filled in below if opened_at available
+                exit_reason="cc_called_away",
+                final_pnl_dollars=capital_gain + cc_premiums * 100,
+            )
+            # Reflection on the CC decision
+            originals = search_memory(ticker, wing=f"wing_{ticker.lower()}",
+                                       hall="hall_facts", n_results=20)
+            content = next((o.get("content", "") for o in originals
+                            if o.get("drawer_id") == cc_drawer), "")
+            if content:
+                reflect_on_outcome(
+                    decision_drawer_id=cc_drawer,
+                    outcome_drawer_id=cc_outcome_id,
+                    ticker=ticker,
+                    decision_reasoning=content,
+                    outcome_summary=(
+                        f"Called away at ${cc_strike} from cost basis ${strike}. "
+                        f"Cap gain ${capital_gain:.2f}, total cycle P&L ${total_pnl:.2f}."
+                    ),
+                )
+        # CSP outcome — the original entry that started the whole cycle.
+        # Marks it as "csp_assigned_then_called_away" so the learning
+        # signal is "this assignment was good — got called away profitably".
+        csp_drawer = position.get("decision_drawer_id")
+        if csp_drawer:
+            csp_return = total_pnl / (strike * 100) if strike > 0 else 0.0
+            record_trade_outcome(
+                ticker=ticker,
+                decision_drawer_id=csp_drawer,
+                realized_return_pct=csp_return,
+                holding_days=0,
+                exit_reason="csp_assigned_then_called_away",
+                final_pnl_dollars=total_pnl,
+            )
+    except Exception as e:
+        log_event("cc_engine", "outcome_resolution_failed",
+                  {"ticker": ticker, "error": str(e)[:200]}, result="degraded")
 
     diary_write("strategy_agent",
         f"{ticker}|WHEEL_COMPLETE|put_{strike}|call_{cc_strike}|"
