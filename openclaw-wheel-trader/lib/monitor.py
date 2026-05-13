@@ -740,6 +740,27 @@ def run_monitoring_check(client: AlpacaClient, *, timeout_seconds: int = 120) ->
         _signal.alarm(0)
         _signal.signal(_signal.SIGALRM, _prev_handler)
 
+    # Self-audit: scan the last 4h of the bot's own audit log for
+    # pipeline-funnel anomalies (e.g. "many attempts, 0 executed" —
+    # the pattern that hid the 2026-05-13 contracts/shares conflation
+    # bug for half a day). Read-only, never blocks. Critical findings
+    # ride the same Telegram alert channel.
+    try:
+        from lib.self_audit import run_self_audit
+        audit_result = run_self_audit(hours=4)
+        for a in audit_result.get("alerts", []):
+            sev = a.get("severity", "info")
+            summary["alerts"].append(
+                f"{'🔴' if sev == 'critical' else '⚠️'} SELF-AUDIT [{a['code']}]: {a['summary']}"
+            )
+            if sev == "critical":
+                send_alert(
+                    f"🔴 SELF-AUDIT {a['code']}: {a['summary']}"
+                )
+    except Exception as e:
+        log_event("monitor", "self_audit_failed",
+                  {"error": str(e)[:200]}, result="degraded")
+
     log_event("monitor", "check_complete", {
         "positions": summary["positions_checked"],
         "actions": len(summary["actions"]),
