@@ -374,12 +374,35 @@ def check_assignment(position: dict, broker_positions: list[dict]) -> dict | Non
 # MAIN MONITORING LOOP
 # ============================================================
 
-def run_monitoring_check(client: AlpacaClient) -> dict:
+def run_monitoring_check(client: AlpacaClient, *, timeout_seconds: int = 120) -> dict:
     """
     Single monitoring check. Called every 3 minutes by launchd cron.
 
     Returns summary dict of actions taken.
+
+    Wall-clock timeout (default 120s) defends against the 2026-05-12
+    incident where an Alpaca HTTPS connection stayed "established" with
+    no response, hanging the monitor for 11 hours and blocking launchd
+    from firing fresh cycles. SIGALRM interrupts a blocking syscall on
+    the next return-from-kernel — works against SSL socket reads where
+    the alpaca-py SDK has no built-in timeout.
     """
+    import signal as _signal
+
+    class _MonitorTimeout(Exception):
+        pass
+
+    def _on_alarm(signum, frame):  # noqa: ARG001
+        raise _MonitorTimeout(
+            f"monitor cycle exceeded {timeout_seconds}s wallclock — "
+            f"likely Alpaca SDK hang on an unresponsive HTTPS connection"
+        )
+
+    # signal.SIGALRM is main-thread-only on macOS / Linux. The monitor
+    # cron runs as a one-shot process so this is the main thread.
+    _prev_handler = _signal.signal(_signal.SIGALRM, _on_alarm)
+    _signal.alarm(int(timeout_seconds))
+
     # Wave 3 #17: detect missed cycles from the previous heartbeat BEFORE
     # resetting in-process state. If the gap was big enough, this can
     # trip the kill switch.
@@ -696,10 +719,26 @@ def run_monitoring_check(client: AlpacaClient) -> dict:
             log_event("monitor", "fund_manager_failed", {"error": str(e)[:200]},
                       result="degraded")
 
+    except _MonitorTimeout as e:
+        # Hang detected — abort the cycle cleanly so launchd can re-fire.
+        # Without this branch the entire process stays blocked in
+        # whatever SSL recv() was hung, and the cron never advances.
+        log_event("monitor", "check_timeout", {
+            "timeout_seconds": int(timeout_seconds),
+            "error": str(e)[:200],
+        }, result="failed")
+        summary["error"] = f"timeout after {timeout_seconds}s"
+        send_alert(f"⏱️  Monitor cycle aborted after {timeout_seconds}s — "
+                   f"likely Alpaca connection hang. Next cycle will retry.")
     except Exception as e:
         log_event("monitor", "check_failed", {"error": str(e)}, result="failed")
         summary["error"] = str(e)
         send_alert(f"❌ Monitoring check failed: {e}")
+    finally:
+        # Disarm the alarm and restore the previous SIGALRM handler so
+        # callers (tests, REPL) aren't left with a dangling timer.
+        _signal.alarm(0)
+        _signal.signal(_signal.SIGALRM, _prev_handler)
 
     log_event("monitor", "check_complete", {
         "positions": summary["positions_checked"],
