@@ -302,6 +302,12 @@ def check_state_reconciliation(broker_client) -> list[AuditAlert]:
     activity, stale positions.json after a crash, broker-side fills the
     bot didn't record. Distinct from ``wheel_state`` preflight (which
     only runs at scan time) — this is continuous.
+
+    Core-holding awareness: tickers in ``wheel_strategy.yaml.core_holdings``
+    are treated specially — when local says held and broker shows zero,
+    the alert is upgraded to ``CORE_HOLDING_MISSING`` (critical) instead
+    of ``STATE_DRIFT_BROKER`` (warn). Core holdings are forever-holds;
+    their absence at the broker is operationally urgent, not "drift".
     """
     alerts: list[AuditAlert] = []
     try:
@@ -315,6 +321,19 @@ def check_state_reconciliation(broker_client) -> list[AuditAlert]:
         log_event("self_audit", "state_recon_unavailable",
                   {"error": str(e)[:200]}, result="degraded")
         return []
+
+    # Load core_holdings from config so we can distinguish forever-holds
+    # from transient screener trades. Best-effort: if config can't load,
+    # treat all as transient.
+    core_holdings: set[str] = set()
+    try:
+        import yaml
+        cfg_path = Path(__file__).parent.parent / "config" / "wheel_strategy.yaml"
+        with open(cfg_path) as f:
+            strategy = yaml.safe_load(f) or {}
+        core_holdings = {str(t).upper() for t in (strategy.get("core_holdings") or [])}
+    except Exception:
+        pass
 
     # Build (symbol, side-or-stock) → qty maps. Side matters because
     # short put and long stock can share an underlying ticker.
@@ -368,13 +387,20 @@ def check_state_reconciliation(broker_client) -> list[AuditAlert]:
         # Look up broker qty by ticker (stock symbol is just ticker).
         broker_qty = broker_map.get((ticker, "long"), 0) or broker_map.get((ticker, ""), 0)
         if local_qty > 0 and broker_qty == 0:
+            is_core = ticker in core_holdings
             alerts.append(AuditAlert(
-                severity="warn", code="STATE_DRIFT_BROKER",
+                severity="critical" if is_core else "warn",
+                code="CORE_HOLDING_MISSING" if is_core else "STATE_DRIFT_BROKER",
                 summary=(
+                    (f"⚠️ CORE HOLDING MISSING: {ticker} (forever-hold) — "
+                     f"local says {local_qty:g} sh, broker shows 0. "
+                     f"Replenish ASAP via manual buy.")
+                    if is_core else
                     f"{ticker}: local says {local_qty:g} sh open, broker shows 0 "
                     f"— phantom local position or unrecorded close"
                 ),
-                evidence={"ticker": ticker, "local_qty": local_qty},
+                evidence={"ticker": ticker, "local_qty": local_qty,
+                          "is_core_holding": is_core},
             ))
         elif local_qty > 0 and broker_qty > 0 and abs(local_qty - broker_qty) >= 1:
             alerts.append(AuditAlert(

@@ -33,6 +33,7 @@ class OrderIntent:
     notional: float | None = None         # crypto buys: dollar amount instead of qty
     reason: str = ""
     composite_score: int = 0             # Trend + Level + Signal (0-9)
+    extended_hours: bool = False         # True to route through pre/post-market
     created_at: str = ""
     intent_hash: str = ""
     _validated: bool = False             # Set by step2_validate

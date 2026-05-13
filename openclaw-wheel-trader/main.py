@@ -618,6 +618,62 @@ def cmd_monitor():
     start_monitoring_loop(client)
 
 
+def cmd_self_audit(hours: float = 24.0, *, telegram: bool = False):
+    """Run a comprehensive self-audit and print a digest.
+
+    Default 24h window for nightly cron usage. Pass ``--telegram`` to
+    also send the digest to the configured Telegram channel — useful
+    for the nightly launchd schedule.
+    """
+    from lib.alpaca_client import AlpacaClient
+    from lib.self_audit import run_self_audit
+
+    try:
+        client = AlpacaClient()
+    except Exception as e:
+        print(f"Could not init broker client (broker-dependent checks skipped): {e}")
+        client = None
+
+    result = run_self_audit(hours=hours, broker_client=client)
+    funnels = result.get("funnels", {})
+    alerts = result.get("alerts", [])
+
+    lines = [
+        f"=== SELF-AUDIT ({hours:.0f}h window) ===",
+        "",
+        "Pipeline funnel:",
+    ]
+    if funnels:
+        for cls, f in funnels.items():
+            nonzero = {k: v for k, v in f.items() if v}
+            if nonzero:
+                lines.append(f"  {cls}: {nonzero}")
+    else:
+        lines.append("  (no trade activity in window)")
+
+    lines.append("")
+    if alerts:
+        crit = [a for a in alerts if a.get("severity") == "critical"]
+        warn = [a for a in alerts if a.get("severity") == "warn"]
+        lines.append(f"Alerts: {len(crit)} critical, {len(warn)} warn")
+        for a in alerts:
+            emoji = "🔴" if a.get("severity") == "critical" else "⚠️"
+            lines.append(f"  {emoji} [{a['code']}] {a['summary']}")
+    else:
+        lines.append("✅ All checks clean — no anomalies detected.")
+
+    digest = "\n".join(lines)
+    print(digest)
+
+    if telegram:
+        try:
+            from lib.monitor import send_alert
+            # Telegram has a 4096-char limit; truncate if needed.
+            send_alert(digest[:3800] + ("\n…(truncated)" if len(digest) > 3800 else ""))
+        except Exception as e:
+            print(f"\n(Telegram send failed: {e})")
+
+
 def cmd_kill(reason: str = "manual_cli"):
     """Emergency kill switch."""
     from lib.kill_switch import activate_kill_switch
@@ -2135,7 +2191,7 @@ def main():
     parser = argparse.ArgumentParser(description="OpenClaw Wheel Strategy Trader")
     parser.add_argument("command",
                         choices=["scan", "monitor", "backtest", "kill", "wheel-reset",
-                                 "wheel-dte-sweep", "status",
+                                 "wheel-dte-sweep", "self-audit", "status",
                                  "chaos", "migrate", "dashboard", "hermes", "pdt",
                                  "kronos", "news", "calibrate", "pred-scan",
                                  "forecast", "kelly", "llm", "correlation",
@@ -2238,6 +2294,10 @@ def main():
         cmd_monitor()
     elif args.command == "kill":
         cmd_kill(args.reason)
+    elif args.command == "self-audit":
+        # Use --lookback if explicitly >= 1, else 24h (default for nightly).
+        sa_hours = float(args.lookback) if args.lookback and args.lookback >= 1 else 24.0
+        cmd_self_audit(hours=sa_hours, telegram=args.telegram)
     elif args.command == "wheel-reset":
         cmd_wheel_reset(confirm=args.confirm)
     elif args.command == "wheel-dte-sweep":

@@ -594,6 +594,25 @@ class AlpacaClient:
         else:
             symbol = intent.ticker
 
+        # Extended-hours routing — Alpaca pre-market is 4:00-9:30 AM ET
+        # and post-market 4:00-8:00 PM ET. Two hard requirements:
+        #   1. LIMIT orders only (Alpaca rejects market orders in extended hours)
+        #   2. asset_type == "equity" only (options & crypto don't route extended)
+        # The flag must be opt-in: a pre-market scan cron should set it
+        # explicitly; regular trading-hours code paths leave it False.
+        wants_extended = bool(getattr(intent, "extended_hours", False))
+        if wants_extended:
+            if intent.asset_type != "equity":
+                raise ValueError(
+                    f"extended_hours requires asset_type=equity, "
+                    f"got {intent.asset_type}"
+                )
+            if intent.order_type != "limit":
+                raise ValueError(
+                    "extended_hours requires order_type=limit "
+                    "(Alpaca rejects market orders outside regular hours)"
+                )
+
         if intent.asset_type == "crypto":
             # Crypto: GTC required, supports notional buys, fractional qty sells.
             tif = TimeInForce.GTC
@@ -611,13 +630,16 @@ class AlpacaClient:
                 time_in_force=TimeInForce.DAY,
             )
         else:
-            request = LimitOrderRequest(
-                symbol=symbol,
-                qty=intent.quantity,
-                side=side,
-                time_in_force=TimeInForce.DAY,
-                limit_price=intent.limit_price,
-            )
+            limit_kwargs = {
+                "symbol": symbol,
+                "qty": intent.quantity,
+                "side": side,
+                "time_in_force": TimeInForce.DAY,
+                "limit_price": intent.limit_price,
+            }
+            if wants_extended:
+                limit_kwargs["extended_hours"] = True
+            request = LimitOrderRequest(**limit_kwargs)
 
         order = client.submit_order(request)
 
