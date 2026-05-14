@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.openclaw.caffeinate</string>
+    <!--
+        Keep the Mac awake so launchd jobs fire on schedule overnight.
+        Previously invoked a bash wrapper that occasionally failed under
+        launchd (pgrep + set -e + pipefail edge cases). Now invokes
+        ``caffeinate -i`` directly with KeepAlive so launchd respawns it
+        if it ever dies. No -t timeout — runs indefinitely. Result: the
+        Mac stays awake while launchd is running this job.
+
+        To pause: ``launchctl unload ~/Library/LaunchAgents/ai.openclaw.caffeinate.plist``
+        To resume: ``launchctl load ~/Library/LaunchAgents/ai.openclaw.caffeinate.plist``
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-i</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/jesse/Desktop/projects/traderbot/openclaw-wheel-trader/logs/launchd_caffeinate.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/jesse/Desktop/projects/traderbot/openclaw-wheel-trader/logs/launchd_caffeinate_err.log</string>
+</dict>
+</plist>
