@@ -77,21 +77,34 @@ def _get_baseline(current_equity: float) -> tuple[float, str]:
     """
     Return (baseline_equity, set_at_iso) for the %-gain-to-date metric.
 
-    On first call (no baseline file yet), we prefer Alpaca portfolio history's
-    first recorded equity — that's the account's actual starting capital, which
-    is what the user cares about ("my total gains since I opened the account").
-    If Alpaca history is unavailable (keys missing, API error, brand-new
-    account), fall back to current equity. Users can override at any time by
-    editing the file or calling `set_baseline(amount)`.
+    Two-tier baseline: the file may carry both ``start_baseline`` (the
+    true account starting capital, set once and never changed — anchors
+    the long-term % growth headline) and ``baseline_equity`` (the
+    operating baseline used by the self-audit's P&L-drift check, which
+    can be periodically rebaselined after a reconciliation event).
+    The dashboard prefers ``start_baseline`` when present so long-term
+    growth doesn't reset every time we reconcile.
+
+    On first call (no baseline file yet), we prefer Alpaca portfolio
+    history's first recorded equity — that's the account's actual
+    starting capital. If unavailable, fall back to current equity.
+    Users can override via ``set_baseline(amount)``.
     """
     try:
         if BASELINE_PATH.exists():
             with open(BASELINE_PATH) as f:
                 data = json.load(f)
-            baseline = float(data.get("baseline_equity", current_equity))
+            # Prefer the immutable long-term start; fall back to the
+            # operating baseline; final fallback is current equity.
+            if "start_baseline" in data:
+                baseline = float(data.get("start_baseline", current_equity))
+                set_at = str(data.get("start_baseline_date") or data.get("set_at", ""))
+            else:
+                baseline = float(data.get("baseline_equity", current_equity))
+                set_at = str(data.get("set_at", ""))
             if baseline <= 0:
                 baseline = float(current_equity)
-            return baseline, str(data.get("set_at", ""))
+            return baseline, set_at
     except Exception:
         pass  # Fall through to fresh snapshot
 
@@ -395,12 +408,23 @@ def get_circuit_breaker_status() -> dict:
                 pct = float(p.get("market_value", 0)) / portfolio
                 max_pos_pct = max(max_pos_pct, pct)
 
+        # Effective daily-loss limit = the more restrictive of (dollar floor)
+        # and (pct of current equity). Mirrors lib/circuit_breaker.check_daily_loss.
+        dollar_floor = cb.get("max_daily_loss", -500)
+        pct_limit = cb.get("max_daily_loss_pct")
+        if pct_limit is not None and portfolio > 0:
+            effective_limit = max(dollar_floor, portfolio * pct_limit)  # both negative; max = stricter
+        else:
+            effective_limit = dollar_floor
+
         breakers = {
             "daily_loss": {
-                "limit": cb.get("max_daily_loss", -500),
+                "limit": round(effective_limit, 2),
+                "dollar_floor": dollar_floor,
+                "pct_limit": pct_limit,
                 "current": round(daily_pl, 2),
-                "pct_used": round(abs(daily_pl / cb.get("max_daily_loss", -500)), 2) if daily_pl < 0 else 0,
-                "tripped": daily_pl <= cb.get("max_daily_loss", -500),
+                "pct_used": round(abs(daily_pl / effective_limit), 2) if daily_pl < 0 and effective_limit < 0 else 0,
+                "tripped": daily_pl <= effective_limit,
             },
             "position_size": {
                 "limit": cb.get("max_position_pct", 0.10),
