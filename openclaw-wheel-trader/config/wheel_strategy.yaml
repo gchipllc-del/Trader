@@ -285,6 +285,20 @@ kelly:
 # (defensive — don't upsize aggressively because vol clusters and can
 # flip suddenly). Falls back to 1.0 (no-op) on insufficient bars or
 # any computation failure — never blocks trades.
+# Sector-rotation overlay (FinRL-X Adaptive Rotation pattern). Modifies
+# composite_score by sleeve↔regime alignment. Dormant below
+# activation_bankroll (default $5000 — the Phase 2 threshold). At small
+# bankrolls diversification math doesn't have enough capital to populate
+# sleeves meaningfully; the bonus is informational only until activation.
+# In bull regimes growth_tech gets +20%, defensive -15%; in bear it
+# flips. Capped at ±max_bonus_swing to keep rotation as a tiebreaker,
+# not a primary signal.
+sector_rotation:
+  enabled: true
+  activation_bankroll: 5000.0   # dormant below this; auto-activates at Phase 2
+  max_bonus_swing: 0.25         # cap effect at ±25%
+  # regime_bias: {}             # optional per-regime overrides (rarely needed)
+
 vol_aware_sizing:
   enabled: true
   current_window: 20         # bars for current realized vol (RV20)

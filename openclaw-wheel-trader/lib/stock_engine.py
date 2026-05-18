@@ -397,6 +397,24 @@ def scan_for_stocks(
     if corr_cfg.get("enabled", True):
         candidates = _apply_correlation_gate(candidates, held_tickers, daily_data, corr_cfg)
 
+    # Gate 7.5: Sector-rotation bias (FinRL-X Adaptive Rotation pattern).
+    # Modifies composite_score by sleeve↔regime alignment. Dormant below
+    # cfg.activation_bankroll ($5000 default) — at small bankrolls the
+    # diversification math doesn't have enough capital to populate
+    # sleeves meaningfully, so we skip rather than apply.
+    rotation_cfg = strategy.get("sector_rotation", {})
+    if rotation_cfg.get("enabled", True):
+        try:
+            from lib.sector_rotation import apply_rotation_bias
+            from lib.memory_palace import get_current_regime
+            regime_now = get_current_regime() or "unknown"
+            candidates = apply_rotation_bias(
+                candidates, regime_now, portfolio_value, rotation_cfg,
+            )
+        except Exception as e:
+            log_event("stock_engine", "rotation_bias_failed",
+                      {"error": str(e)[:200]}, result="degraded")
+
     # Gate 8: Kelly position sizing (overrides shares count with optimal size)
     kelly_cfg = strategy.get("kelly", {})
     if kelly_cfg.get("enabled", True):
