@@ -186,6 +186,82 @@ def check_contracts_per_order(contracts: int, settings: dict | None = None) -> b
     return True
 
 
+def check_consecutive_losses(settings: dict | None = None) -> bool:
+    """
+    Streak-based kill switch (adapted from NoFx, github.com/NoFxAiOS/nofx).
+
+    After N consecutive losing trades, refuse new entries for a cooldown
+    period. This catches regime-mismatch days where the bot is fighting
+    a trend it doesn't understand — even if the per-trade stop is doing
+    its job, a streak of losses signals the bot's edge has temporarily
+    inverted and capital preservation > new entries.
+
+    Reads recent trade outcomes from the calibration log (most recent N
+    resolved entries, where N = max_consecutive_losses + 1). Trips if
+    ALL of the last N were losses. Cooldown duration is
+    `streak_cooldown_hours` from settings.
+
+    Defaults: 3 consecutive losses → 24h cooldown. Returns True when
+    not tripped. Disabled when settings entry is missing OR set to 0.
+    """
+    if settings is None:
+        settings = _load_settings()
+    cb = settings.get("circuit_breakers", {})
+    n_threshold = int(cb.get("max_consecutive_losses", 0) or 0)
+    cooldown_hours = float(cb.get("streak_cooldown_hours", 24) or 24)
+
+    if n_threshold <= 0:
+        return True  # Feature disabled
+
+    # Read the calibration log (lightweight) — this is the same outcome
+    # source used by stock_calibration / agent_accuracy.
+    try:
+        from lib.stock_calibration import _load_calibration as _load_cal
+        entries = _load_cal() or []
+    except Exception:
+        # If we can't read history, default to allowing trades.
+        # Better to keep trading than to over-trip on infra errors.
+        return True
+
+    resolved = [e for e in entries if e.get("outcome") in ("win", "loss")]
+    if len(resolved) < n_threshold:
+        return True  # Not enough history to trip
+
+    recent = resolved[-n_threshold:]
+    all_losses = all(e.get("outcome") == "loss" for e in recent)
+    if not all_losses:
+        return True
+
+    # Streak detected — check if we're still inside the cooldown window.
+    last_loss_iso = recent[-1].get("resolved_at") or recent[-1].get("timestamp")
+    if not last_loss_iso:
+        return True  # Can't determine timing; don't block
+    try:
+        last_loss_time = datetime.fromisoformat(last_loss_iso.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return True
+    elapsed_hours = (datetime.now(timezone.utc) - last_loss_time).total_seconds() / 3600
+    if elapsed_hours >= cooldown_hours:
+        # Cooldown expired — let the bot trade again. The streak still
+        # shows in history but it's stale.
+        return True
+
+    remaining_hours = cooldown_hours - elapsed_hours
+    log_event("circuit_breaker", "consecutive_loss_streak", {
+        "n_losses": n_threshold,
+        "tickers": [e.get("ticker") for e in recent],
+        "last_loss_at": last_loss_iso,
+        "cooldown_hours": cooldown_hours,
+        "remaining_hours": round(remaining_hours, 2),
+    }, result="blocked")
+    raise CircuitBreakerTripped(
+        f"BLOCKED: {n_threshold} consecutive losses "
+        f"({', '.join(e.get('ticker','?') for e in recent)}) — "
+        f"streak cooldown {remaining_hours:.1f}h remaining "
+        f"(regime-mismatch protection; resumes after cooldown)"
+    )
+
+
 def run_all_checks(
     order_value: float,
     portfolio_value: float,
@@ -206,6 +282,7 @@ def run_all_checks(
     check_open_orders(current_open_orders, settings)
     check_contracts_per_order(contracts, settings)
     check_cooldown(last_loss_time, settings)
+    check_consecutive_losses(settings)
 
     log_event("circuit_breaker", "all_checks_passed", {
         "order_value": order_value,

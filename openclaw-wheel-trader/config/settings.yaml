@@ -27,6 +27,16 @@ circuit_breakers:
   max_contracts_per_order: 2    # Start small
   cooldown_after_loss_minutes: 15  # Faster recovery (was 30)
 
+  # Streak-based kill switch (NoFx pattern, github.com/NoFxAiOS/nofx).
+  # After N consecutive losses, refuses new entries for the cooldown
+  # window. Catches regime-mismatch days — bot fighting a trend it
+  # doesn't understand — before they compound. Layered ON TOP of
+  # cooldown_after_loss_minutes (single-loss recovery, above); this
+  # is the rarer streak-detector. Set max_consecutive_losses to 0
+  # to disable.
+  max_consecutive_losses: 3
+  streak_cooldown_hours: 24
+
 # --- PDT Guard (Pattern Day Trader Rule) ---
 pdt:
   enabled: true

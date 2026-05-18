@@ -257,20 +257,31 @@ def combine_bull_bear(
     bull_review: dict,
     bear_review: dict,
     cap_multiplier: float = 1.25,
+    use_dynamic_weights: bool = True,
 ) -> dict:
     """
     Reconcile bull + bear into a single sizing multiplier.
 
-    Asymmetric: bear's downsize/veto ALWAYS wins. Bull's boost only fires
-    when bear is silent (PASS) AND bull's score significantly exceeds
-    bear's. This preserves the "risk-first" discipline — we never let
-    bull's enthusiasm override a bear veto.
+    Asymmetric bear-first discipline is preserved: bear VETO and
+    DOWNSIZE ALWAYS win regardless of agent weights — risk discipline
+    is non-negotiable. Weighting only affects the BOOST threshold when
+    bear is in PASS.
+
+    Dynamic weighting (ai-hedge-fund pattern, github.com/virattt/
+    ai-hedge-fund): when use_dynamic_weights is True and we have
+    MIN_SAMPLES resolved trades per agent, the score-delta threshold
+    for BOOST is computed with each agent's recent accuracy. If bull
+    has been more accurate recently its score gets more weight, making
+    BOOST trigger at a lower raw delta; conversely if bull's been wrong,
+    raw delta has to be wider to trigger.
 
     Returns:
         {
             "size_multiplier": float,    # final combined
             "decision": "VETO" | "DOWNSIZE" | "BOOST" | "PASS",
-            "delta": int,                # bull_score - bear_score
+            "delta": int,                # bull_score - bear_score (raw)
+            "delta_eff": float,          # weighted effective delta
+            "weights": dict,             # {"bull_weight", "bear_weight", ...}
             "reasoning": str,
         }
     """
@@ -280,11 +291,36 @@ def combine_bull_bear(
     bear_score = int(bear_review.get("score", 0))
     delta = bull_score - bear_score
 
+    # Load dynamic weights — never fail the combine on a logging issue.
+    weights = {"bull_weight": 0.5, "bear_weight": 0.5, "is_default": True}
+    if use_dynamic_weights:
+        try:
+            from lib.agent_accuracy import get_agent_weights
+            weights = get_agent_weights()
+        except Exception:
+            # Best-effort — if the accuracy module can't read its log
+            # (e.g. fresh install, corruption), fall back to 0.5/0.5.
+            pass
+
+    # Weighted effective delta: scales each side's score by its weight,
+    # then compares. With default 0.5/0.5, this is 0.5*delta. With
+    # e.g. bull=0.7/bear=0.3, the same bull lead yields a larger
+    # delta_eff so BOOST clears more easily.
+    bw = float(weights.get("bull_weight", 0.5))
+    rw = float(weights.get("bear_weight", 0.5))
+    delta_eff = (bw * bull_score) - (rw * bear_score)
+    # Original threshold was raw delta >= 4 at equal weights, which
+    # equals delta_eff >= 2.0. Keep that as the gate so default
+    # behavior is unchanged.
+    boost_threshold_eff = 2.0
+
     if bear_action == "VETO":
         return {
             "size_multiplier": 0.0,
             "decision": "VETO",
             "delta": delta,
+            "delta_eff": round(delta_eff, 3),
+            "weights": weights,
             "reasoning": (
                 f"bear VETO score={bear_score} (bull was {bull_score}) — "
                 f"asymmetric risk discipline: bear always wins"
@@ -295,22 +331,31 @@ def combine_bull_bear(
             "size_multiplier": bear_mult,
             "decision": "DOWNSIZE",
             "delta": delta,
+            "delta_eff": round(delta_eff, 3),
+            "weights": weights,
             "reasoning": (
                 f"bear DOWNSIZE score={bear_score} (bull was {bull_score}) — "
                 f"bull boost suppressed by bear caution"
             ),
         }
 
-    # Bear is PASS — bull may boost if its case is materially stronger.
-    if bull_review.get("action") == "BOOST" and delta >= 4:
+    # Bear is PASS — bull may boost if its weighted case is materially stronger.
+    if bull_review.get("action") == "BOOST" and delta_eff >= boost_threshold_eff:
+        weight_note = (
+            "" if weights.get("is_default")
+            else f"  [weighted: bull={bw:.2f} bear={rw:.2f}]"
+        )
         return {
             "size_multiplier": min(cap_multiplier,
                                    float(bull_review.get("size_multiplier", 1.0))),
             "decision": "BOOST",
             "delta": delta,
+            "delta_eff": round(delta_eff, 3),
+            "weights": weights,
             "reasoning": (
                 f"bull BOOST score={bull_score} vs bear {bear_score} "
-                f"(delta {delta:+d} ≥ 4) — upsizing within cap"
+                f"(delta {delta:+d}, eff {delta_eff:+.2f})"
+                f"{weight_note} — upsizing within cap"
             ),
         }
 
@@ -318,7 +363,10 @@ def combine_bull_bear(
         "size_multiplier": 1.0,
         "decision": "PASS",
         "delta": delta,
+        "delta_eff": round(delta_eff, 3),
+        "weights": weights,
         "reasoning": (
-            f"bull {bull_score}/bear {bear_score} (delta {delta:+d}) → no adjustment"
+            f"bull {bull_score}/bear {bear_score} (delta {delta:+d}, "
+            f"eff {delta_eff:+.2f}) -> no adjustment"
         ),
     }

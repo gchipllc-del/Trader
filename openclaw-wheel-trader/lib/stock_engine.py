@@ -1012,6 +1012,23 @@ def execute_stock_buy(
                 f"{ticker}|STOCK_BEAR_VETO|bear_{bear_review['score']}/bull_{bull_review['score']}")
             return None
 
+        # Log the agent decision for accuracy tracking. Used by the
+        # weighted-aggregation pattern (ai-hedge-fund) to dynamically
+        # weight bull vs bear scores by recent track record.
+        try:
+            from lib.agent_accuracy import log_decision
+            log_decision(
+                ticker=ticker,
+                bull_score=int(bull_review.get("score", 0)),
+                bear_score=int(bear_review.get("score", 0)),
+                bull_action=str(bull_review.get("action", "?")),
+                bear_action=str(bear_review.get("action", "?")),
+                combined_decision=str(decision),
+                composite_score=int(candidate.get("composite_score", 0)),
+            )
+        except Exception:
+            pass  # Non-critical telemetry — never block trades on logging
+
         if size_mult != 1.0:
             new_shares = int(shares * size_mult)
             if new_shares < 1:
@@ -1535,6 +1552,19 @@ def execute_stock_sell(
                 outcome="win" if realized_pnl > 0 else "loss",
                 pnl_pct=pnl_pct,
                 close_reason=reason,
+            )
+        except Exception:
+            pass  # Non-critical
+
+        # Agent-accuracy outcome — mirror to the new per-agent log so
+        # weighted-aggregation has data to recompute bull/bear weights.
+        try:
+            from lib.agent_accuracy import record_outcome as record_agent_outcome
+            pnl_pct = (exit_price - entry_price) / entry_price if entry_price > 0 else 0
+            record_agent_outcome(
+                ticker=ticker,
+                outcome="win" if realized_pnl > 0 else "loss",
+                pnl_pct=pnl_pct,
             )
         except Exception:
             pass  # Non-critical
