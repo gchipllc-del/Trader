@@ -277,6 +277,25 @@ correlation:
 kelly:
   enabled: true
   fraction: 0.5
+# Volatility-aware position sizing (adapted from the Adaptive-Volatility-
+# Regime-Based-Execution-and-Risk-Framework pattern). Layered AFTER Kelly
+# + min_position_pct floor. Scales position size by realized-vol regime:
+# vol_multiplier = clip(1 / sqrt(current_vol / baseline_vol), floor, ceiling).
+# High vol → downsize (key risk-mgmt benefit). Low vol → cap at 1.0x
+# (defensive — don't upsize aggressively because vol clusters and can
+# flip suddenly). Falls back to 1.0 (no-op) on insufficient bars or
+# any computation failure — never blocks trades.
+vol_aware_sizing:
+  enabled: true
+  current_window: 20         # bars for current realized vol (RV20)
+  baseline_window: 60        # bars for baseline comparison (RV60)
+  use_kronos_forecast: false # opt-in: replace current RV with Kronos forward forecast
+                             # (slow ~6-10s/ticker on CPU; only enable
+                             # if Kronos calls aren't a bottleneck)
+  kronos_horizon: 20         # forecast horizon when use_kronos_forecast=true
+  floor: 0.5                 # min multiplier — never reduce below 50% Kelly
+  ceiling: 1.0               # max multiplier — never upsize past 100% Kelly
+  min_baseline_vol: 0.05     # absolute floor on baseline to avoid divide-near-zero
 insider_flow:
   enabled: true
   lookback_days: 90

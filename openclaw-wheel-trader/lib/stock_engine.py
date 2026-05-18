@@ -400,7 +400,8 @@ def scan_for_stocks(
     # Gate 8: Kelly position sizing (overrides shares count with optimal size)
     kelly_cfg = strategy.get("kelly", {})
     if kelly_cfg.get("enabled", True):
-        candidates = _apply_kelly_sizing(candidates, portfolio_value, kelly_cfg)
+        candidates = _apply_kelly_sizing(candidates, portfolio_value, kelly_cfg,
+                                          daily_data=daily_data)
 
     # Gate 8.5: Sector concentration hard cap.
     # Runs AFTER Kelly so we know the proposed position value. Vetoes any
@@ -852,7 +853,8 @@ def _apply_sector_concentration_gate(
     return filtered
 
 
-def _apply_kelly_sizing(candidates: list[dict], portfolio_value: float, kelly_cfg: dict) -> list[dict]:
+def _apply_kelly_sizing(candidates: list[dict], portfolio_value: float, kelly_cfg: dict,
+                         daily_data: dict | None = None) -> list[dict]:
     """
     Gate 8: Kelly position sizing.
 
@@ -938,16 +940,64 @@ def _apply_kelly_sizing(candidates: list[dict], portfolio_value: float, kelly_cf
                         sizing["shares"] = new_shares
                         sizing["floor_applied"] = True
 
+            # Volatility-aware sizing modifier. After Kelly + floor have
+            # chosen a size, scale it by realized-vol regime: high vol
+            # → downsize, low vol → cap at 1.0x (defensive ceiling).
+            # Same Sharpe, smaller drawdowns. Layered AFTER the floor so
+            # floor sets the LOWER bound on Kelly's recommendation and
+            # vol_mult can pull from there. Failures fall back to 1.0
+            # (no-op) — never blocks a trade.
+            if sizing.get("shares", 0) > 0:
+                try:
+                    from lib.vol_sizing import compute_vol_multiplier
+                    vol_cfg = _strategy_for_floor.get("vol_aware_sizing")
+                    daily_df = (daily_data or {}).get(candidate["ticker"])
+                    if daily_df is not None:
+                        vol_mult, vol_meta = compute_vol_multiplier(
+                            candidate["ticker"], daily_df, cfg=vol_cfg,
+                        )
+                        if vol_mult != 1.0:
+                            # Re-derive shares + value at the new pct
+                            new_pct = float(sizing["pct_of_portfolio"]) * vol_mult
+                            new_shares = int(
+                                portfolio_value * new_pct / candidate["current_price"]
+                            )
+                            if new_shares >= 1:
+                                sizing["pct_of_portfolio"] = round(new_pct, 4)
+                                sizing["position_value"] = round(portfolio_value * new_pct, 2)
+                                sizing["shares"] = new_shares
+                                sizing["vol_multiplier"] = vol_mult
+                                sizing["vol_meta"] = vol_meta
+                            # If vol_mult would shrink to <1 share, just
+                            # apply the multiplier as a recorded flag
+                            # without zeroing the trade.
+                            else:
+                                sizing["vol_multiplier"] = vol_mult
+                                sizing["vol_meta"] = vol_meta
+                                sizing["vol_skipped"] = "would_round_to_zero"
+                        else:
+                            sizing["vol_multiplier"] = 1.0
+                            sizing["vol_meta"] = vol_meta
+                except Exception as _e:
+                    # Vol sizing is opt-in observability — never break trades on it.
+                    log_event("stock_engine", "vol_sizing_failed",
+                              {"ticker": candidate.get("ticker"),
+                               "error": str(_e)[:200]}, result="degraded")
+
             # Override the screener's default sizing with Kelly's
             if sizing.get("shares", 0) > 0:
                 candidate["kelly_sizing"] = sizing
                 candidate["shares"] = sizing["shares"]
                 candidate["position_value"] = sizing["position_value"]
                 floor_tag = " [FLOOR]" if sizing.get("floor_applied") else ""
+                vol_tag = ""
+                vm = sizing.get("vol_multiplier")
+                if vm is not None and vm != 1.0:
+                    vol_tag = f" [VOL×{vm:.2f}]"
                 print(f"  💰 {candidate['ticker']}: Kelly sized to "
                       f"{sizing['shares']} shares "
                       f"({sizing['pct_of_portfolio']*100:.1f}% of portfolio, "
-                      f"R/R {sizing.get('reward_to_risk', 0)}x){floor_tag}")
+                      f"R/R {sizing.get('reward_to_risk', 0)}x){floor_tag}{vol_tag}")
             else:
                 print(f"  ⚠️  {candidate['ticker']}: Kelly says no trade — {sizing.get('reason', 'unknown')}")
                 # Keep original sizing if Kelly says 0
