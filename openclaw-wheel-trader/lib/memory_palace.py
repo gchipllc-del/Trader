@@ -171,9 +171,11 @@ def search_memory(
     Filters by wing/hall/room if provided (the +34% retrieval boost).
 
     Preference order:
-      1. ChromaDB (if installed and has data)
+      1. ChromaDB (if installed and has data) — dense vector similarity
       2. sqlite-vec + sentence-transformers (if deps installed)
-      3. JSONL keyword fallback
+      3. BM25 over JSONL drawers — deterministic ranking, always available
+         (adapted from TradingAgents v0.2.0)
+      4. JSONL substring fallback — last resort, simple match
     """
     if HAS_CHROMA:
         init_palace()
@@ -221,6 +223,25 @@ def search_memory(
                     "drawer_id": h["drawer_id"],
                 } for h in hits]
     except Exception:
+        pass
+
+    # Third preference: BM25 over the JSONL drawer log. Deterministic
+    # ranking (TradingAgents v0.2.0 pattern), zero deps, strong baseline
+    # on short typed content like trade memories. Beats substring matching
+    # on relevance ordering while staying offline.
+    try:
+        from lib.memory_bm25 import bm25_search
+        bm25_hits = bm25_search(
+            query=query,
+            jsonl_path=PALACE_DIR / "drawers.jsonl",
+            wing=wing,
+            k=n_results,
+        )
+        if bm25_hits:
+            return bm25_hits
+    except Exception:
+        # Best-effort — if BM25 errors (e.g. corrupt file), fall through
+        # to the simpler substring fallback rather than failing search.
         pass
 
     return _search_fallback(query, wing, n_results)
