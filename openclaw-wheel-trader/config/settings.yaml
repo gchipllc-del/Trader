@@ -6,6 +6,18 @@
 mode: paper              # paper | live — DO NOT CHANGE until Phase 1 criteria met
 live_migration_approved: false   # Requires manual flip + documented approval
 
+# --- Self-Audit Auto-Reconcile ---
+# When self_audit detects STATE_DRIFT_BROKER (positions.json says open
+# but broker shows 0 shares), auto-close the local record by matching
+# against the broker's recent FILLED sell orders. Without this, the
+# audit would just keep alerting every cycle while the drift persists.
+#
+# Safety: skips core_holdings (those need human attention), skips
+# options (handled by wheel_state preflight), and uses the broker's
+# real filled_avg_price for P&L. If no matching sell is found, closes
+# the position flat with P&L=0 and a 'needs_review' audit flag.
+auto_reconcile_phantoms: true
+
 # --- Circuit Breakers ---
 circuit_breakers:
   # Two layers — whichever is more restrictive wins:

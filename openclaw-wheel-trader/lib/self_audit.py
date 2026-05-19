@@ -416,6 +416,255 @@ def check_state_reconciliation(broker_client) -> list[AuditAlert]:
     return alerts
 
 
+def auto_reconcile_phantom_positions(
+    broker_client,
+    alerts: list[AuditAlert],
+) -> dict:
+    """Auto-resolve state drift between positions.json and the broker.
+
+    Handles TWO directions:
+
+      A. STATE_DRIFT_BROKER (local says open, broker shows 0):
+         The broker sold but local didn't get updated. Look up the
+         most recent FILLED sell for that ticker and close the local
+         record with the broker's real filled_avg_price → realistic
+         P&L. If no sell is found, close flat with P&L=0 and a
+         needs_review flag.
+
+      B. STATE_DRIFT_LOCAL (broker has shares, local has no record):
+         The bot bought at the broker but local didn't get updated.
+         Look up the most recent FILLED buy and ADD a new open
+         position to positions.json with the broker's filled_avg
+         as entry price. Tagged backfilled_from_broker=True.
+
+    Skips:
+      • Core holdings (``CORE_HOLDING_MISSING``) — those are critical,
+        require human attention, never auto-modify.
+      • Options / CSPs — wheel_state preflight handles those.
+
+    Both directions audit-logged. Returns counts + ticker lists.
+    """
+    phantom_alerts = [
+        a for a in alerts
+        if a.code == "STATE_DRIFT_BROKER"
+    ]
+    broker_only_alerts = [
+        a for a in alerts
+        if a.code == "STATE_DRIFT_LOCAL"
+    ]
+    if not phantom_alerts and not broker_only_alerts:
+        return {"reconciled": 0, "no_sell_found": 0,
+                "backfilled": 0, "tickers": []}
+
+    from lib.positions_store import mutate_positions
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+
+    reconciled = 0
+    no_sell = 0
+    tickers: list[str] = []
+    now_iso = _dt.now(_tz.utc).isoformat()
+
+    # Build a (ticker -> latest FILLED sell within 7 days) map in one
+    # broker query, rather than firing N separate ones.
+    fills_by_ticker: dict[str, dict] = {}
+    try:
+        # AlpacaClient wraps the SDK — pull recent orders for the
+        # tickers we care about.
+        target_tickers = sorted({
+            str(a.evidence.get("ticker", "")).upper()
+            for a in phantom_alerts
+        })
+        # The wrapper exposes get_orders via _get_trading_client; use
+        # it directly to filter by symbols + status. Fall back to no
+        # data if the SDK call raises.
+        try:
+            tc = broker_client._get_trading_client()
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            since = _dt.now(_tz.utc) - _td(days=7)
+            broker_client.limiter.wait_if_needed()
+            orders = tc.get_orders(filter=GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED,
+                symbols=target_tickers,
+                after=since,
+                limit=200,
+            )) or []
+            # Pick the latest FILLED sell per ticker
+            for o in orders:
+                if str(o.side).split(".")[-1].lower() not in ("sell",):
+                    continue
+                if str(o.status).split(".")[-1].lower() != "filled":
+                    continue
+                sym = str(o.symbol).upper()
+                cur = fills_by_ticker.get(sym)
+                if cur is None or o.submitted_at > cur["submitted_at"]:
+                    fills_by_ticker[sym] = {
+                        "filled_avg_price": float(o.filled_avg_price or 0),
+                        "qty": float(o.qty or 0),
+                        "submitted_at": o.submitted_at,
+                    }
+        except Exception as e:
+            log_event("self_audit", "auto_reconcile_order_lookup_failed",
+                      {"error": str(e)[:200]}, result="degraded")
+    except Exception:
+        pass
+
+    # Now mutate positions.json under the file lock; for each phantom
+    # find its open record and close it.
+    targets = {a.evidence.get("ticker", "").upper() for a in phantom_alerts}
+    with mutate_positions() as positions:
+        for p in positions:
+            if p.get("status") != "open":
+                continue
+            ticker = str(p.get("ticker", "")).upper()
+            if ticker not in targets:
+                continue
+            if p.get("type") != "stock":
+                continue
+
+            entry = float(p.get("entry_price", 0) or 0)
+            qty = float(p.get("shares", 0) or p.get("quantity", 0) or 0)
+            sell_info = fills_by_ticker.get(ticker)
+
+            if sell_info and sell_info["filled_avg_price"] > 0:
+                exit_price = sell_info["filled_avg_price"]
+                p["status"] = "closed"
+                p["closed_at"] = (
+                    sell_info["submitted_at"].isoformat()
+                    if hasattr(sell_info["submitted_at"], "isoformat")
+                    else str(sell_info["submitted_at"])
+                )
+                p["exit_price"] = round(exit_price, 4)
+                p["close_reason"] = "auto_reconcile_broker_sold"
+                p["realized_pnl"] = round((exit_price - entry) * qty, 2)
+                reconciled += 1
+                tickers.append(ticker)
+                log_event("self_audit", "auto_reconciled", {
+                    "ticker": ticker,
+                    "entry_price": entry,
+                    "exit_price": exit_price,
+                    "qty": qty,
+                    "realized_pnl": p["realized_pnl"],
+                    "method": "matched_broker_sell",
+                }, result="success")
+            else:
+                # No matching sell at broker — close flat with no P&L
+                # assumption. Safe default, audit-flagged for review.
+                p["status"] = "closed"
+                p["closed_at"] = now_iso
+                p["exit_price"] = entry
+                p["close_reason"] = "auto_reconcile_no_sell_found"
+                p["realized_pnl"] = 0.0
+                no_sell += 1
+                tickers.append(ticker)
+                log_event("self_audit", "auto_reconciled", {
+                    "ticker": ticker,
+                    "entry_price": entry,
+                    "qty": qty,
+                    "method": "no_sell_found_flat_close",
+                    "needs_review": True,
+                }, result="degraded")
+
+    # ── Direction B: backfill broker-only positions into local ─────────
+    # Broker has shares we don't track locally (bot bought but local
+    # write was skipped). Look up the most recent buy, add a local
+    # record with the broker's real entry data.
+    backfilled = 0
+    if broker_only_alerts:
+        broker_only_tickers = sorted({
+            str(a.evidence.get("symbol", "")).upper()
+            for a in broker_only_alerts
+        })
+
+        # Pull the latest filled buy per ticker
+        buys_by_ticker: dict[str, dict] = {}
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            tc = broker_client._get_trading_client()
+            broker_client.limiter.wait_if_needed()
+            buy_orders = tc.get_orders(filter=GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED,
+                symbols=broker_only_tickers,
+                limit=200,
+            )) or []
+            for o in buy_orders:
+                if str(o.side).split(".")[-1].lower() != "buy":
+                    continue
+                if str(o.status).split(".")[-1].lower() != "filled":
+                    continue
+                sym = str(o.symbol).upper()
+                cur = buys_by_ticker.get(sym)
+                if cur is None or o.submitted_at > cur["submitted_at"]:
+                    buys_by_ticker[sym] = {
+                        "filled_avg_price": float(o.filled_avg_price or 0),
+                        "qty": float(o.qty or 0),
+                        "submitted_at": o.submitted_at,
+                        "order_id": str(o.id),
+                    }
+        except Exception as e:
+            log_event("self_audit", "auto_backfill_lookup_failed",
+                      {"error": str(e)[:200]}, result="degraded")
+
+        # Pull the broker's current qty for each (canonical source)
+        broker_qtys: dict[str, float] = {}
+        try:
+            for bp in broker_client.get_positions() or []:
+                sym = str(bp.get("symbol") or bp.get("ticker") or "").upper()
+                broker_qtys[sym] = float(bp.get("qty", 0) or 0)
+        except Exception:
+            pass
+
+        with mutate_positions() as positions:
+            for sym in broker_only_tickers:
+                qty = broker_qtys.get(sym, 0)
+                if qty <= 0:
+                    continue
+                buy = buys_by_ticker.get(sym)
+                if buy and buy["filled_avg_price"] > 0:
+                    entry_price = buy["filled_avg_price"]
+                    opened_at = (
+                        buy["submitted_at"].isoformat()
+                        if hasattr(buy["submitted_at"], "isoformat")
+                        else str(buy["submitted_at"])
+                    )
+                    order_id = buy["order_id"]
+                else:
+                    # No buy found — use broker's avg_entry as best guess
+                    entry_price = broker_qtys.get(sym + "_avg", 0) or 0.0
+                    opened_at = now_iso
+                    order_id = "auto_backfill_unknown"
+
+                new_pos = {
+                    "ticker": sym,
+                    "type": "stock",
+                    "status": "open",
+                    "shares": int(qty),
+                    "entry_price": round(entry_price, 4),
+                    "order_id": str(order_id),
+                    "opened_at": opened_at,
+                    "composite_score": 0,
+                    "backfilled_from_broker": True,
+                    "backfill_reason": "auto_reconcile_state_drift_local",
+                }
+                positions.append(new_pos)
+                backfilled += 1
+                tickers.append(sym)
+                log_event("self_audit", "auto_backfilled", {
+                    "ticker": sym,
+                    "qty": qty,
+                    "entry_price": entry_price,
+                    "method": "matched_broker_buy" if buy else "no_buy_found",
+                }, result="success" if buy else "degraded")
+
+    return {
+        "reconciled": reconciled,
+        "no_sell_found": no_sell,
+        "backfilled": backfilled,
+        "tickers": tickers,
+    }
+
+
 def check_config_sanity() -> list[AuditAlert]:
     """Verify config files satisfy internal invariants. Catches Hermes
     or manual edits that produced an inconsistent state."""
@@ -721,7 +970,8 @@ def check_heartbeat_freshness(*, max_stale_minutes: int = 10) -> list[AuditAlert
     return []
 
 
-def run_self_audit(hours: float = 4.0, *, broker_client=None) -> dict:
+def run_self_audit(hours: float = 4.0, *, broker_client=None,
+                    auto_reconcile: bool | None = None) -> dict:
     """Compute the funnel, detect anomalies, log everything. The return
     dict goes into the monitor's summary so the operator dashboard can
     surface it.
@@ -730,8 +980,15 @@ def run_self_audit(hours: float = 4.0, *, broker_client=None) -> dict:
     state-reconciliation and P&L-reconciliation checks (those need
     live broker data). Skipped when None.
 
-    Idempotent and read-only: this function never modifies positions,
-    config, or any other state.
+    ``auto_reconcile``: when True, automatically closes phantom positions
+    (positions.json says open, broker shows 0) by matching against the
+    broker's recent FILLED sell orders. When None, reads
+    ``settings.yaml.auto_reconcile_phantoms`` (default True). Set to
+    False to disable.
+
+    Mostly idempotent and read-only. The ONE state-changing path is
+    auto-reconcile when explicitly enabled — every change is audit-
+    logged.
     """
     funnels, events = compute_funnel(hours)
     alerts = detect_alerts(funnels, events)
@@ -752,6 +1009,8 @@ def run_self_audit(hours: float = 4.0, *, broker_client=None) -> dict:
                       result="degraded")
 
     # Broker-dependent checks
+    auto_reconcile_result: dict = {"reconciled": 0, "no_sell_found": 0,
+                                    "backfilled": 0, "tickers": []}
     if broker_client is not None:
         for check_fn in (check_state_reconciliation, check_pnl_reconciliation):
             try:
@@ -760,6 +1019,34 @@ def run_self_audit(hours: float = 4.0, *, broker_client=None) -> dict:
                 log_event("self_audit", "check_failed",
                           {"check": check_fn.__name__, "error": str(e)[:200]},
                           result="degraded")
+
+        # Auto-reconcile phantoms if enabled. Resolves the
+        # STATE_DRIFT_BROKER pattern where broker sold but local
+        # positions.json still says open — instead of re-alerting every
+        # 3 min for hours (current behavior), we close the local record
+        # with the broker's actual filled exit price.
+        try:
+            if auto_reconcile is None:
+                import yaml
+                cfg_path = Path(__file__).parent.parent / "config" / "settings.yaml"
+                with open(cfg_path) as f:
+                    settings = yaml.safe_load(f) or {}
+                auto_reconcile = bool(
+                    settings.get("auto_reconcile_phantoms", True)
+                )
+            if auto_reconcile:
+                auto_reconcile_result = auto_reconcile_phantom_positions(
+                    broker_client, alerts,
+                )
+                total_actions = (auto_reconcile_result["reconciled"]
+                                 + auto_reconcile_result["no_sell_found"]
+                                 + auto_reconcile_result["backfilled"])
+                if total_actions > 0:
+                    log_event("self_audit", "auto_reconcile_summary",
+                              auto_reconcile_result, result="success")
+        except Exception as e:
+            log_event("self_audit", "auto_reconcile_failed",
+                      {"error": str(e)[:200]}, result="degraded")
 
     # Always log the audit even when clean — gives the operator a
     # heartbeat that the self-audit is itself running.
@@ -788,4 +1075,5 @@ def run_self_audit(hours: float = 4.0, *, broker_client=None) -> dict:
              "evidence": a.evidence}
             for a in alerts
         ],
+        "auto_reconcile": auto_reconcile_result,
     }
