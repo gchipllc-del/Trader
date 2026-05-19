@@ -2341,7 +2341,7 @@ def main():
                                  "build-cache",
                                  "pairs-scan", "min-variance",
                                  "anomaly", "postmortem", "digest", "dipbuy",
-                                 "longterm-pick"],
+                                 "longterm-pick", "features"],
                         help="Command to run")
     parser.add_argument("--signal", default="all",
                         help="build-cache: which signal to fill (kronos|news|llm|all)")
@@ -2524,6 +2524,9 @@ def main():
             save=args.save,
             explicit_tickers=args.tickers,
         )
+    elif args.command == "features":
+        from lib.feature_status import gather_all, render_report
+        print(render_report(gather_all()))
 
 
 if __name__ == "__main__":
