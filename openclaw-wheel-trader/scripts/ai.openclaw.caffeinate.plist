@@ -18,7 +18,19 @@
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/caffeinate</string>
-        <string>-i</string>
+        <!-- Stronger flag set so launchd jobs fire 24/7:
+             -i  prevent idle sleep
+             -d  prevent display sleep
+             -m  prevent disk sleep (otherwise disk spindown can
+                 break long-running file-watch handles)
+             -s  prevent system sleep WHILE ON AC POWER. This is the
+                 critical flag — without it the system enters standby
+                 after ~3h idle (pmset standbydelaylow).
+             -u  declare user activity; resets idle timer (belt+suspenders)
+             Note: -s only takes effect on AC. On battery the Mac
+             will still sleep. Keep plugged in or run
+             `sudo pmset -b sleep 0` separately for battery override. -->
+        <string>-idmsu</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
