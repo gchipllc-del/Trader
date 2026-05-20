@@ -635,12 +635,31 @@ def auto_reconcile_phantom_positions(
                     opened_at = now_iso
                     order_id = "auto_backfill_unknown"
 
+                # CRITICAL: synthesize sensible target_price and stop_loss
+                # using the strategy defaults. WITHOUT these, the monitor's
+                # check_stock_exits would see target_price=0.0 and instantly
+                # sell because any current_price > 0 satisfies "target hit".
+                # That's the bug that caused the 14:47 mass-exit on 2026-05-19.
+                try:
+                    import yaml
+                    cfg_path = Path(__file__).parent.parent / "config" / "wheel_strategy.yaml"
+                    with open(cfg_path) as f:
+                        strat = yaml.safe_load(f) or {}
+                    sp = strat.get("stock_params", {})
+                    target_pct = float(sp.get("default_target_pct", 0.10))
+                    stop_pct = float(sp.get("stop_loss_pct", 0.035))
+                except Exception:
+                    target_pct = 0.10
+                    stop_pct = 0.035
+
                 new_pos = {
                     "ticker": sym,
                     "type": "stock",
                     "status": "open",
                     "shares": int(qty),
                     "entry_price": round(entry_price, 4),
+                    "target_price": round(entry_price * (1 + target_pct), 2),
+                    "stop_loss": round(entry_price * (1 - stop_pct), 2),
                     "order_id": str(order_id),
                     "opened_at": opened_at,
                     "composite_score": 0,
