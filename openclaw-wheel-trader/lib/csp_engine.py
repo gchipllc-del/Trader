@@ -350,13 +350,30 @@ def run_csp_scan_and_execute(
     account = client.get_account()
     open_orders = client.get_open_orders()
 
+    # 2026-05-20: was hardcoded `current_daily_pnl=0` with a TODO,
+    # which silently disabled the daily-loss circuit breaker on the
+    # CSP path. Now derives from broker equity vs morning baseline.
+    daily_pnl_dollars = 0.0
+    try:
+        baseline = json.load(open(
+            Path(__file__).parent.parent / "data" / "baseline_equity.json"
+        ))
+        portfolio_now = float(account.get("portfolio_value", 0) or 0)
+        baseline_eq = float(baseline.get("baseline_equity", portfolio_now))
+        daily_pnl_dollars = portfolio_now - baseline_eq
+    except Exception:
+        # If baseline file missing, fall through with 0 (same as before
+        # but at least we tried). Log this so it's discoverable.
+        log_event("csp_engine", "daily_pnl_baseline_missing",
+                  {}, result="degraded")
+
     executed = []
     for candidate in candidates[:max_trades]:
         result = execute_csp(
             candidate=candidate,
             client=client,
             portfolio_value=account["portfolio_value"],
-            current_daily_pnl=0,  # TODO: calculate from today's trades
+            current_daily_pnl=daily_pnl_dollars,
             current_open_orders=len(open_orders),
         )
         if result:

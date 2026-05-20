@@ -1454,8 +1454,11 @@ def check_stock_exits(
                 "partial_shares": shares_to_sell,
             }
 
-        # Stop loss hit
-        elif current_price <= stop:
+        # Stop loss hit. Defensively require stop > 0 — a missing stop
+        # field would default to 0 and make `current_price <= 0` never
+        # true, which is actually safe (no false stop). But still log a
+        # warning so we can find positions with missing data.
+        elif stop > 0 and current_price <= stop:
             exit_signal = {
                 "ticker": ticker,
                 "action": "stop_loss",
@@ -1463,14 +1466,27 @@ def check_stock_exits(
                 "pnl_pct": pnl_pct,
             }
 
-        # Target hit
-        elif current_price >= target:
+        # Target hit. CRITICAL guard: require target > 0. A missing
+        # target_price defaults to 0; without this guard the comparison
+        # `current_price >= 0` is always true → instant tautological
+        # take_profit on every monitor cycle (this was the 14:47 mass-
+        # exit bug on 2026-05-19). Position with target=0 = missing
+        # configuration, log + skip instead of acting on a tautology.
+        elif target > 0 and current_price >= target:
             exit_signal = {
                 "ticker": ticker,
                 "action": "take_profit",
                 "reason": f"Target reached: ${current_price:.2f} >= ${target:.2f}",
                 "pnl_pct": pnl_pct,
             }
+        elif target <= 0 or stop <= 0:
+            # Position is missing target/stop. Don't act, but flag it.
+            log_event("stock_engine", "position_missing_target_stop", {
+                "ticker": ticker,
+                "target_price": target,
+                "stop_loss": stop,
+                "entry_price": entry_price,
+            }, result="degraded")
 
         # Momentum death: bearish MACD cross + RSI overbought
         elif ticker in daily_data and pnl_pct > 0.02:
@@ -1993,6 +2009,20 @@ def run_stock_scan_and_execute(
     except Exception:
         current_open_orders = 0
 
+    # 2026-05-20: was hardcoded `current_daily_pnl=0`, which silently
+    # disabled the daily-loss circuit breaker on the stock-buy path.
+    # Derive from broker equity vs baseline (same formula as main.py).
+    daily_pnl_dollars = 0.0
+    try:
+        baseline = json.load(open(
+            Path(__file__).parent.parent / "data" / "baseline_equity.json"
+        ))
+        baseline_eq = float(baseline.get("baseline_equity", portfolio_value))
+        daily_pnl_dollars = float(portfolio_value) - baseline_eq
+    except Exception:
+        log_event("stock_engine", "daily_pnl_baseline_missing",
+                  {}, result="degraded")
+
     executed = 0
     for candidate in candidates:
         if executed >= effective_max_trades:
@@ -2000,7 +2030,7 @@ def run_stock_scan_and_execute(
 
         resp = execute_stock_buy(
             candidate, client, portfolio_value,
-            current_daily_pnl=0,
+            current_daily_pnl=daily_pnl_dollars,
             current_open_orders=current_open_orders,
         )
         if resp:

@@ -751,13 +751,23 @@ def monitor_crypto_positions(client: AlpacaClient, dry_run: bool = False) -> dic
         gain_pct = (price - entry) / entry if entry > 0 else 0.0
         trail_stop_price = high_water * (1.0 - trailing_pct)
 
+        # Same target/stop=0 tautology guard as stock_engine. A position
+        # with missing target_price defaults to 0; without this guard
+        # `price >= 0` is ALWAYS true → instant tautological target_hit.
+        # Stop=0 fails the `price <= 0` test silently (safer, but log it).
         exit_reason = None
-        if price <= stop:
+        if stop > 0 and price <= stop:
             exit_reason = "stop_loss"
-        elif price >= target:
+        elif target > 0 and price >= target:
             exit_reason = "target_hit"
-        elif gain_pct > 0 and price <= trail_stop_price:
+        elif gain_pct > 0 and trail_stop_price > 0 and price <= trail_stop_price:
             exit_reason = "trailing_stop"
+        elif target <= 0 or stop <= 0:
+            from lib.audit import log_event as _log
+            _log("crypto_engine", "position_missing_target_stop", {
+                "ticker": sym, "target_price": target,
+                "stop_loss": stop, "entry_price": entry,
+            }, result="degraded")
 
         if exit_reason:
             exits.append({
