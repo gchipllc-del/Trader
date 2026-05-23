@@ -386,6 +386,201 @@ def get_trade_history() -> dict:
     }
 
 
+def get_agent_thinking(limit_per_agent: int = 6) -> dict:
+    """Surface recent diary entries from each governance agent.
+
+    Returns the last N entries from strategy_agent, risk_agent, bull_agent,
+    bear_agent, compliance_agent — the bot's actual reasoning trail. Powers
+    the dashboard's 'Bot Thinking' panel so the operator can see what each
+    agent has been saying about recent trade decisions.
+
+    Each entry has a compressed format like:
+      strategy_agent: "AAPL|CSP_170P|score_8/9|zone_168|hammer"
+      bull_agent:     "NVDA|BULL_BOOST|score_10/10|strong_composite_score,..."
+      bear_agent:     "AAPL|BEAR_DOWNSIZE|score_3/10|kronos_bearish,..."
+      risk_agent:     "VETO|AAPL|sell_cc|pos_17%|sector_tech_17%"
+    """
+    diaries_dir = Path(__file__).parent.parent / "data" / "palace" / "diaries"
+    agents = ["strategy_agent", "risk_agent", "compliance_agent",
+              "bull_agent", "bear_agent"]
+    result: dict = {}
+    for agent in agents:
+        path = diaries_dir / f"{agent}.jsonl"
+        if not path.exists():
+            result[agent] = []
+            continue
+        try:
+            rows: list[dict] = []
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rows.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+            # Newest last → reverse to newest first, cap
+            rows = list(reversed(rows))[:limit_per_agent]
+            # Parse the entry string into structured pieces for the UI
+            parsed = []
+            for r in rows:
+                entry = r.get("entry", "")
+                parts = entry.split("|") if entry else []
+                # First "verdict-ish" token if it looks like one
+                verdict = "info"
+                if parts:
+                    first = parts[0].upper()
+                    if any(k in first for k in ("VETO", "BLOCK", "REJECT", "FAIL")):
+                        verdict = "block"
+                    elif any(k in first for k in ("APPROVE", "CLEAR", "BOOST", "ENTER", "PASS")):
+                        verdict = "good"
+                    elif "DOWNSIZE" in first or "WARN" in first or "CAUTION" in first:
+                        verdict = "warn"
+                # Also pick up keywords from any segment
+                for seg in parts:
+                    su = seg.upper()
+                    if "BLOCKED" in su or "VETO" in su:
+                        verdict = "block"
+                        break
+                    if "BOOST" in su or "APPROVE" in su:
+                        if verdict == "info":
+                            verdict = "good"
+                    if "DOWNSIZE" in su:
+                        if verdict == "info":
+                            verdict = "warn"
+                parsed.append({
+                    "timestamp": r.get("timestamp", ""),
+                    "entry": entry,
+                    "ticker": parts[0] if parts and len(parts[0]) <= 8 else None,
+                    "verdict": verdict,
+                    "tokens": parts[:8],
+                })
+            result[agent] = parsed
+        except OSError:
+            result[agent] = []
+    return result
+
+
+def get_hermes_state() -> dict:
+    """Surface the scientific-Hermes loop state for the dashboard:
+      - current goal-distance / velocity / drawdown
+      - mode (review|live)
+      - ledger stats + recent experiments
+      - last weekly review file path
+    Lightweight — all reads from local JSONL / YAML, no network.
+    """
+    out: dict = {}
+    try:
+        from lib.hermes_goal_score import compute_goal_metrics
+        out["goal"] = compute_goal_metrics()
+    except Exception as e:
+        out["goal_error"] = str(e)[:200]
+
+    try:
+        from lib.hermes_scientific import get_mode
+        out["mode"] = get_mode()
+    except Exception:
+        out["mode"] = "unknown"
+
+    try:
+        from lib.hermes_ledger import history, stats
+        out["ledger_stats"] = stats()
+        out["recent_experiments"] = history(limit=10)
+    except Exception:
+        out["recent_experiments"] = []
+        out["ledger_stats"] = {"counts": {}, "total": 0, "keep_rate": None}
+
+    # Last weekly review
+    try:
+        reviews_dir = Path(__file__).parent.parent / "data" / "hermes_reviews"
+        if reviews_dir.exists():
+            md_files = sorted(reviews_dir.glob("weekly_*.md"), reverse=True)
+            if md_files:
+                out["last_review"] = {
+                    "path": str(md_files[0]),
+                    "modified_at": datetime.fromtimestamp(
+                        md_files[0].stat().st_mtime, tz=timezone.utc
+                    ).isoformat(),
+                }
+    except OSError:
+        pass
+
+    return out
+
+
+def get_markov_summary(ticker: str = "SPY", refresh: bool = False) -> dict:
+    """Return the most recent Markov-regime summary for the dashboard panel.
+
+    Reads data/markov_latest.json (populated by ``main.py markov``); on
+    miss or when stale (>6h) and ``refresh=True``, recomputes inline. We
+    don't auto-refresh on every dashboard hit because the Alpaca history
+    pull adds 2-5s.
+    """
+    cache = Path(__file__).parent.parent / "data" / "markov_latest.json"
+    fresh = False
+    data: dict | None = None
+    if cache.exists():
+        try:
+            with open(cache) as f:
+                data = json.load(f)
+            try:
+                mtime = datetime.fromtimestamp(cache.stat().st_mtime, tz=timezone.utc)
+                age_h = (datetime.now(timezone.utc) - mtime).total_seconds() / 3600.0
+                fresh = age_h < 6
+                if data is not None:
+                    data["_cache_age_hours"] = round(age_h, 2)
+            except OSError:
+                pass
+        except (OSError, json.JSONDecodeError):
+            data = None
+
+    if (data is None or refresh) and not fresh:
+        try:
+            from lib.markov_regime import markov_summary
+            data = markov_summary(ticker)
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            with open(cache, "w") as f:
+                json.dump(data, f, indent=2, default=str)
+            data["_cache_age_hours"] = 0.0
+        except Exception as e:
+            return {"error": str(e)[:200], "ticker": ticker}
+
+    if data is None:
+        return {
+            "error": "no markov data — run `python main.py markov`",
+            "ticker": ticker,
+        }
+    return data
+
+
+def get_goal_progress() -> dict:
+    """Unified-goals progress payload for the dashboard milestone bar.
+
+    Returns current equity, anchor, target, hard floor, halt state, and
+    the milestone schedule. Hides cleanly when tradingcore isn't on path.
+    """
+    try:
+        from tradingcore.unified_goals import load_goals, get_progress
+        goals = load_goals()
+        tb = get_progress("traderbot")
+        return {
+            "current": tb.get("current"),
+            "anchor": tb.get("anchor"),
+            "target": tb.get("target"),
+            "hard_floor": goals.get("traderbot", {}).get("hard_floor"),
+            "hard_floor_buffer": goals.get("traderbot", {}).get("hard_floor_buffer"),
+            "halt_state": tb.get("halt_state"),
+            "halt_reason": tb.get("halt_reason"),
+            "pct_growth_from_anchor": tb.get("pct_growth_from_anchor"),
+            "pct_to_target": tb.get("pct_to_target"),
+            "milestones": tb.get("milestones", []),
+            "stock_buys_gate": goals.get("traderbot", {}).get("stock_buys_gate", {}),
+        }
+    except Exception as e:
+        return {"error": str(e)[:200]}
+
+
 def get_circuit_breaker_status() -> dict:
     """Circuit breaker limits vs current values."""
     try:

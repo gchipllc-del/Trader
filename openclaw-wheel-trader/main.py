@@ -189,7 +189,8 @@ def cmd_min_variance():
     from lib.alpaca_client import AlpacaClient
     from lib.portfolio_optimization import min_variance_weights
 
-    positions = json.load(open(Path(__file__).parent / "data" / "positions.json"))
+    with open(Path(__file__).parent / "data" / "positions.json") as _f:
+        positions = json.load(_f)
     held = [p for p in positions
             if p.get("status") == "open" and p.get("type") == "stock"]
     if len(held) < 2:
@@ -442,7 +443,8 @@ def cmd_crypto_scan(dry_run: bool = False):
 
         # Daily P/L vs baseline_equity (used by daily-loss circuit breaker)
         try:
-            baseline = json.load(open(Path(__file__).parent / "data" / "baseline_equity.json"))
+            with open(Path(__file__).parent / "data" / "baseline_equity.json") as _bf:
+                baseline = json.load(_bf)
             daily_pnl = portfolio - float(baseline.get("baseline_equity", portfolio))
         except Exception:
             daily_pnl = 0.0
@@ -492,7 +494,8 @@ def cmd_scan():
         from lib.risk_profile import select_profile, log_active_profile
         from lib.memory_palace import get_current_regime as _regime
         try:
-            baseline = json.load(open(Path(__file__).parent / "data" / "baseline_equity.json"))
+            with open(Path(__file__).parent / "data" / "baseline_equity.json") as _bf:
+                baseline = json.load(_bf)
             baseline_equity = float(baseline.get("baseline_equity", portfolio))
             daily_loss_pct = ((portfolio - baseline_equity) / baseline_equity
                               if baseline_equity > 0 else 0.0)
@@ -2326,6 +2329,68 @@ def cmd_longterm_pick(themes: str | None = None, top_n: int = 15,
     print()
 
 
+def cmd_goals():
+    """Display unified cross-bot goal tracker."""
+    try:
+        from tradingcore.unified_goals import (
+            load_goals, get_progress, init_default_goals, GOALS_PATH,
+        )
+    except ImportError as e:
+        print(f"[goals] tradingcore.unified_goals unavailable: {e}")
+        return
+
+    if not GOALS_PATH.exists():
+        print(f"[goals] No goals file at {GOALS_PATH} — initializing.")
+        init_default_goals()
+
+    # Refresh equity from local baseline file (avoid pandas/alpaca imports —
+    # heavy chains crash this CLI in the current env). Live Alpaca sync runs
+    # via separate scripts; the top-level ~/Desktop/projects/goals does it too.
+    try:
+        import json
+        from pathlib import Path
+        from tradingcore.unified_goals import update_current_equity
+        baseline = Path(__file__).resolve().parent / "data" / "baseline_equity.json"
+        if baseline.exists():
+            with open(baseline) as f:
+                bd = json.load(f)
+            eq = float(bd.get("baseline_equity") or bd.get("start_baseline") or 0.0)
+            if eq > 0:
+                update_current_equity("traderbot", eq)
+    except Exception:
+        pass
+
+    data = load_goals()
+    tb = get_progress("traderbot")
+    pb = get_progress("polybot")
+
+    def _row(label: str, val: str) -> str:
+        return f"  {label:<24} {val}"
+
+    def _halt_badge(state: str) -> str:
+        return "[HALTED]" if state == "halted" else "[ ok   ]"
+
+    print("=" * 70)
+    print(f"UNIFIED GOALS — {data.get('updated_at', 'n/a')}")
+    print(f"File: {GOALS_PATH}")
+    print("=" * 70)
+    for bot, prog in (("traderbot", tb), ("polybot", pb)):
+        print()
+        print(f"{bot.upper():<12}  {_halt_badge(prog['halt_state'])}  "
+              f"${prog['current']:.2f}  (anchor ${prog['anchor']:.2f} → target ${prog['target']:.2f})")
+        print(_row("growth from anchor", f"{prog['pct_growth_from_anchor']:+.2f}%"))
+        print(_row("progress to target", f"{prog['pct_to_target']:.2f}%"))
+        if prog["halt_reason"]:
+            print(_row("halt reason", prog["halt_reason"]))
+            print(_row("halted at", prog["halted_at"] or "?"))
+        ms_line = "  ".join(
+            f"${m['value']}{'✓' if m['hit_at'] else '·'}"
+            for m in prog["milestones"]
+        )
+        print(_row("milestones", ms_line))
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(description="OpenClaw Wheel Strategy Trader")
     parser.add_argument("command",
@@ -2341,7 +2406,11 @@ def main():
                                  "build-cache",
                                  "pairs-scan", "min-variance",
                                  "anomaly", "postmortem", "digest", "dipbuy",
-                                 "longterm-pick", "features"],
+                                 "longterm-pick", "features", "goals",
+                                 "stock-buys-gate", "markov",
+                                 "hermes-cycle", "hermes-review",
+                                 "hermes-ledger", "hermes-mode",
+                                 "cornelius", "goal-score"],
                         help="Command to run")
     parser.add_argument("--signal", default="all",
                         help="build-cache: which signal to fill (kronos|news|llm|all)")
@@ -2527,6 +2596,83 @@ def main():
     elif args.command == "features":
         from lib.feature_status import gather_all, render_report
         print(render_report(gather_all()))
+    elif args.command == "goals":
+        cmd_goals()
+    elif args.command == "stock-buys-gate":
+        from lib.stock_buys_gate import evaluate as _sbg_eval, render as _sbg_render
+        result = _sbg_eval()
+        print(_sbg_render(result))
+    elif args.command == "hermes-cycle":
+        # Scientific-method Hermes pass: closes prior experiments, picks
+        # one new change, applies if mode=live. Read-only otherwise.
+        from lib.hermes_scientific import (
+            run_scientific_cycle, render_cycle, write_weekly_review,
+        )
+        force = "live" if "--live" in sys.argv else (
+            "review" if "--review" in sys.argv else None
+        )
+        report = run_scientific_cycle(force_mode=force)
+        print(render_cycle(report))
+        # Always write the weekly markdown so the operator has an audit trail
+        md_path = write_weekly_review(report)
+        print(f"\nWeekly review written: {md_path}")
+    elif args.command == "hermes-review":
+        from lib.hermes_scientific import run_scientific_cycle, write_weekly_review
+        report = run_scientific_cycle(force_mode="review")
+        path = write_weekly_review(report)
+        print(f"Weekly review written: {path}")
+    elif args.command == "hermes-ledger":
+        from lib.hermes_ledger import history, stats
+        s = stats()
+        print(f"Experiments — total {s['total']}, keep_rate "
+              f"{s['keep_rate'] if s['keep_rate'] is not None else 'n/a'}")
+        print(f"  open={s['counts'].get('open',0)} "
+              f"kept={s['counts'].get('kept',0)} "
+              f"rolled_back={s['counts'].get('rolled_back',0)} "
+              f"expired={s['counts'].get('expired',0)}")
+        print()
+        for e in history(limit=15):
+            when = (e.get("opened_at") or "")[:19].replace("T", " ")
+            print(f"  {when}  {e.get('status'):<12} "
+                  f"{e.get('param'):<26} "
+                  f"{e.get('old_value')} → {e.get('new_value')}  "
+                  f"verdict={e.get('verdict')}")
+    elif args.command == "hermes-mode":
+        from lib.hermes_scientific import get_mode, set_mode
+        if len(sys.argv) > 2 and sys.argv[-1] in ("review", "live"):
+            set_mode(sys.argv[-1])
+            print(f"hermes_mode set → {sys.argv[-1]}")
+        else:
+            print(f"hermes_mode = {get_mode()}  "
+                  "(set with `python main.py hermes-mode review|live`)")
+    elif args.command == "cornelius":
+        from agents.cornelius_agent import run_cornelius_cycle, render_cornelius_report
+        dry = "--apply" not in sys.argv
+        report = run_cornelius_cycle(dry_run=dry)
+        print(render_cornelius_report(report))
+        if dry:
+            print("(dry-run — pass --apply to commit the picked change)")
+    elif args.command == "goal-score":
+        from lib.hermes_goal_score import compute_goal_metrics, render
+        print(render(compute_goal_metrics()))
+    elif args.command == "markov":
+        from lib.markov_regime import markov_summary, render_summary
+        ticker = args.ticker or "SPY"
+        # Reuse --lookback for lookback_days, --simulations as horizon stub
+        lookback = args.lookback if args.lookback else 730
+        horizon = 1  # daily forecast default; users override in code if needed
+        result = markov_summary(ticker, lookback_days=lookback, horizon=horizon)
+        print(render_summary(result))
+        # Cache the latest summary for the dashboard panel
+        try:
+            import json as _json
+            from pathlib import Path as _Path
+            cache = _Path(__file__).parent / "data" / "markov_latest.json"
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            with open(cache, "w") as _f:
+                _json.dump(result, _f, indent=2, default=str)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

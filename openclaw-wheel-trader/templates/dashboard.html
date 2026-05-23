@@ -107,6 +107,17 @@ tr:hover { background: #22224e; }
       </tr></thead><tbody id="positions-body"><tr><td colspan="10" class="dim">Loading...</td></tr></tbody></table>
     </div>
 
+    <!-- All Bots — Open Trades (cross-bot) -->
+    <div class="card full-width">
+      <h2>All Bots — Open Trades <span id="all-bots-totals" class="dim" style="font-weight:400;font-size:0.85em"></span></h2>
+      <table><thead><tr>
+        <th>Bot</th><th>ID / Symbol</th><th>Side</th>
+        <th class="right">Size</th><th class="right">Entry</th>
+        <th class="right">Mark</th><th class="right">P/L</th>
+        <th class="right">Age</th>
+      </tr></thead><tbody id="all-bots-body"><tr><td colspan="8" class="dim">Loading...</td></tr></tbody></table>
+    </div>
+
     <!-- Quant Scores -->
     <div class="card">
       <h2>Quant Scores <span id="quant-spinner" class="spinner"></span></h2>
@@ -133,6 +144,43 @@ tr:hover { background: #22224e; }
       <h2>Trade History</h2>
       <div id="history-stats" class="dim" style="margin-bottom:8px;">--</div>
       <div class="chart-container"><canvas id="pl-chart"></canvas></div>
+    </div>
+
+    <!-- Goal Progress -->
+    <div class="card full-width">
+      <h2>Goal Progress &nbsp; <span id="goal-summary" class="dim" style="font-size:13px"></span></h2>
+      <svg id="goal-svg" width="100%" height="64" viewBox="0 0 1000 64"
+           preserveAspectRatio="none"
+           style="background:#1a1a3e;border-radius:6px;margin-top:4px"></svg>
+      <div id="goal-legend" class="dim" style="font-size:11px;margin-top:6px"></div>
+    </div>
+
+    <!-- Bot Thinking (agent diaries) -->
+    <div class="card full-width">
+      <h2>Bot Thinking — Recent Agent Reasoning</h2>
+      <div id="thinking-container" class="dim">Loading…</div>
+    </div>
+
+    <!-- Hermes self-improving loop -->
+    <div class="card full-width">
+      <h2>Hermes Self-Improving Loop
+        &nbsp; <span id="hermes-summary" class="dim" style="font-size:13px"></span>
+      </h2>
+      <div id="hermes-body" class="dim">Loading…</div>
+    </div>
+
+    <!-- Markov Regime — quant hedge-fund method -->
+    <div class="card full-width">
+      <h2>Markov Regime
+        &nbsp; <span id="markov-summary" class="dim" style="font-size:13px"></span>
+        <span style="float:right;font-size:11px">
+          <input id="markov-ticker" value="SPY"
+                 style="width:60px;background:#0f0f23;color:#e0e0e0;border:1px solid #3a2a6e;padding:2px 4px;font-family:inherit"/>
+          <button onclick="refreshMarkov(true)"
+                  style="background:#2a2a5e;color:#e0e0e0;border:1px solid #3a3a7e;padding:2px 8px;cursor:pointer;font-family:inherit;font-size:11px">refresh</button>
+        </span>
+      </h2>
+      <div id="markov-body" class="dim">Loading…</div>
     </div>
 
   </div>
@@ -312,6 +360,373 @@ async function refresh() {
     const data = await resp.json();
     renderState(data);
   } catch(e) { console.error('State fetch error:', e); }
+  // Goal + thinking + cross-bot + markov + hermes are independent — fire & forget
+  refreshGoal();
+  refreshThinking();
+  refreshAllBots();
+  refreshMarkov(false);
+  refreshHermes();
+}
+
+async function refreshHermes() {
+  try {
+    const resp = await fetch('/api/hermes');
+    const data = await resp.json();
+    renderHermes(data);
+  } catch(e) { console.error('Hermes fetch error:', e); }
+}
+
+function renderHermes(h) {
+  const body = $('hermes-body');
+  if (!h) { body.innerHTML = '<span class="dim">unavailable</span>'; return; }
+  const g = h.goal || {};
+  const mode = h.mode || 'unknown';
+  const modeColor = mode === 'live' ? '#ff6b6b' : '#f0c040';
+  const vel = g.velocity_per_day || 0;
+  const velColor = vel > 0 ? '#00d4aa' : (vel < 0 ? '#ff6b6b' : '#888');
+  const days = g.days_to_target_at_velocity;
+  const daysStr = days !== null && days !== undefined
+    ? days.toFixed(0) + ' days at current velocity'
+    : 'n/a (velocity ≤ 0)';
+
+  $('hermes-summary').innerHTML =
+    'mode=<b style="color:' + modeColor + '">' + mode.toUpperCase() + '</b> &nbsp;|&nbsp; ' +
+    'gap <b>$' + (g.gap_remaining || 0).toFixed(0) + '</b> &nbsp;|&nbsp; ' +
+    'velocity <b style="color:' + velColor + '">$' + vel.toFixed(2) + '/day</b> &nbsp;|&nbsp; ' +
+    'ETA ' + daysStr;
+
+  const ls = h.ledger_stats || {counts:{},total:0};
+  const counts = ls.counts || {};
+  const recent = h.recent_experiments || [];
+
+  let stats = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;font-size:12px;margin-bottom:10px">';
+  const bigStat = (label, val, color) =>
+    '<div style="background:#0f0f23;border-radius:6px;padding:8px"><div class="dim" style="font-size:10px;text-transform:uppercase">' +
+    label + '</div><div style="font-size:18px;color:' + (color||'#e0e0e0') + ';font-weight:bold">' + val + '</div></div>';
+  stats += bigStat('Total experiments', ls.total || 0);
+  stats += bigStat('Kept', counts.kept || 0, '#00d4aa');
+  stats += bigStat('Rolled back', counts.rolled_back || 0, '#ff6b6b');
+  stats += bigStat('Open', counts.open || 0, '#f0c040');
+  stats += bigStat('Keep rate',
+    ls.keep_rate !== null && ls.keep_rate !== undefined
+      ? (ls.keep_rate * 100).toFixed(0) + '%' : '—',
+    '#80c0ff');
+  stats += bigStat('30d PnL', '$' + (g.rolling_pnl || 0).toFixed(2),
+    (g.rolling_pnl || 0) >= 0 ? '#00d4aa' : '#ff6b6b');
+  stats += bigStat('30d WR',
+    g.win_rate !== null && g.win_rate !== undefined
+      ? (g.win_rate * 100).toFixed(0) + '%' : '—');
+  stats += bigStat('Drawdown', ((g.drawdown_from_peak_pct || 0) * 100).toFixed(2) + '%',
+    (g.drawdown_from_peak_pct || 0) > 0.05 ? '#ff6b6b' : '#888');
+  stats += '</div>';
+
+  // Experiment table
+  let table = '<table style="width:100%;font-size:11px">' +
+    '<thead><tr><th>When</th><th>Param</th><th>Change</th><th>Status</th><th>Reason</th></tr></thead><tbody>';
+  if (recent.length === 0) {
+    table += '<tr><td colspan="5" class="dim">No experiments yet — run <code>python main.py hermes-cycle</code> to start the loop.</td></tr>';
+  } else {
+    recent.forEach(e => {
+      const when = (e.opened_at || '').slice(0, 19).replace('T', ' ');
+      const statusColor = {kept:'#00d4aa', rolled_back:'#ff6b6b', open:'#f0c040', expired:'#888'}[e.status] || '#888';
+      const reasonShort = (e.reason || '').slice(0, 60);
+      table += '<tr>' +
+        '<td class="dim">' + when + '</td>' +
+        '<td><b>' + (e.param || '?') + '</b></td>' +
+        '<td>' + (e.old_value !== undefined ? e.old_value : '?') + ' → ' + (e.new_value !== undefined ? e.new_value : '?') + '</td>' +
+        '<td style="color:' + statusColor + ';font-weight:bold">' + e.status + '</td>' +
+        '<td class="dim">' + reasonShort + '</td></tr>';
+    });
+  }
+  table += '</tbody></table>';
+
+  let footer = '';
+  if (h.last_review && h.last_review.path) {
+    footer = '<div class="dim" style="font-size:11px;margin-top:6px">Last weekly review: <code>' +
+             h.last_review.path.split('/').slice(-3).join('/') + '</code></div>';
+  }
+  body.innerHTML = stats + table + footer;
+}
+
+async function refreshAllBots() {
+  try {
+    const resp = await fetch('/api/all_open_trades');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    renderAllBots(await resp.json());
+  } catch(e) { console.error('all_open_trades:', e); }
+}
+
+function renderAllBots(d) {
+  const tbody = $('all-bots-body');
+  const totEl = $('all-bots-totals');
+  if (!d || !d.rows) { tbody.innerHTML = '<tr><td colspan="8" class="dim">no data</td></tr>'; return; }
+  totEl.textContent = `· ${d.totals.open} open · ${d.totals.stale} stale ⚠`;
+  if (d.rows.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="8" class="dim">no open positions across any bot</td></tr>';
+    return;
+  }
+  const rows = [...d.rows].sort((a,b) => (b.stale - a.stale) || a.bot.localeCompare(b.bot) || (b.age_days||0) - (a.age_days||0));
+  tbody.innerHTML = rows.map(r => {
+    const stale = r.stale ? '<span style="color:#e57373" title="past per-kind staleness threshold">⚠</span> ' : '';
+    const pcls = r.upnl > 0 ? 'positive' : (r.upnl < 0 ? 'negative' : '');
+    const upnl = (r.upnl != null && r.upnl !== 0)
+      ? `<span class="${pcls}">${r.upnl >= 0 ? '+' : ''}${r.upnl.toFixed(4)}</span>`
+      : '<span class="dim">—</span>';
+    const mark = r.mark > 0 ? '$' + r.mark.toFixed(4) : '<span class="dim">—</span>';
+    const age = r.age_days != null
+      ? (r.age_days < 1 ? `${Math.round(r.age_days*24*60)}m` : `${r.age_days.toFixed(1)}d`)
+      : '?';
+    const id = (r.label || r.id || '?').toString().substring(0, 40);
+    return `<tr>
+      <td>${stale}${r.bot}</td>
+      <td title="${(r.id||'').replace(/"/g,'&quot;')}">${id}</td>
+      <td>${r.side}</td>
+      <td class="right">${r.size.toFixed(4)}</td>
+      <td class="right">$${r.entry.toFixed(4)}</td>
+      <td class="right">${mark}</td>
+      <td class="right">${upnl}</td>
+      <td class="right">${age}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function refreshGoal() {
+  try {
+    const resp = await fetch('/api/goal-progress');
+    const data = await resp.json();
+    renderGoalProgress(data);
+  } catch(e) { console.error('Goal fetch error:', e); }
+}
+
+async function refreshThinking() {
+  try {
+    const resp = await fetch('/api/thinking');
+    const data = await resp.json();
+    renderThinking(data);
+  } catch(e) { console.error('Thinking fetch error:', e); }
+}
+
+async function refreshMarkov(forceRefresh) {
+  try {
+    const ticker = ($('markov-ticker').value || 'SPY').toUpperCase();
+    const url = '/api/markov?ticker=' + encodeURIComponent(ticker) +
+                (forceRefresh ? '&refresh=1' : '');
+    const resp = await fetch(url);
+    const data = await resp.json();
+    renderMarkov(data);
+  } catch(e) { console.error('Markov fetch error:', e); }
+}
+
+function renderMarkov(m) {
+  const body = $('markov-body');
+  if (!m || m.error) {
+    body.innerHTML = '<span class="red">' + (m && m.error ? m.error : 'unavailable') + '</span>';
+    $('markov-summary').textContent = '';
+    return;
+  }
+  // Header summary
+  const sig = m.signal || 0;
+  const sigColor = sig > 0.05 ? '#00d4aa' : (sig < -0.05 ? '#ff6b6b' : '#f0c040');
+  const direction = sig > 0.05 ? 'LONG' : (sig < -0.05 ? 'SHORT' : 'FLAT');
+  const cacheAge = m._cache_age_hours;
+  const cacheStr = cacheAge !== undefined
+    ? ' &nbsp;(cache age ' + cacheAge.toFixed(1) + 'h)'
+    : '';
+  $('markov-summary').innerHTML =
+    '<b>' + m.ticker + '</b> &nbsp; state=<b style="color:' + sigColor + '">' +
+    (m.today_state || '?').toUpperCase() + '</b> &nbsp; ' +
+    'signal=<b style="color:' + sigColor + '">' + (sig >= 0 ? '+' : '') + sig.toFixed(4) +
+    '</b> &nbsp; → ' + direction + cacheStr;
+
+  // 3x3 transition matrix grid
+  const STATES = ['bear', 'sideways', 'bull'];
+  const colorFor = (v) => {
+    // 0 → dark blue, 1 → bright gold
+    const t = Math.min(1, Math.max(0, v));
+    const r = Math.round(0x1a + (0xf0 - 0x1a) * t);
+    const g = Math.round(0x1a + (0xc0 - 0x1a) * t);
+    const b = Math.round(0x3e + (0x40 - 0x3e) * t);
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  };
+  let matrixHtml = '<table style="font-size:12px;border-collapse:collapse">' +
+    '<thead><tr><th style="padding:6px 10px;color:#888">today \\ tomorrow</th>';
+  STATES.forEach(s => matrixHtml += '<th style="padding:6px 10px;color:#888">' + s + '</th>');
+  matrixHtml += '</tr></thead><tbody>';
+  STATES.forEach(s => {
+    const row = (m.matrix || {})[s] || {};
+    matrixHtml += '<tr><td style="padding:6px 10px;color:#888;text-align:right"><b>' + s + '</b></td>';
+    STATES.forEach(t => {
+      const v = row[t] || 0;
+      const txtColor = v > 0.5 ? '#0f0f23' : '#e0e0e0';
+      const border = (s === m.today_state) ? '2px solid #f0c040' : '1px solid #2a2a5e';
+      matrixHtml += '<td style="padding:8px 12px;background:' + colorFor(v) +
+                    ';color:' + txtColor + ';text-align:center;border:' + border + '">' +
+                    (v * 100).toFixed(1) + '%</td>';
+    });
+    matrixHtml += '</tr>';
+  });
+  matrixHtml += '</tbody></table>';
+
+  // Side stats — stickiness + stationary + walk-forward
+  const stick = m.stickiness || {};
+  const stat = m.stationary || {};
+  const fc = m.forecast || {};
+  const wf = m.walk_forward || {};
+  let stats = '<div style="font-size:12px;line-height:1.6">';
+  stats += '<b style="color:#f0c040">Forecast (horizon ' + (m.horizon || 1) + 'd from today)</b><br>';
+  STATES.forEach(s => {
+    stats += '&nbsp;&nbsp;P(' + s + ') = <b>' + ((fc[s] || 0) * 100).toFixed(1) + '%</b><br>';
+  });
+  stats += '<br><b style="color:#f0c040">Stickiness</b><br>';
+  STATES.forEach(s => {
+    stats += '&nbsp;&nbsp;' + s + ' → ' + s + ': <b>' + ((stick[s] || 0) * 100).toFixed(1) + '%</b><br>';
+  });
+  stats += '<br><b style="color:#f0c040">Stationary (long-run)</b><br>';
+  STATES.forEach(s => {
+    stats += '&nbsp;&nbsp;π(' + s + ') = <b>' + ((stat[s] || 0) * 100).toFixed(1) + '%</b><br>';
+  });
+  stats += '<br><b style="color:#f0c040">Walk-forward (' + (wf.bars || 0) + ' bars)</b><br>';
+  if (wf.directional_accuracy !== null && wf.directional_accuracy !== undefined) {
+    const acc = wf.directional_accuracy * 100;
+    const accColor = acc > 55 ? '#00d4aa' : (acc < 50 ? '#ff6b6b' : '#f0c040');
+    stats += '&nbsp;&nbsp;Directional acc: <span style="color:' + accColor + ';font-weight:bold">' +
+             acc.toFixed(1) + '%</span><br>';
+  } else {
+    stats += '&nbsp;&nbsp;Directional acc: n/a<br>';
+  }
+  stats += '&nbsp;&nbsp;PnL/unit bankroll: <b>' +
+           (wf.cumulative_pnl_per_unit_bankroll >= 0 ? '+' : '') +
+           (wf.cumulative_pnl_per_unit_bankroll || 0).toFixed(4) + '</b><br>';
+  if (m.hmm_agreement !== undefined) {
+    stats += '<br><b style="color:#f0c040">HMM cross-check</b><br>';
+    stats += '&nbsp;&nbsp;HMM-lite today: <b>' + (m.hmm_lite_today || '?') + '</b><br>';
+    stats += '&nbsp;&nbsp;Agreement rate: <b>' + (m.hmm_agreement * 100).toFixed(1) + '%</b><br>';
+    if (m.green_light) {
+      stats += '&nbsp;&nbsp;<span style="color:#00d4aa;font-weight:bold">GREEN LIGHT ✓</span>';
+    } else {
+      stats += '&nbsp;&nbsp;<span class="dim">no green light</span>';
+    }
+  }
+  stats += '<br><br><b style="color:#f0c040">Suggested position</b><br>';
+  const pos = m.position_size_pct || 0;
+  const posColor = pos > 0 ? '#00d4aa' : (pos < 0 ? '#ff6b6b' : '#888');
+  stats += '&nbsp;&nbsp;<b style="color:' + posColor + ';font-size:16px">' +
+           (pos >= 0 ? '+' : '') + (pos * 100).toFixed(2) + '%</b> of bankroll';
+  stats += '</div>';
+
+  body.innerHTML =
+    '<div style="display:flex;gap:20px;flex-wrap:wrap;align-items:flex-start">' +
+    '<div>' + matrixHtml +
+    '<div class="dim" style="font-size:11px;margin-top:6px">Gold border = today\'s state row. ' +
+    'Darker cells = lower prob, brighter = higher. Window=' + (m.window || 20) + 'd, ' +
+    (m.bars_used || 0) + ' bars history.</div>' +
+    '</div>' +
+    '<div style="min-width:240px">' + stats + '</div>' +
+    '</div>';
+}
+
+function renderGoalProgress(g) {
+  if (!g || g.error) {
+    $('goal-summary').textContent = g && g.error ? ('error: ' + g.error) : 'unavailable';
+    return;
+  }
+  const cur = g.current || 0, anchor = g.anchor || 0, target = g.target || 0;
+  const floor = g.hard_floor || 0, buf = g.hard_floor_buffer || 0;
+  const eFloor = floor + buf;
+  $('goal-summary').innerHTML =
+    '<b>$' + cur.toFixed(2) + '</b> &nbsp;' +
+    '(anchor $' + anchor + ' → target $' + target + ') &nbsp;' +
+    'growth ' + (g.pct_growth_from_anchor || 0).toFixed(2) + '%, ' +
+    'to target ' + (g.pct_to_target || 0).toFixed(2) + '% &nbsp;' +
+    (g.halt_state === 'halted'
+      ? '<span class="red">[HALTED: ' + (g.halt_reason || '?') + ']</span>'
+      : '<span class="green">[OK]</span>');
+
+  const svg = $('goal-svg');
+  const W = 1000, H = 64, PAD = 8;
+  const lo = Math.min(eFloor, anchor) - (target - anchor) * 0.02;
+  const hi = target * 1.02;
+  const sx = v => PAD + ((v - lo) / (hi - lo)) * (W - 2 * PAD);
+  const yMid = H / 2;
+  let parts = [];
+  // Track
+  parts.push('<line x1="' + PAD + '" y1="' + yMid + '" x2="' + (W - PAD) +
+             '" y2="' + yMid + '" stroke="#3a3a5e" stroke-width="6" stroke-linecap="round"/>');
+  // Progress fill (anchor → current)
+  if (cur > anchor) {
+    parts.push('<line x1="' + sx(anchor) + '" y1="' + yMid + '" x2="' + sx(cur) +
+               '" y2="' + yMid + '" stroke="#00d4aa" stroke-width="6" stroke-linecap="round"/>');
+  }
+  // Hard-floor zone (eFloor → anchor) in dim red
+  parts.push('<rect x="' + sx(floor) + '" y="' + (yMid - 4) +
+             '" width="' + (sx(eFloor) - sx(floor)) + '" height="8" fill="#ff4444" opacity="0.6"/>');
+  // Anchor marker (gray dot)
+  parts.push('<circle cx="' + sx(anchor) + '" cy="' + yMid + '" r="5" fill="#9ba8b9"/>');
+  parts.push('<text x="' + sx(anchor) + '" y="' + (yMid + 22) + '" text-anchor="middle" fill="#9ba8b9" font-size="10">anchor $' + anchor + '</text>');
+  // Current position marker
+  parts.push('<circle cx="' + sx(cur) + '" cy="' + yMid + '" r="7" fill="#f0c040" stroke="#1a1a3e" stroke-width="2"/>');
+  parts.push('<text x="' + sx(cur) + '" y="' + (yMid - 12) + '" text-anchor="middle" fill="#f0c040" font-size="11" font-weight="bold">$' + cur.toFixed(0) + '</text>');
+  // Milestones
+  (g.milestones || []).forEach(m => {
+    const hit = !!m.hit_at;
+    const color = hit ? '#00d4aa' : '#666';
+    parts.push('<circle cx="' + sx(m.value) + '" cy="' + yMid + '" r="5" fill="' + color + '" stroke="#1a1a3e" stroke-width="1.5"/>');
+    parts.push('<text x="' + sx(m.value) + '" y="' + (yMid + 22) + '" text-anchor="middle" fill="' + color + '" font-size="10">$' + m.value + (hit ? ' ✓' : '') + '</text>');
+  });
+  // Target end
+  parts.push('<circle cx="' + sx(target) + '" cy="' + yMid + '" r="6" fill="none" stroke="#f0c040" stroke-width="2"/>');
+  svg.innerHTML = parts.join('');
+
+  const sb = g.stock_buys_gate || {};
+  const sbReason = sb.blocking_reason ? ' — ' + sb.blocking_reason : '';
+  $('goal-legend').innerHTML =
+    '<span style="color:#ff4444">▮</span> hard-floor zone ($' + floor + ' + $' + buf + ' buffer) &nbsp;' +
+    '<span style="color:#00d4aa">▮</span> progress from anchor &nbsp;' +
+    '<span style="color:#f0c040">●</span> current equity &nbsp;' +
+    '<span style="color:#00d4aa">●</span> milestone hit &nbsp;' +
+    '<span style="color:#666">●</span> milestone pending &nbsp;' +
+    '<br>stock-buys gate: ' +
+    (sb.enabled === false
+      ? '<span class="red">DISABLED</span>' + sbReason
+      : '<span class="green">ENABLED</span>');
+}
+
+function renderThinking(t) {
+  const div = $('thinking-container');
+  if (!t || typeof t !== 'object') { div.textContent = 'unavailable'; return; }
+  const agents = ['strategy_agent', 'risk_agent', 'compliance_agent', 'bull_agent', 'bear_agent'];
+  const labels = {
+    strategy_agent: 'Strategy', risk_agent: 'Risk', compliance_agent: 'Compliance',
+    bull_agent: 'Bull', bear_agent: 'Bear',
+  };
+  const verdictColor = {good: '#00d4aa', block: '#ff6b6b', warn: '#f0c040', info: '#888'};
+  let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px">';
+  agents.forEach(a => {
+    const rows = t[a] || [];
+    let inner = '<div style="font-weight:bold;color:#f0c040;font-size:13px;margin-bottom:4px;border-bottom:1px solid #3a2a6e;padding-bottom:3px">' +
+                labels[a] + ' Agent' +
+                '<span class="dim" style="float:right;font-weight:normal;font-size:11px">' + rows.length + ' recent</span></div>';
+    if (rows.length === 0) {
+      inner += '<div class="dim" style="font-size:11px">No entries yet.</div>';
+    } else {
+      rows.forEach(r => {
+        const time = (r.timestamp || '').slice(11, 19);
+        const date = (r.timestamp || '').slice(5, 10);
+        const color = verdictColor[r.verdict] || '#888';
+        const ticker = r.ticker || '?';
+        // Show entry, truncated
+        const entry = (r.entry || '').length > 90 ? (r.entry.slice(0, 90) + '…') : r.entry;
+        inner += '<div style="font-size:11px;border-left:3px solid ' + color +
+                 ';padding-left:6px;margin-bottom:5px;line-height:1.35">' +
+                 '<div><span class="dim">' + date + ' ' + time + '</span> &nbsp;<b>' + ticker + '</b></div>' +
+                 '<div style="font-family:ui-monospace,Menlo,monospace;font-size:10.5px;color:#c0c0ff">' +
+                 entry + '</div></div>';
+      });
+    }
+    html += '<div>' + inner + '</div>';
+  });
+  html += '</div>';
+  div.innerHTML = html;
 }
 
 async function refreshQuant() {

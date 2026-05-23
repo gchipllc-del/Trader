@@ -18,6 +18,8 @@ from lib.dashboard_data import (
     get_full_dashboard_state, get_quant_scores,
     get_portfolio_summary, get_positions_table,
     get_events, get_trade_history, get_circuit_breaker_status,
+    get_agent_thinking, get_goal_progress, get_markov_summary,
+    get_hermes_state,
 )
 
 TEMPLATE_DIR = Path(__file__).parent.parent / "templates"
@@ -50,6 +52,15 @@ def api_positions():
     return jsonify(get_positions_table())
 
 
+@app.route("/api/all_open_trades")
+def api_all_open_trades():
+    """Unified open-trades view across every sibling bot.
+    Same response shape across polybot, cryptobot, wheel-trader.
+    """
+    from lib.all_bots_positions import get_all_bots_open_positions
+    return jsonify(get_all_bots_open_positions())
+
+
 @app.route("/api/events")
 def api_events():
     return jsonify(get_events(30))
@@ -63,6 +74,29 @@ def api_history():
 @app.route("/api/breakers")
 def api_breakers():
     return jsonify(get_circuit_breaker_status())
+
+
+@app.route("/api/thinking")
+def api_thinking():
+    return jsonify(get_agent_thinking())
+
+
+@app.route("/api/goal-progress")
+def api_goal_progress():
+    return jsonify(get_goal_progress())
+
+
+@app.route("/api/markov")
+def api_markov():
+    from flask import request
+    ticker = request.args.get("ticker", "SPY").upper()
+    refresh = request.args.get("refresh", "0") == "1"
+    return jsonify(get_markov_summary(ticker, refresh=refresh))
+
+
+@app.route("/api/hermes")
+def api_hermes():
+    return jsonify(get_hermes_state())
 
 
 def run_dashboard(port: int = 5051):
