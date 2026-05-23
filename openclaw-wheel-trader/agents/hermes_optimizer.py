@@ -188,23 +188,51 @@ def review_trades(
         score = p.get("composite_score", 0)
         ticker = p.get("ticker", "?")
 
-        # Calculate approximate P/L
-        if reason == "stop_loss":
+        # 2026-05-23 fix: trust ``realized_pnl`` and ``exit_price`` when
+        # they're present. Without this, ~99% of recent closes
+        # (close_reason=auto_reconcile_*) silently fell to the "else"
+        # branch below and were scored as breakeven — Hermes was BLIND
+        # to a +$788/14d run because the only recognized close_reasons
+        # were "stop_loss" / "take_profit". The reconciler is now the
+        # dominant exit path so we must read its outcomes.
+        realized = p.get("realized_pnl")
+        exit_p_field = p.get("exit_price")
+        if (realized is not None and realized != 0) or (
+            exit_p_field is not None and entry > 0
+            and float(exit_p_field) > 0 and float(exit_p_field) != entry
+        ):
+            if exit_p_field is not None and float(exit_p_field) > 0:
+                exit_price = float(exit_p_field)
+                pnl_pct = (exit_price - entry) / entry if entry > 0 else 0.0
+            else:
+                # Derive pct from realized_pnl + shares + entry
+                shares = float(p.get("shares") or 0)
+                cost = entry * shares if entry > 0 and shares > 0 else 0
+                pnl_pct = (float(realized) / cost) if cost > 0 else 0.0
+                exit_price = entry + (entry * pnl_pct)
+            # Still classify stop/target hits when the field tags it
+            if reason == "stop_loss":
+                stop_outs.append(p)
+            elif reason == "take_profit":
+                target_hits.append(p)
+        elif reason == "stop_loss":
             exit_price = stop
             stop_outs.append(p)
+            pnl_pct = (exit_price - entry) / entry if entry > 0 else 0
         elif reason == "take_profit":
             exit_price = target
             target_hits.append(p)
+            pnl_pct = (exit_price - entry) / entry if entry > 0 else 0
         else:
-            # Estimate: midpoint between entry and target for wins, entry and stop for losses
-            exit_price = entry  # Unknown, assume breakeven
-
-        pnl_pct = (exit_price - entry) / entry if entry > 0 else 0
+            # No realized_pnl, no exit, no known reason — true breakeven
+            exit_price = entry
+            pnl_pct = 0.0
 
         if pnl_pct > 0:
             wins.append({"ticker": ticker, "pnl_pct": pnl_pct, "score": score, "reason": reason})
-        else:
+        elif pnl_pct < 0:
             losses.append({"ticker": ticker, "pnl_pct": pnl_pct, "score": score, "reason": reason})
+        # pnl_pct == 0 → genuinely flat, don't count as win or loss
 
     total = len(closed)
     win_rate = len(wins) / total if total > 0 else 0

@@ -122,6 +122,71 @@ def _revert_param(param: str, old_value) -> None:
 
 # ─── Single-variable change selection ─────────────────────────────────
 
+def goal_aware_recommendations(metrics: dict) -> list[dict]:
+    """Inject defensive / aggressive recommendations from goal-level
+    signals that the per-trade diagnose() can't see.
+
+    Two main triggers:
+
+      DRAWDOWN — if drawdown_from_peak > 20%, the bot is bleeding from
+      a high-water mark. Recommend cutting position size + tightening
+      stops to preserve remaining equity. This is the bot's #1 capital-
+      preservation lever.
+
+      VELOCITY — if velocity is strongly positive AND drawdown is
+      contained, push for more aggression (larger positions, more
+      trades per scan).
+
+    Returns recs in the same shape as agents.hermes_optimizer.diagnose().
+    """
+    out: list[dict] = []
+    dd = metrics.get("drawdown_from_peak_pct", 0.0) or 0.0
+    vel = metrics.get("velocity_per_day", 0.0) or 0.0
+    n_trades = metrics.get("n_trades_window", 0)
+    wr = metrics.get("win_rate")
+
+    # Defensive: significant drawdown
+    if dd >= 0.20 and n_trades >= 10:
+        out.append({
+            "param": "max_position_pct",
+            "direction": "decrease",
+            "confidence": min(1.0, dd * 2),  # 20% dd → 0.4 conf, 50% dd → 1.0
+            "reason": (
+                f"goal_aware: drawdown {dd:.0%} from peak — "
+                "reduce position size to preserve equity"
+            ),
+        })
+    if dd >= 0.30 and n_trades >= 10:
+        out.append({
+            "param": "stop_loss_pct",
+            "direction": "decrease",  # tighter stops in drawdown
+            "confidence": min(1.0, dd * 1.5),
+            "reason": (
+                f"goal_aware: drawdown {dd:.0%} — tighten stops to "
+                "limit further bleed"
+            ),
+        })
+
+    # Aggressive: strong velocity + WR + low drawdown
+    if (
+        vel > 5.0  # > $5/day on the current equity scale
+        and dd < 0.10
+        and wr is not None and wr >= 0.55
+        and n_trades >= 20
+    ):
+        out.append({
+            "param": "max_trades_per_scan",
+            "direction": "increase",
+            "confidence": 0.6,
+            "reason": (
+                f"goal_aware: velocity ${vel:+.2f}/day, WR {wr:.0%}, "
+                f"drawdown {dd:.0%} — bot is healthy, push more trades"
+            ),
+        })
+
+    return out
+
+
 def pick_one_change(recommendations: list[dict]) -> dict | None:
     """From the optimizer's recommendation list, pick the single best
     candidate to apply this cycle. Filters out recently-rolled-back
@@ -189,7 +254,11 @@ def run_scientific_cycle(
         dry_run=True,
     )
     recs = legacy_report.get("recommendations", []) or []
-    pick = pick_one_change(recs)
+    # Layer in goal-aware recs (drawdown defense, velocity-driven aggression)
+    goal_recs = goal_aware_recommendations(baseline_metrics)
+    # Goal-aware recs go first so they win the priority sort on ties
+    all_recs = goal_recs + recs
+    pick = pick_one_change(all_recs)
 
     applied_change: dict | None = None
     new_experiment: dict | None = None

@@ -22,6 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 BASELINE_PATH = ROOT / "data" / "baseline_equity.json"
 TRADE_HISTORY_PATH = ROOT / "data" / "trade_history.json"
+POSITIONS_PATH = ROOT / "data" / "positions.json"
 
 
 def _load_json(p: Path, default):
@@ -79,34 +80,60 @@ def compute_goal_metrics(window_days: int = 30) -> dict:
     goal_distance_pct = min(1.0, gap_remaining / gap_total)
     progress_pct = 1.0 - goal_distance_pct
 
-    # Per-day velocity from trade history
-    history = _load_json(TRADE_HISTORY_PATH, [])
-    if isinstance(history, dict):
-        history = history.get("trades", [])
+    # Per-day velocity. 2026-05-23 fix: trade_history.json is sparse
+    # (~13 entries) while positions.json carries the actual closed-trade
+    # outcomes (~1000+ rows from auto_reconcile flows). Prefer positions
+    # when both exist; fall back to trade_history.
     cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
-    window = []
-    for t in history:
-        closed = t.get("closed_at") or t.get("completed_at") or t.get("opened_at")
-        if not closed:
+    positions_raw = _load_json(POSITIONS_PATH, [])
+    positions = (
+        positions_raw.get("positions", positions_raw)
+        if isinstance(positions_raw, dict) else positions_raw
+    )
+    pos_window = []
+    for p in positions or []:
+        if p.get("status") != "closed":
+            continue
+        closed_ts = p.get("closed_at")
+        if not closed_ts:
             continue
         try:
-            dt = datetime.fromisoformat(str(closed).replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(str(closed_ts).replace("Z", "+00:00"))
             if dt >= cutoff:
-                window.append(t)
+                pos_window.append(p)
         except (ValueError, TypeError):
             continue
-    pnl_window = sum(
-        float(t.get("total_pnl") or t.get("realized_pnl") or 0.0)
-        for t in window
-    )
-    wins = sum(
-        1 for t in window
-        if (t.get("total_pnl") or t.get("realized_pnl") or 0.0) > 0
-    )
-    losses = sum(
-        1 for t in window
-        if (t.get("total_pnl") or t.get("realized_pnl") or 0.0) < 0
-    )
+
+    if pos_window:
+        window = pos_window
+        pnls = [float(p.get("realized_pnl") or 0.0) for p in window]
+        source = "positions.json"
+    else:
+        history = _load_json(TRADE_HISTORY_PATH, [])
+        if isinstance(history, dict):
+            history = history.get("trades", [])
+        window = []
+        for t in history:
+            closed_ts = (
+                t.get("closed_at") or t.get("completed_at") or t.get("opened_at")
+            )
+            if not closed_ts:
+                continue
+            try:
+                dt = datetime.fromisoformat(str(closed_ts).replace("Z", "+00:00"))
+                if dt >= cutoff:
+                    window.append(t)
+            except (ValueError, TypeError):
+                continue
+        pnls = [
+            float(t.get("total_pnl") or t.get("realized_pnl") or 0.0)
+            for t in window
+        ]
+        source = "trade_history.json"
+
+    pnl_window = sum(pnls)
+    wins = sum(1 for v in pnls if v > 0)
+    losses = sum(1 for v in pnls if v < 0)
     win_rate = (wins / (wins + losses)) if (wins + losses) > 0 else None
     velocity_per_day = pnl_window / max(window_days, 1)
 
@@ -115,15 +142,24 @@ def compute_goal_metrics(window_days: int = 30) -> dict:
     else:
         days_to_target = None
 
-    # Drawdown-from-peak — peak since the anchor date
+    # Drawdown-from-peak — peak equity since the anchor date. Walk
+    # cumulative realized PnL across ALL closed positions (not just the
+    # window) and track the high-water mark.
     peak = anchor
-    for t in history:
-        try:
-            eq_after = float(t.get("equity_after") or 0)
-            if eq_after > peak:
-                peak = eq_after
-        except (TypeError, ValueError):
-            continue
+    cum = anchor
+    if positions:
+        sorted_pos = sorted(
+            [p for p in positions if p.get("status") == "closed"
+             and p.get("closed_at")],
+            key=lambda p: p.get("closed_at", ""),
+        )
+        for p in sorted_pos:
+            try:
+                cum += float(p.get("realized_pnl") or 0.0)
+                if cum > peak:
+                    peak = cum
+            except (TypeError, ValueError):
+                continue
     if peak <= 0:
         peak = max(current, anchor)
     drawdown_from_peak = max(0.0, (peak - current) / peak) if peak > 0 else 0.0
@@ -143,6 +179,7 @@ def compute_goal_metrics(window_days: int = 30) -> dict:
         "losses": losses,
         "win_rate": round(win_rate, 4) if win_rate is not None else None,
         "velocity_per_day": round(velocity_per_day, 4),
+        "pnl_source": source,
         "days_to_target_at_velocity": (
             round(days_to_target, 1) if days_to_target is not None else None
         ),
