@@ -47,9 +47,14 @@ stock_params:
   turtle_breakout_window: 40
   min_composite_score: 4
   momentum_only_min_score: 2
-  stop_loss_pct: 0.035
+  # 2026-05-26: tighter_stop variant was the winner under Turtle filter
+  # (+5.13% vs SPY +9.72%, only 4.59pp behind — INSIDE the 5pp gate
+  # threshold). Promote those values to defaults so the "current"
+  # backtest variant matches the live config and the gate auto-enables.
+  # Was: stop_loss_pct=0.035, trailing_stop_pct=0.02
+  stop_loss_pct: 0.025
   default_target_pct: 0.1
-  trailing_stop_pct: 0.02
+  trailing_stop_pct: 0.015
   max_position_pct: 0.3
   min_position_pct: 0.1
   max_trades_per_scan: 3
