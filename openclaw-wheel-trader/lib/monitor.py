@@ -563,6 +563,33 @@ def run_monitoring_check(client: AlpacaClient, *, timeout_seconds: int = 120) ->
                 # for tax/P&L reporting, bad for assignment-risk decisions.
                 pos["original_purchase_price"] = float(assignment["avg_price"])
 
+                # 2026-05-26: forever-hold protection. If the assigned
+                # ticker is in core_holdings, stamp hold_forever so the
+                # CC engine and exit logic skip it. The stock-buy path
+                # already does this at entry (stock_engine.py:1320); we
+                # mirror it here for the CSP-assignment path so the
+                # protection applies regardless of how shares were
+                # acquired.
+                try:
+                    import yaml
+                    from pathlib import Path
+                    _sp = Path(__file__).resolve().parent.parent / "config" / "wheel_strategy.yaml"
+                    with open(_sp) as _f:
+                        _strat = yaml.safe_load(_f) or {}
+                    _core = {
+                        str(t).upper()
+                        for t in (_strat.get("core_holdings") or [])
+                    }
+                    if ticker.upper() in _core:
+                        pos["hold_forever"] = True
+                        log_event("monitor", "core_holding_stamped_hold_forever",
+                                  {"ticker": ticker,
+                                   "shares": assignment["shares"]},
+                                  result="success")
+                except Exception:
+                    # Best-effort stamp; never block assignment processing
+                    pass
+
                 summary["actions"].append(assignment)
                 summary["alerts"].append(f"📋 {ticker}: ASSIGNED at {pos.get('strike')}")
 
