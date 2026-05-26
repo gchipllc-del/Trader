@@ -2412,7 +2412,7 @@ def main():
                                  "hermes-ledger", "hermes-mode",
                                  "cornelius", "goal-score",
                                  "turtle", "turtle-scan", "turtle-backtest",
-                                 "pead", "pead-scan"],
+                                 "pead", "pead-scan", "paper-live-drift"],
                         help="Command to run")
     parser.add_argument("--signal", default="all",
                         help="build-cache: which signal to fill (kronos|news|llm|all)")
@@ -2662,6 +2662,17 @@ def main():
         ticker = args.ticker or "SPY"
         result = turtle_signal(ticker, lookback_days=365)
         print(render_summary(result))
+    elif args.command == "paper-live-drift":
+        from lib.paper_live_drift import record_fills, summary, render
+        if "--record" in sys.argv:
+            r = record_fills()
+            print(f"Recorded {r['recorded']} new fill(s). "
+                  f"Log size: {r['total_in_log']}")
+        window = 30
+        for arg in sys.argv[1:]:
+            if arg.startswith("--window="):
+                window = int(arg.split("=", 1)[1])
+        print(render(summary(window_days=window)))
     elif args.command == "pead":
         from lib.pead_signal import pead_score, render as _pead_render
         print(_pead_render(pead_score(args.ticker or "NVDA")))

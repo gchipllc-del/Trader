@@ -55,6 +55,18 @@ stock_params:
   stop_loss_pct: 0.025
   default_target_pct: 0.1
   trailing_stop_pct: 0.015
+
+  # 2026-05-26: paper-to-live realism knobs (after the Kalshi paper-vs-live
+  # divergence lesson). The backtest now models:
+  #   - entry_slippage_pct: live BUY market orders fill at ASK (≈ +5 bps)
+  #   - exit_slippage_pct:  live SELL market orders fill at BID  (≈ -5 bps)
+  #   - gap_open_stops:     if overnight gap blew through a stop, fill
+  #                         happens at the OPEN (not the idealized stop)
+  # These cumulatively shave ~50-100 bps off the backtest's reported
+  # return — a more honest projection of what live would actually do.
+  entry_slippage_pct: 0.0005
+  exit_slippage_pct: 0.0005
+  gap_open_stops: true
   max_position_pct: 0.3
   min_position_pct: 0.1
   max_trades_per_scan: 3

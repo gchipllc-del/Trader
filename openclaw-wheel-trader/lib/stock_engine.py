@@ -291,6 +291,34 @@ def scan_for_stocks(
     max_position_value = portfolio_value * max_position_pct
     max_concurrent = strategy.get("stock_params", {}).get("max_concurrent_positions", 5)
 
+    # Gate 0: Market regime filter — BEFORE any per-ticker work, check
+    # whether the broad market structure is favorable for new entries.
+    # The 2026-05-23 30d backtest showed all variants losing 3-7% vs SPY
+    # +4.84% — strategy bleeds in choppy/bearish regimes. This gate
+    # blocks new entries when SPY downtrend OR VIX stressed. Existing
+    # positions stay managed normally (this is ENTRY-only).
+    try:
+        from lib.regime_filter import (
+            get_market_regime, is_filter_enabled, render_snapshot,
+        )
+        if is_filter_enabled():
+            regime = get_market_regime(client)
+            print(f"\n  {render_snapshot(regime)}")
+            if not regime["allow_entries"]:
+                log_event("stock_engine", "regime_filter_blocked", {
+                    "regime": regime["regime"],
+                    "reason": regime["reason"],
+                    "vix": regime.get("vix_level"),
+                    "spy_above_50ma": regime.get("spy_above_50ma"),
+                    "spy_slope_pct": regime.get("spy_50ma_slope_10d_pct"),
+                })
+                print(f"  ⛔ Entry blocked by regime filter — no new positions this scan.")
+                return []
+    except Exception as e:
+        # Filter must NEVER break the scan; degrade open if it errors.
+        log_event("stock_engine", "regime_filter_error",
+                  {"error": str(e)[:200]}, result="degraded")
+
     # Gate 1: Quantitative screening
     quant_scores = screen_universe(
         daily_data,
@@ -1050,6 +1078,14 @@ def execute_stock_buy(
     try:
         check_paper_mode()
         check_daily_loss(current_daily_pnl, portfolio_value=portfolio_value)
+        # Stock-buys gate: directional momentum layer can be disabled when
+        # the recent backtest underperforms SPY by >threshold. CSP/CC paths
+        # don't call this. Fails open if unified_goals is unavailable.
+        try:
+            from lib.circuit_breaker import check_stock_buys_enabled
+            check_stock_buys_enabled()
+        except ImportError:
+            pass
     except CircuitBreakerTripped as e:
         log_event("stock_engine", "blocked", {"ticker": ticker, "error": str(e)})
         diary_write("strategy_agent", f"{ticker}|STOCK_BLOCKED|{e}")
@@ -1273,6 +1309,11 @@ def execute_stock_buy(
 
     # Track position under exclusive lock so a concurrent crypto-monitor
     # or scan can't race the read-modify-write and clobber this append.
+    # 2026-05-26: record intent_price (signal-time current_price) and
+    # fill_price (broker's filled_avg). Drift detector compares these
+    # over time to validate the realism knobs in wheel_strategy.yaml.
+    intent_price_signal = float(candidate.get("current_price", price))
+    fill_price_broker = float(price)  # `price` was reassigned to filled_avg above
     with mutate_positions() as positions:
         new_pos = {
             "ticker": ticker,
@@ -1280,6 +1321,8 @@ def execute_stock_buy(
             "status": "open",
             "shares": shares,
             "entry_price": price,
+            "intent_price": intent_price_signal,
+            "fill_price": fill_price_broker,
             "target_price": candidate["target_price"],
             "stop_loss": candidate["stop_loss"],
             "order_id": response["id"],
@@ -2014,9 +2057,8 @@ def run_stock_scan_and_execute(
     # Derive from broker equity vs baseline (same formula as main.py).
     daily_pnl_dollars = 0.0
     try:
-        baseline = json.load(open(
-            Path(__file__).parent.parent / "data" / "baseline_equity.json"
-        ))
+        with open(Path(__file__).parent.parent / "data" / "baseline_equity.json") as _bf:
+            baseline = json.load(_bf)
         baseline_eq = float(baseline.get("baseline_equity", portfolio_value))
         daily_pnl_dollars = float(portfolio_value) - baseline_eq
     except Exception:

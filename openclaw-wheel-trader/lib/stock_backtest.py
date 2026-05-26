@@ -382,18 +382,45 @@ def _check_exits(
       1. Stop loss hit on the day's low → exit at stop_loss price (worst case)
       2. Target hit on the day's high → exit at target_price
       3. Update high-water; trailing stop hit → exit at trailing price
+
+    2026-05-26: paper-to-live realism additions:
+      - exit_slippage_pct (default 0.0005, 5 bps): live SELL market orders
+        fill at BID, not mid/close. Applied to every exit price.
+      - gap_open_stops (default True): if today's OPEN gapped below the
+        stop_loss, exit at the OPEN price (worst-case real outcome),
+        not at stop_loss. This is what actually happens in live: a 2%
+        overnight gap blows through a 1% stop, and the order fills
+        at the much-worse open price. Without this the backtest
+        systematically overstates returns on volatile names.
     """
     high = float(bar["high"])
     low = float(bar["low"])
+    open_p = float(bar["open"]) if "open" in bar else float(bar["close"])
     close = float(bar["close"])
 
-    # Stop loss
+    exit_slip = float(params.get("exit_slippage_pct", 0.0005))
+    gap_aware = bool(params.get("gap_open_stops", True))
+
+    def _slip(price: float, side: str = "sell") -> float:
+        # SELL fills at BID → price × (1 - slippage)
+        return price * (1.0 - exit_slip) if side == "sell" else price * (1.0 + exit_slip)
+
+    # Stop loss — with gap-through detection
     if low <= pos.stop_loss:
-        return pos.stop_loss, "stop_loss"
+        # If the OPEN was already below the stop, real fill happened at
+        # open (worse than stop_price). Without gap-handling the
+        # backtest assumes idealized fill at stop_price exactly.
+        if gap_aware and open_p < pos.stop_loss:
+            return _slip(open_p), "stop_loss_gap_through"
+        return _slip(pos.stop_loss), "stop_loss"
 
     # Target
     if high >= pos.target_price:
-        return pos.target_price, "target_hit"
+        # Gap-up through target: real fill is at open, which is BETTER
+        # than target. Use the more generous value for realism.
+        if gap_aware and open_p > pos.target_price:
+            return _slip(open_p), "target_hit_gap_up"
+        return _slip(pos.target_price), "target_hit"
 
     # Trailing
     if close > pos.high_water_mark:
@@ -401,7 +428,9 @@ def _check_exits(
     trail_price = pos.high_water_mark * (1 - pos.trailing_stop_pct)
     if low <= trail_price and pos.high_water_mark > pos.entry_price * 1.02:
         # Only trail-stop if we're at least +2% from entry
-        return trail_price, "trailing_stop"
+        if gap_aware and open_p < trail_price:
+            return _slip(open_p), "trailing_stop_gap_through"
+        return _slip(trail_price), "trailing_stop"
 
     return None, ""
 
@@ -539,22 +568,32 @@ def run_backtest(
 
             # Rank by composite score and take top N
             candidates.sort(key=lambda c: c["composite_score"], reverse=True)
+            # 2026-05-26: paper-to-live realism. Live market-order buys
+            # pay the ASK, not the mid/close — built-in slippage roughly
+            # equal to half the bid-ask spread plus a few bps of market
+            # impact. We model this as a single ``slippage_pct`` knob
+            # applied to entries (and a matching one on exits in
+            # _check_exits). Default 0.0005 (5 bps) is conservative for
+            # liquid large-caps; widen for small/mid caps via per-ticker
+            # overrides if needed later.
+            entry_slip = float(params.get("entry_slippage_pct", 0.0005))
             for cand in candidates[: min(max_per_scan, slots)]:
                 shares = _kelly_size(cand, portfolio_value, cash, params)
                 if shares < 1:
                     continue
-                cost = shares * cand["current_price"]
+                effective_entry = cand["current_price"] * (1.0 + entry_slip)
+                cost = shares * effective_entry
                 cash -= cost
                 positions.append(_SimPosition(
                     ticker=cand["ticker"],
                     entry_date=sim_date,
-                    entry_price=cand["current_price"],
+                    entry_price=effective_entry,
                     shares=shares,
                     target_price=cand["target_price"],
                     stop_loss=cand["stop_loss"],
                     trailing_stop_pct=cand["trailing_stop_pct"],
                     composite_score=cand["composite_score"],
-                    high_water_mark=cand["current_price"],
+                    high_water_mark=effective_entry,
                 ))
 
         # ── 4: Record equity ──
