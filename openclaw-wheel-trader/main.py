@@ -2410,7 +2410,9 @@ def main():
                                  "stock-buys-gate", "markov",
                                  "hermes-cycle", "hermes-review",
                                  "hermes-ledger", "hermes-mode",
-                                 "cornelius", "goal-score"],
+                                 "cornelius", "goal-score",
+                                 "turtle", "turtle-scan", "turtle-backtest",
+                                 "pead", "pead-scan", "paper-live-drift"],
                         help="Command to run")
     parser.add_argument("--signal", default="all",
                         help="build-cache: which signal to fill (kronos|news|llm|all)")
@@ -2655,6 +2657,96 @@ def main():
     elif args.command == "goal-score":
         from lib.hermes_goal_score import compute_goal_metrics, render
         print(render(compute_goal_metrics()))
+    elif args.command == "turtle":
+        from lib.turtle_signal import turtle_signal, render_summary
+        ticker = args.ticker or "SPY"
+        result = turtle_signal(ticker, lookback_days=365)
+        print(render_summary(result))
+    elif args.command == "paper-live-drift":
+        from lib.paper_live_drift import record_fills, summary, render
+        if "--record" in sys.argv:
+            r = record_fills()
+            print(f"Recorded {r['recorded']} new fill(s). "
+                  f"Log size: {r['total_in_log']}")
+        window = 30
+        for arg in sys.argv[1:]:
+            if arg.startswith("--window="):
+                window = int(arg.split("=", 1)[1])
+        print(render(summary(window_days=window)))
+    elif args.command == "pead":
+        from lib.pead_signal import pead_score, render as _pead_render
+        print(_pead_render(pead_score(args.ticker or "NVDA")))
+    elif args.command == "pead-scan":
+        from lib.pead_signal import universe_scan as _pead_scan
+        import yaml as _yaml
+        with open("config/wheel_strategy.yaml") as _f:
+            _cfg = _yaml.safe_load(_f) or {}
+        universe = list(set(
+            (_cfg.get("core_holdings") or [])
+            + (_cfg.get("tickers") or [])
+        ))
+        print(f"Scanning {len(universe)} tickers for PEAD signals...\n")
+        results = _pead_scan(universe)
+        # Show only non-zero scores
+        active = [r for r in results if abs(r.get("score") or 0) > 0.01]
+        if not active:
+            print("No PEAD signals active right now.")
+        else:
+            print(f"  {'Ticker':<8} {'Days':>5} {'Surprise':>10} "
+                  f"{'Kind':<12} {'Score':>8}  Reason")
+            for r in active[:20]:
+                sp = r.get("surprise_pct")
+                sp_s = f"{sp:+.1%}" if sp is not None else "n/a"
+                print(f"  {r['ticker']:<8} {r.get('days_since', '?'):>5} "
+                      f"{sp_s:>10} {r.get('kind', '?'):<12} "
+                      f"{r.get('score', 0):>+8.3f}  {r.get('reason', '')[:40]}")
+    elif args.command == "turtle-backtest":
+        from lib.turtle_backtest import backtest_ticker, render_backtest, universe_backtest
+        ticker = args.ticker or "SPY"
+        lookback = args.lookback if args.lookback else 1825
+        if "," in ticker:
+            tickers = [t.strip().upper() for t in ticker.split(",")]
+            results = universe_backtest(tickers, lookback_days=lookback)
+            print(f"Backtest over {lookback}d for {len(tickers)} tickers:\n")
+            print(f"  {'Ticker':<8} {'N':>4} {'WR':>7} {'R:R':>6} {'PF':>6} "
+                  f"{'CompRet':>10} {'MaxDD':>8}")
+            for r in results:
+                if "error" in r:
+                    print(f"  {r['ticker']:<8} ERROR — {r['error']}")
+                    continue
+                wr = r.get("win_rate")
+                wr_s = f"{wr*100:.1f}%" if wr is not None else "n/a"
+                rr_s = f"{r.get('rr_ratio'):.2f}" if r.get("rr_ratio") else "n/a"
+                pf_s = f"{r.get('profit_factor'):.2f}" if r.get("profit_factor") else "n/a"
+                print(f"  {r['ticker']:<8} {r['n_trades']:>4} {wr_s:>7} "
+                      f"{rr_s:>6} {pf_s:>6} "
+                      f"{r['compounded_return']*100:>+9.1f}% "
+                      f"{r['max_drawdown']*100:>+7.1f}%")
+        else:
+            print(render_backtest(backtest_ticker(ticker, lookback_days=lookback)))
+    elif args.command == "turtle-scan":
+        from lib.turtle_signal import universe_scan
+        import yaml as _yaml
+        # Pull the universe from wheel_strategy.yaml (core_holdings + tickers)
+        with open("config/wheel_strategy.yaml") as _f:
+            _cfg = _yaml.safe_load(_f) or {}
+        universe = list(set(
+            (_cfg.get("core_holdings") or [])
+            + (_cfg.get("tickers") or [])
+        ))
+        print(f"Scanning {len(universe)} tickers for Turtle signals...")
+        fired = universe_scan(universe)
+        if not fired:
+            print("No Turtle signals firing today.")
+        else:
+            print(f"\n{len(fired)} signal(s) firing:\n")
+            for f in fired:
+                s = f.get('sizing', {})
+                print(f"  {f['ticker']:<6} ${f['today_price']:>8.2f}  "
+                      f"stop ${f['stop_price']:>8.2f} "
+                      f"({f['stop_distance_pct']:+.1%})  "
+                      f"size {s.get('shares', 0)} sh / "
+                      f"${s.get('sized_dollars', 0):.0f}")
     elif args.command == "markov":
         from lib.markov_regime import markov_summary, render_summary
         ticker = args.ticker or "SPY"

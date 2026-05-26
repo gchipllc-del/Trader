@@ -108,7 +108,14 @@ def close_prior_experiments(
 
 
 def _revert_param(param: str, old_value) -> None:
-    """Restore a parameter in wheel_strategy.yaml to its prior value."""
+    """Restore a parameter in wheel_strategy.yaml to its prior value.
+
+    For params that have a settings.yaml mirror (currently:
+    max_position_pct → circuit_breakers.max_position_pct), also sync the
+    rollback over so the circuit breaker reads match the strategy. The
+    legacy apply_adjustments writes both files on forward; without this
+    parallel update the rollback leaves settings.yaml stale.
+    """
     try:
         with open(STRATEGY_PATH) as f:
             strategy = yaml.safe_load(f) or {}
@@ -118,6 +125,20 @@ def _revert_param(param: str, old_value) -> None:
     sp[param] = old_value
     with open(STRATEGY_PATH, "w") as f:
         yaml.safe_dump(strategy, f, default_flow_style=False, sort_keys=False)
+
+    # Mirror to settings.yaml for params that live in both
+    SETTINGS_MIRRORED = {"max_position_pct"}
+    if param in SETTINGS_MIRRORED:
+        try:
+            with open(SETTINGS_PATH) as f:
+                settings = yaml.safe_load(f) or {}
+            settings.setdefault("circuit_breakers", {})[param] = old_value
+            with open(SETTINGS_PATH, "w") as f:
+                yaml.safe_dump(
+                    settings, f, default_flow_style=False, sort_keys=False
+                )
+        except OSError:
+            pass
 
 
 # ─── Single-variable change selection ─────────────────────────────────

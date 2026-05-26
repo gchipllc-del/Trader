@@ -169,6 +169,31 @@ def _score_candidate(
     closes = daily_slice["close"].values
     current_price = float(closes[-1])
 
+    # ── Turtle entry pre-filter (2026-05-26) ───────────────────────────
+    # Adapted from lib/turtle_signal. When ``require_turtle_entry`` is
+    # set in params (default OFF for back-compat), a candidate must
+    # ALSO clear:
+    #   - long regime: today's close > 200-period SMA
+    #   - donchian:    today's close > prior 40-bar high
+    # Otherwise return None (signal silenced). ATR-based stop overlay
+    # is left to caller; we keep the existing stop_pct flow below.
+    #
+    # The cron's existing momentum / composite scoring runs UNCHANGED
+    # afterward — Turtle is a quality gate, not a replacement.
+    if params.get("require_turtle_entry", False):
+        regime_window = params.get("turtle_regime_window", 200)
+        breakout_window = params.get("turtle_breakout_window", 40)
+        if len(closes) <= max(regime_window, breakout_window):
+            return None
+        sma_n = float(pd.Series(closes).rolling(regime_window).mean().iloc[-1])
+        if pd.isna(sma_n) or current_price <= sma_n:
+            return None  # bear regime
+        prior_high = float(
+            pd.Series(closes[:-1]).rolling(breakout_window).max().iloc[-1]
+        )
+        if pd.isna(prior_high) or current_price <= prior_high:
+            return None  # no breakout
+
     # Build a weekly-ish frame by resampling daily to 5-day buckets
     weekly = daily_slice["close"].resample("W").last().to_frame("close")
     weekly["high"] = daily_slice["high"].resample("W").max()
@@ -236,6 +261,9 @@ def _score_candidate(
                 and momentum_score >= params.get("momentum_only_min_score", 3)):
             return None
 
+    # Confluence gate moved to AFTER bayesian_data computation below so
+    # the Bayesian signal can actually vote — see end of function.
+
     stop_pct = params.get("stop_loss_pct", 0.035)
     target_pct = params.get("default_target_pct", 0.10)
 
@@ -293,6 +321,32 @@ def _score_candidate(
             )
         except Exception:
             pass
+
+    # ── Confluence gate (2026-05-26) ───────────────────────────────────
+    # Now that bayesian_data, kronos, news, and (in live mode) PEAD are
+    # all populated, run the multi-signal agreement check.
+    # confluence_filter handles signal availability gracefully — missing
+    # signals count as "skipped", not as votes against.
+    if params.get("require_confluence", False):
+        from lib.confluence_filter import confluence_check, should_fire
+        # Normalize bayesian_data for the confluence check (object → dict)
+        bayes_dict = None
+        if bayesian_data is not None:
+            wp = getattr(bayesian_data, "win_probability", None)
+            if wp is not None:
+                bayes_dict = {"win_prob": float(wp)}
+        candidate_for_conf = {
+            "ticker": ticker,
+            "current_price": current_price,
+        }
+        conf = confluence_check(
+            ticker=ticker, daily_slice=daily_slice,
+            candidate=candidate_for_conf, params=params,
+            bayesian_data=bayes_dict,
+        )
+        fire, size_mult, conf_reason = should_fire(conf, params)
+        if not fire:
+            return None
 
     return {
         "ticker": ticker,
@@ -357,18 +411,45 @@ def _check_exits(
       1. Stop loss hit on the day's low → exit at stop_loss price (worst case)
       2. Target hit on the day's high → exit at target_price
       3. Update high-water; trailing stop hit → exit at trailing price
+
+    2026-05-26: paper-to-live realism additions:
+      - exit_slippage_pct (default 0.0005, 5 bps): live SELL market orders
+        fill at BID, not mid/close. Applied to every exit price.
+      - gap_open_stops (default True): if today's OPEN gapped below the
+        stop_loss, exit at the OPEN price (worst-case real outcome),
+        not at stop_loss. This is what actually happens in live: a 2%
+        overnight gap blows through a 1% stop, and the order fills
+        at the much-worse open price. Without this the backtest
+        systematically overstates returns on volatile names.
     """
     high = float(bar["high"])
     low = float(bar["low"])
+    open_p = float(bar["open"]) if "open" in bar else float(bar["close"])
     close = float(bar["close"])
 
-    # Stop loss
+    exit_slip = float(params.get("exit_slippage_pct", 0.0005))
+    gap_aware = bool(params.get("gap_open_stops", True))
+
+    def _slip(price: float, side: str = "sell") -> float:
+        # SELL fills at BID → price × (1 - slippage)
+        return price * (1.0 - exit_slip) if side == "sell" else price * (1.0 + exit_slip)
+
+    # Stop loss — with gap-through detection
     if low <= pos.stop_loss:
-        return pos.stop_loss, "stop_loss"
+        # If the OPEN was already below the stop, real fill happened at
+        # open (worse than stop_price). Without gap-handling the
+        # backtest assumes idealized fill at stop_price exactly.
+        if gap_aware and open_p < pos.stop_loss:
+            return _slip(open_p), "stop_loss_gap_through"
+        return _slip(pos.stop_loss), "stop_loss"
 
     # Target
     if high >= pos.target_price:
-        return pos.target_price, "target_hit"
+        # Gap-up through target: real fill is at open, which is BETTER
+        # than target. Use the more generous value for realism.
+        if gap_aware and open_p > pos.target_price:
+            return _slip(open_p), "target_hit_gap_up"
+        return _slip(pos.target_price), "target_hit"
 
     # Trailing
     if close > pos.high_water_mark:
@@ -376,7 +457,9 @@ def _check_exits(
     trail_price = pos.high_water_mark * (1 - pos.trailing_stop_pct)
     if low <= trail_price and pos.high_water_mark > pos.entry_price * 1.02:
         # Only trail-stop if we're at least +2% from entry
-        return trail_price, "trailing_stop"
+        if gap_aware and open_p < trail_price:
+            return _slip(open_p), "trailing_stop_gap_through"
+        return _slip(trail_price), "trailing_stop"
 
     return None, ""
 
@@ -514,22 +597,32 @@ def run_backtest(
 
             # Rank by composite score and take top N
             candidates.sort(key=lambda c: c["composite_score"], reverse=True)
+            # 2026-05-26: paper-to-live realism. Live market-order buys
+            # pay the ASK, not the mid/close — built-in slippage roughly
+            # equal to half the bid-ask spread plus a few bps of market
+            # impact. We model this as a single ``slippage_pct`` knob
+            # applied to entries (and a matching one on exits in
+            # _check_exits). Default 0.0005 (5 bps) is conservative for
+            # liquid large-caps; widen for small/mid caps via per-ticker
+            # overrides if needed later.
+            entry_slip = float(params.get("entry_slippage_pct", 0.0005))
             for cand in candidates[: min(max_per_scan, slots)]:
                 shares = _kelly_size(cand, portfolio_value, cash, params)
                 if shares < 1:
                     continue
-                cost = shares * cand["current_price"]
+                effective_entry = cand["current_price"] * (1.0 + entry_slip)
+                cost = shares * effective_entry
                 cash -= cost
                 positions.append(_SimPosition(
                     ticker=cand["ticker"],
                     entry_date=sim_date,
-                    entry_price=cand["current_price"],
+                    entry_price=effective_entry,
                     shares=shares,
                     target_price=cand["target_price"],
                     stop_loss=cand["stop_loss"],
                     trailing_stop_pct=cand["trailing_stop_pct"],
                     composite_score=cand["composite_score"],
-                    high_water_mark=cand["current_price"],
+                    high_water_mark=effective_entry,
                 ))
 
         # ── 4: Record equity ──

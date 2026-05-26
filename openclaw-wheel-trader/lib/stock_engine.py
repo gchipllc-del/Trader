@@ -291,6 +291,34 @@ def scan_for_stocks(
     max_position_value = portfolio_value * max_position_pct
     max_concurrent = strategy.get("stock_params", {}).get("max_concurrent_positions", 5)
 
+    # Gate 0: Market regime filter — BEFORE any per-ticker work, check
+    # whether the broad market structure is favorable for new entries.
+    # The 2026-05-23 30d backtest showed all variants losing 3-7% vs SPY
+    # +4.84% — strategy bleeds in choppy/bearish regimes. This gate
+    # blocks new entries when SPY downtrend OR VIX stressed. Existing
+    # positions stay managed normally (this is ENTRY-only).
+    try:
+        from lib.regime_filter import (
+            get_market_regime, is_filter_enabled, render_snapshot,
+        )
+        if is_filter_enabled():
+            regime = get_market_regime(client)
+            print(f"\n  {render_snapshot(regime)}")
+            if not regime["allow_entries"]:
+                log_event("stock_engine", "regime_filter_blocked", {
+                    "regime": regime["regime"],
+                    "reason": regime["reason"],
+                    "vix": regime.get("vix_level"),
+                    "spy_above_50ma": regime.get("spy_above_50ma"),
+                    "spy_slope_pct": regime.get("spy_50ma_slope_10d_pct"),
+                })
+                print(f"  ⛔ Entry blocked by regime filter — no new positions this scan.")
+                return []
+    except Exception as e:
+        # Filter must NEVER break the scan; degrade open if it errors.
+        log_event("stock_engine", "regime_filter_error",
+                  {"error": str(e)[:200]}, result="degraded")
+
     # Gate 1: Quantitative screening
     quant_scores = screen_universe(
         daily_data,
@@ -1050,6 +1078,75 @@ def execute_stock_buy(
     try:
         check_paper_mode()
         check_daily_loss(current_daily_pnl, portfolio_value=portfolio_value)
+        # Stock-buys gate: directional momentum layer can be disabled when
+        # the recent backtest underperforms SPY by >threshold. CSP/CC paths
+        # don't call this. Fails open if unified_goals is unavailable.
+        try:
+            from lib.circuit_breaker import check_stock_buys_enabled
+            check_stock_buys_enabled()
+        except ImportError:
+            pass
+
+        # 2026-05-26: Confluence gate (live mode). Backtest only had
+        # bars-based signals (Turtle + Markov + Bayesian, all correlated).
+        # Live has 2 GENUINELY ORTHOGONAL extras — PEAD (event-driven,
+        # from earnings calendar) and Bull/Bear (fundamental review).
+        # When require_confluence is set, run all 5 and demand N-of-M.
+        # This is the real WR-pushing layer per Bernard-Thomas-style
+        # multi-signal-confluence research.
+        try:
+            from lib.confluence_filter import confluence_check, should_fire
+            import yaml as _yaml
+            from pathlib import Path as _Path
+            _sp_path = _Path(__file__).resolve().parent.parent / "config" / "wheel_strategy.yaml"
+            with open(_sp_path) as _f:
+                _strat = _yaml.safe_load(_f) or {}
+            _live_params = dict(_strat.get("stock_params", {}))
+            if _live_params.get("require_confluence", False):
+                # Enable BOTH PEAD and Bull/Bear in live mode — these
+                # are the independent signals that push WR past the
+                # backtest ceiling.
+                _live_params["enable_pead"] = True
+                _live_params["enable_bull_bear"] = True
+                _daily_slice = candidate.get("daily_slice")  # may be None
+                # Bayesian win prob from the candidate if present
+                _bayes = None
+                if "bayesian_win_prob" in candidate:
+                    _bayes = {"win_prob": candidate.get("bayesian_win_prob")}
+                if _daily_slice is not None:
+                    _conf = confluence_check(
+                        ticker=ticker, daily_slice=_daily_slice,
+                        candidate=candidate, params=_live_params,
+                        bayesian_data=_bayes,
+                    )
+                    _fire, _size_mult, _reason = should_fire(_conf, _live_params)
+                    if not _fire:
+                        log_event("stock_engine", "confluence_skip", {
+                            "ticker": ticker,
+                            "agreements": _conf.agreements,
+                            "disagreements": _conf.disagreements,
+                            "skipped": _conf.skipped,
+                            "reason": _reason,
+                        }, result="blocked")
+                        diary_write("strategy_agent",
+                            f"{ticker}|CONFLUENCE_SKIP|"
+                            f"{_conf.agreement_count}of{_conf.evaluated_count}|"
+                            f"{','.join(_conf.agreements) or 'none'}")
+                        return None
+                    # Half-size adjustment: shrink shares to half if
+                    # confluence is partial (3-of-N when 4 required, etc.)
+                    if _size_mult < 1.0 and shares > 1:
+                        shares = max(1, int(shares * _size_mult))
+                        log_event("stock_engine", "confluence_half_size", {
+                            "ticker": ticker,
+                            "new_shares": shares,
+                            "agreements": _conf.agreements,
+                        }, result="degraded")
+        except Exception as _e:
+            # Never block trade on confluence-system error — fail open
+            log_event("stock_engine", "confluence_check_error",
+                      {"ticker": ticker, "error": str(_e)[:200]},
+                      result="degraded")
     except CircuitBreakerTripped as e:
         log_event("stock_engine", "blocked", {"ticker": ticker, "error": str(e)})
         diary_write("strategy_agent", f"{ticker}|STOCK_BLOCKED|{e}")
@@ -1273,6 +1370,11 @@ def execute_stock_buy(
 
     # Track position under exclusive lock so a concurrent crypto-monitor
     # or scan can't race the read-modify-write and clobber this append.
+    # 2026-05-26: record intent_price (signal-time current_price) and
+    # fill_price (broker's filled_avg). Drift detector compares these
+    # over time to validate the realism knobs in wheel_strategy.yaml.
+    intent_price_signal = float(candidate.get("current_price", price))
+    fill_price_broker = float(price)  # `price` was reassigned to filled_avg above
     with mutate_positions() as positions:
         new_pos = {
             "ticker": ticker,
@@ -1280,6 +1382,8 @@ def execute_stock_buy(
             "status": "open",
             "shares": shares,
             "entry_price": price,
+            "intent_price": intent_price_signal,
+            "fill_price": fill_price_broker,
             "target_price": candidate["target_price"],
             "stop_loss": candidate["stop_loss"],
             "order_id": response["id"],
@@ -2014,9 +2118,8 @@ def run_stock_scan_and_execute(
     # Derive from broker equity vs baseline (same formula as main.py).
     daily_pnl_dollars = 0.0
     try:
-        baseline = json.load(open(
-            Path(__file__).parent.parent / "data" / "baseline_equity.json"
-        ))
+        with open(Path(__file__).parent.parent / "data" / "baseline_equity.json") as _bf:
+            baseline = json.load(_bf)
         baseline_eq = float(baseline.get("baseline_equity", portfolio_value))
         daily_pnl_dollars = float(portfolio_value) - baseline_eq
     except Exception:

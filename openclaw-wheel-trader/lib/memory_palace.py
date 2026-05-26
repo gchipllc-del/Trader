@@ -138,11 +138,12 @@ def add_drawer(drawer: Drawer) -> str:
                 **{k: str(v) for k, v in drawer.metadata.items()},
             }],
         )
-    else:
-        # Fallback: append to JSONL
-        fallback_file = PALACE_DIR / "drawers.jsonl"
-        with open(fallback_file, "a") as f:
-            f.write(json.dumps(asdict(drawer)) + "\n")
+
+    # Always mirror to JSONL so BM25 retrieval and feature_status counters
+    # have a tier-independent view of every drawer.
+    fallback_file = PALACE_DIR / "drawers.jsonl"
+    with open(fallback_file, "a") as f:
+        f.write(json.dumps(asdict(drawer)) + "\n")
 
     # Mirror into sqlite-vec semantic index if available. No-op if the deps
     # aren't installed (lib.memory_vec short-circuits). This gives us a

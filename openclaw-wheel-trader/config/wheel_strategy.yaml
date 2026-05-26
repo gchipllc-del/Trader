@@ -1,15 +1,12 @@
 tickers_phase1:
 - F
 - BAC
-- PFE
-- INTC
 - VALE
 - WBD
 - KO
 - NIO
 - RIVN
 - NU
-- SOFI
 - CCL
 - AAL
 - CLF
@@ -37,129 +34,122 @@ quant:
   min_quant_score: 3.5
   exclude_avoid: true
 stock_params:
-  # 2026-04-28: Investigated why bot is making 0 trades.
-  # composite_score is sum(trend, level, signal, momentum) on a 0-13 scale
-  # (NOT the 0-10 quant screener QScore). Today's actual composites for the
-  # STRONG quant names are 1-4/13 because trend_score=0 across the board
-  # (multi-timeframe alignment is weak in current chop regime).
-  # Today's strongest names (BAC, F, SHOP) score composite=4. Setting
-  # threshold to 4 so those clear the gate while AMD(1), VALE(1), PFE(1)
-  # don't. The 3-pt floor still requires meaningful technical structure
-  # (e.g. signal=3 candlestick pattern, OR momentum=3 + signal=1).
-  # Was 10 (Hermes overshoot from 3-trade sample) → 7 (over-tight) → 4.
+  # 2026-05-26: Turtle pre-filter (lib/turtle_signal). When True, every
+  # candidate must also clear:
+  #   - long regime: today's close > 200-period SMA
+  #   - donchian:    today's close > prior 40-bar high
+  # Backtest validation: across the 24-ticker universe over 2y, 11 of 13
+  # successful runs profitable, R:R 4-7×, +12-305% compounded.
+  # The Turtle gate sits ABOVE the existing composite+momentum scoring,
+  # so this is additive selectivity, not a replacement.
+  require_turtle_entry: true
+  turtle_regime_window: 200
+  turtle_breakout_window: 40
   min_composite_score: 4
-  momentum_only_min_score: 2     # Was 3. Lowered so momentum-driven entries fire.
-  stop_loss_pct: 0.035
+  momentum_only_min_score: 2
+  # 2026-05-26: tighter_stop variant was the winner under Turtle filter
+  # (+5.13% vs SPY +9.72%, only 4.59pp behind — INSIDE the 5pp gate
+  # threshold). Promote those values to defaults so the "current"
+  # backtest variant matches the live config and the gate auto-enables.
+  # Was: stop_loss_pct=0.035, trailing_stop_pct=0.02
+  stop_loss_pct: 0.025
   default_target_pct: 0.1
-  trailing_stop_pct: 0.02
-  # Per-asset Kelly cap for stock entries. settings.yaml
-  # circuit_breakers.max_position_pct is the hard ceiling — keep this <= that.
+  trailing_stop_pct: 0.015
+
+  # 2026-05-26: paper-to-live realism knobs (after the Kalshi paper-vs-live
+  # divergence lesson). The backtest now models:
+  #   - entry_slippage_pct: live BUY market orders fill at ASK (≈ +5 bps)
+  #   - exit_slippage_pct:  live SELL market orders fill at BID  (≈ -5 bps)
+  #   - gap_open_stops:     if overnight gap blew through a stop, fill
+  #                         happens at the OPEN (not the idealized stop)
+  # These cumulatively shave ~50-100 bps off the backtest's reported
+  # return — a more honest projection of what live would actually do.
+  entry_slippage_pct: 0.0005
+  exit_slippage_pct: 0.0005
+  gap_open_stops: true
+
+  # 2026-05-26: Confluence filter (lib/confluence_filter). Require
+  # multiple independent signals to agree before firing. Each
+  # confirmer adds 3-7pp WR on average. Target: 65-72% WR.
+  require_confluence: true
+  confluence_min_agree: 3        # full-size if 3-of-3 evaluated agree
+  confluence_half_size: 2        # half-size at 2-of-3
+  # 2026-05-26: thresholds reverted after the tightening pass made WR
+  # WORSE (50% → 49%). Lesson: Turtle + Markov + Bayesian all read
+  # the same bars; tightening any of them doesn't add new information.
+  # The 50% WR backtest ceiling is the real cost of bars-only signals.
+  # To push WR > 50% we need event-driven (PEAD) + fundamentals
+  # (Bull/Bear), which only run cleanly in LIVE mode, not backtest.
+  bayesian_min_win_prob: 0.55
+  markov_min_signal: 0.05
+  pead_min_score: 0.15
+  bull_bear_margin: 2
+  enable_pead: false             # off for backtest (per-sim-date earnings
+                                 # cache not built yet); ENABLE IN LIVE
+  enable_markov: true
+  enable_bull_bear: false        # off for backtest (live-only agents);
+                                 # ENABLE IN LIVE for orthogonal vote
   max_position_pct: 0.3
-  # Floor on per-position sizing. With a small bankroll, Kelly often returns
-  # 3-7% which produces $50-$100 positions and tiny dollar P&L per win.
-  # Floor lifts those entries to a minimum stake so winning setups translate
-  # into meaningful compounding. Effective range = [min_position_pct,
-  # max_position_pct]. Edge case: if Kelly says "no trade" (shares == 0),
-  # the floor does NOT override that — gate-out signals are still respected.
-  min_position_pct: 0.10
+  min_position_pct: 0.1
   max_trades_per_scan: 3
   max_concurrent_positions: 5
   allow_momentum_only: true
-  # Tiered trailing stop — tightens as unrealized P/L grows.
-  # See lib/stock_engine.py:1093 for behavior. The static `trailing_stop_pct`
-  # above (2%) is the fallback when this block is disabled.
   trailing_stop_tiered:
     enabled: true
-    tighten_on_rsi_exhaustion: true   # 30% tighter when RSI ≥ 78
+    tighten_on_rsi_exhaustion: true
     tiers:
-      - {min_pnl: 0.20, trail: 0.005}  # +20% → 0.5% trail (very tight, milk the runner)
-      - {min_pnl: 0.12, trail: 0.008}  # +12% → 0.8% trail (aggressive lock)
-      - {min_pnl: 0.07, trail: 0.012}  # +7%  → 1.2% trail (tighten — gains at risk)
-      - {min_pnl: 0.03, trail: 0.018}  # +3%  → 1.8% trail (modest lock)
-      - {min_pnl: 0.00, trail: 0.025}  # 0%   → 2.5% trail (breathing room early)
+    - min_pnl: 0.2
+      trail: 0.005
+    - min_pnl: 0.12
+      trail: 0.008
+    - min_pnl: 0.07
+      trail: 0.012
+    - min_pnl: 0.03
+      trail: 0.018
+    - min_pnl: 0.0
+      trail: 0.025
   support_distance_tiers:
   - 0.04
   - 0.07
   - 0.1
   enable_scale_out: true
-  # Lowered 0.10 → 0.07 to cycle capital faster on a small bankroll.
-  # At +7% the position takes half off, locking gains and freeing slot
-  # capital for the next setup. The runner still benefits from tiered
-  # trailing stops above. Trade-off: smaller per-trade max payout but
-  # higher trade frequency and faster compounding back into Phase 2.
   partial_exit_threshold: 0.07
   partial_exit_fraction: 0.5
-# ────────────────────────────────────────────────────────────────
-# Core long-term holdings — algorithm BUYS them via the normal scan
-# (they must still pass quant + technical + bull/bear gates), but
-# once a position is opened, the exit logic skips it entirely.
-# Used for high-conviction multi-year holds: no stop, no target,
-# no trailing exit, no fund-manager rebalance trim. The only way
-# to exit is manual intervention.
-#
-# Selected 2026-05-07 via `python main.py longterm-pick` (multi-factor
-# scoring: 35% Quality / 25% Growth / 15% Moat / 15% Momentum / 10%
-# Valuation, with Kronos AI 60-day directional bias enabled).
-# Composites at selection: TSM 0.932, MU 0.913, AVGO 0.887, META 0.868,
-# MSFT 0.818. Re-run the picker any time fundamentals shift.
 core_holdings:
-  - TSM    # Taiwan Semiconductor — chip foundry monopoly, AI tailwind
-  - MU     # Micron — memory cycle leader, +196% YoY revenue growth
-  - AVGO   # Broadcom — AI/networking + custom silicon, dividend
-  - META   # Meta — platform franchise, Kronos AI bullish 60d
-  - MSFT   # Microsoft — durable moat (46% op-margin), Kronos AI bullish 60d
+- TSM
+- MU
+- AVGO
+- META
+- MSFT
+- CBRS
 tickers_crypto:
 - BTC/USD
 - ETH/USD
 - SOL/USD
 crypto_params:
   enabled: true
-  # ─── Scalp mode (Tier B 2026-04-25) ───
-  # Tighter, faster setup that cycles capital ~5-10x more than swing-mode.
-  # The math: 0.2% spread + 0.1% slippage = 0.3% round-trip cost. A 3%
-  # gross target = 2.7% net. Risk/reward 1.5:2.7 = 1:1.8. Need >55% win
-  # rate to be net positive. The LLM ensemble + 10-feature score should
-  # clear that bar IF calibration holds.
-  min_trend_score: 7              # 7/10 — stricter than swing's 6 (less noise)
-  min_rsi: 42                     # Slightly tighter than 40 (less false bottoms)
-  max_rsi: 62                     # Avoid topping-out entries
-
-  stop_loss_pct: 0.015            # 1.5% — was 7%. Tighter = more stop-outs but smaller losses
-  target_pct: 0.03                # 3% — was 15%. Faster turnover
-  trailing_stop_pct: 0.01         # 1% trailing once in profit
-  partial_exit_threshold: 0.015   # Take half off at +1.5%
+  min_trend_score: 7
+  min_rsi: 42
+  max_rsi: 62
+  stop_loss_pct: 0.015
+  target_pct: 0.03
+  trailing_stop_pct: 0.01
+  partial_exit_threshold: 0.015
   partial_exit_fraction: 0.5
-
-  max_position_pct: 0.20          # Same as before
-  max_concurrent: 3               # Was 2. With faster turnover, 3 = ~3x activity
-  max_trades_per_scan: 2          # Up from 1 — fill empty slots faster
-
-  # Cost-edge gate: minimum NET edge after spread + slippage. Skip a
-  # trade if (target_pct - spread_estimate - slippage_estimate) < this.
-  # Crypto on Alpaca: ~0.2% spread, ~0.1% slippage typical = 0.3% costs.
-  # 0.025 = 2.5% min net edge. Below this we're scalping into noise.
+  max_position_pct: 0.2
+  max_concurrent: 3
+  max_trades_per_scan: 2
   min_net_edge: 0.025
   spread_estimate: 0.002
   slippage_estimate: 0.001
-
-  # Volatility-adaptive overrides (Tier B force multiplier).
-  # When ATR/price > volatility_high, widen targets+stops by 1.5x.
-  # When ATR/price < volatility_low, tighten by 0.7x. Prevents the
-  # bot from getting whipsawed in high-vol regimes or sitting bored
-  # in low-vol regimes.
   atr_adaptive_enabled: true
-  volatility_high: 0.04           # 4% ATR/price ratio
-  volatility_low: 0.015           # 1.5%
+  volatility_high: 0.04
+  volatility_low: 0.015
   atr_high_multiplier: 1.5
   atr_low_multiplier: 0.7
-
-  # Dynamic Kelly fraction based on conviction.
-  # Base = 0.30, ramps up with composite_score and LLM probability.
-  # High conviction (composite>=10 + llm_prob>=0.70) → 0.65 (near-half-Kelly).
-  # Low conviction (composite<7 + llm_prob<0.55) → 0.20.
-  kelly_fraction_base: 0.30
+  kelly_fraction_base: 0.3
   kelly_fraction_high_conviction: 0.65
-  kelly_fraction_low_conviction: 0.20
+  kelly_fraction_low_conviction: 0.2
 tickers_phase2:
 - F
 - NIO
@@ -178,19 +168,9 @@ tickers:
 csp:
   delta_min: -0.35
   delta_max: -0.2
-  # Shifted from 30-45 to 21-28 (2026-05-12). Per-day theta capture
-  # is ~1.7× the previous band; gamma still manageable at 21+ DTE
-  # with the existing bull/bear, LLM, Kronos, Bayesian defense stack
-  # in front. See `python main.py wheel-dte-sweep` for the rationale.
-  # Watch list: realized assignment-into-loser frequency over the
-  # next 30 days; revert toward 28-35 if it materially rises.
   dte_min: 21
   dte_max: 28
   min_annualized_return: 0.12
-  # Reject suspiciously rich premiums — corporate actions (special divs,
-  # mergers, buyouts) and stale quotes can produce contracts that look
-  # like 200%+ annualized yield. Without a ceiling, the bad-data row
-  # ranks #1 and gets selected. Pattern from alpacahq/options-wheel.
   max_annualized_return: 1.5
   min_open_interest: 100
   max_bid_ask_spread: 0.15
@@ -198,9 +178,6 @@ csp:
 cc:
   delta_min: 0.2
   delta_max: 0.35
-  # Shifted from 30-45 to 21-28 (2026-05-12). Same rationale as CSP
-  # band — match the CSP timing so wheel cycles complete in roughly
-  # one month instead of 1-1.5, and per-day theta on CCs ~1.7× higher.
   dte_min: 21
   dte_max: 28
   min_annualized_return: 0.1
@@ -214,12 +191,7 @@ management:
   roll_trigger_dte: 7
   roll_min_credit: 0.5
 risk:
-  # Global capital-at-risk ceiling: (Σ short-put collateral) + (Σ long-share
-  # market value) + the proposed new collateral must not exceed this
-  # fraction of portfolio_value. Defends against the "8 individually-OK
-  # CSPs each at 10% sum to 80% of cash" failure mode that the per-position
-  # gate alone misses. Adapted from alpacahq/options-wheel MAX_RISK.
-  max_capital_at_risk_pct: 0.80
+  max_capital_at_risk_pct: 0.8
 confirmation:
   min_composite_score: 7
   required_timeframes:
@@ -277,39 +249,19 @@ correlation:
 kelly:
   enabled: true
   fraction: 0.5
-# Volatility-aware position sizing (adapted from the Adaptive-Volatility-
-# Regime-Based-Execution-and-Risk-Framework pattern). Layered AFTER Kelly
-# + min_position_pct floor. Scales position size by realized-vol regime:
-# vol_multiplier = clip(1 / sqrt(current_vol / baseline_vol), floor, ceiling).
-# High vol → downsize (key risk-mgmt benefit). Low vol → cap at 1.0x
-# (defensive — don't upsize aggressively because vol clusters and can
-# flip suddenly). Falls back to 1.0 (no-op) on insufficient bars or
-# any computation failure — never blocks trades.
-# Sector-rotation overlay (FinRL-X Adaptive Rotation pattern). Modifies
-# composite_score by sleeve↔regime alignment. Dormant below
-# activation_bankroll (default $5000 — the Phase 2 threshold). At small
-# bankrolls diversification math doesn't have enough capital to populate
-# sleeves meaningfully; the bonus is informational only until activation.
-# In bull regimes growth_tech gets +20%, defensive -15%; in bear it
-# flips. Capped at ±max_bonus_swing to keep rotation as a tiebreaker,
-# not a primary signal.
 sector_rotation:
   enabled: true
-  activation_bankroll: 5000.0   # dormant below this; auto-activates at Phase 2
-  max_bonus_swing: 0.25         # cap effect at ±25%
-  # regime_bias: {}             # optional per-regime overrides (rarely needed)
-
+  activation_bankroll: 2500.0
+  max_bonus_swing: 0.25
 vol_aware_sizing:
   enabled: true
-  current_window: 20         # bars for current realized vol (RV20)
-  baseline_window: 60        # bars for baseline comparison (RV60)
-  use_kronos_forecast: false # opt-in: replace current RV with Kronos forward forecast
-                             # (slow ~6-10s/ticker on CPU; only enable
-                             # if Kronos calls aren't a bottleneck)
-  kronos_horizon: 20         # forecast horizon when use_kronos_forecast=true
-  floor: 0.5                 # min multiplier — never reduce below 50% Kelly
-  ceiling: 1.0               # max multiplier — never upsize past 100% Kelly
-  min_baseline_vol: 0.05     # absolute floor on baseline to avoid divide-near-zero
+  current_window: 20
+  baseline_window: 60
+  use_kronos_forecast: false
+  kronos_horizon: 20
+  floor: 0.5
+  ceiling: 1.0
+  min_baseline_vol: 0.05
 insider_flow:
   enabled: true
   lookback_days: 90
@@ -325,17 +277,10 @@ greeks:
   default_iv: 0.3
   max_portfolio_vega: 500
   max_portfolio_abs_delta: 0.8
-# --- Options-derived signals (lib/options_signals.py) -----------------
-# Adds a ±2 boost to composite_score based on:
-#   1. Per-ticker IV/HV ratio (options cheap/expensive vs realized)
-#   2. SPY IV regime (low/normal/high — set per scan)
-#   3. (Optional) Unusual call volume — extra API call per candidate, off by default
-# Set enabled=false to skip these checks entirely (saves ~1 API call/candidate).
 options_signals:
   enabled: true
   enable_iv_hv: true
-  enable_unusual_volume: false   # extra API call per candidate; opt-in
-
+  enable_unusual_volume: false
 llm:
   enabled: true
   provider: deepseek

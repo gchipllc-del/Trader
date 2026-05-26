@@ -187,6 +187,10 @@ class TestBearAgentIntegration:
         monkeypatch.setattr(stock_engine, "POSITIONS_PATH", pos_file)
         monkeypatch.setattr(stock_engine, "diary_write", lambda a, e: None)
         monkeypatch.setattr(stock_engine, "remember_trade_decision", lambda **kw: None)
+        # Bypass the SPY-gap stock-buys gate — it's a separate live-state
+        # circuit breaker, not what this test is asserting.
+        monkeypatch.setattr("lib.circuit_breaker.check_stock_buys_enabled",
+                            lambda: True)
 
         captured_intent = []
         monkeypatch.setattr("lib.stock_engine.step1_propose",

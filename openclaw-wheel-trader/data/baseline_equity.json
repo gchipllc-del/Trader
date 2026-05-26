@@ -1,6 +1,9 @@
 {
-  "baseline_equity": 1500.0,
-  "set_at": "2026-04-10T00:00:00+00:00",
-  "source": "alpaca_portfolio_history",
-  "note": "Auto-detected from Alpaca portfolio history (account's first recorded equity). Edit baseline_equity to set a different starting capital, or delete this file to re-detect on next load."
+  "start_baseline": 1500.0,
+  "start_baseline_date": "2026-04-10T00:00:00+00:00",
+  "start_baseline_source": "alpaca_portfolio_history",
+  "baseline_equity": 1571.63,
+  "set_at": "2026-05-13T20:59:40.448325+00:00",
+  "source": "manual_reconciliation_2026-05-13",
+  "note": "Two-tier baseline: start_baseline (1500 @ 2026-04-10) is the IMMUTABLE long-term anchor for dashboard % growth \u2014 never edit. baseline_equity is the operating reference for the self-audit PNL_DRIFT check; can be rebaselined after a reconciliation event without affecting the dashboard headline."
 }

@@ -54,7 +54,8 @@ def _portfolio_section(client) -> DigestSection:
     baseline = portfolio
     if BASELINE_PATH.exists():
         try:
-            baseline = float(json.load(open(BASELINE_PATH)).get("baseline_equity", portfolio))
+            with open(BASELINE_PATH) as _bf:
+                baseline = float(json.load(_bf).get("baseline_equity", portfolio))
         except Exception:
             pass
 
@@ -70,7 +71,8 @@ def _closed_today() -> list[dict]:
     if not TRADE_HISTORY_PATH.exists():
         return []
     try:
-        history = json.load(open(TRADE_HISTORY_PATH))
+        with open(TRADE_HISTORY_PATH) as _f:
+            history = json.load(_f)
     except Exception:
         return []
     today = _today()
@@ -105,7 +107,8 @@ def _open_section() -> DigestSection:
     if not POSITIONS_PATH.exists():
         return DigestSection("OPEN POSITIONS", ["No positions file."])
     try:
-        positions = json.load(open(POSITIONS_PATH))
+        with open(POSITIONS_PATH) as _f:
+            positions = json.load(_f)
     except Exception:
         return DigestSection("OPEN POSITIONS", ["(positions file unreadable)"])
 

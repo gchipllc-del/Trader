@@ -26,6 +26,53 @@ SECTOR_MAP = {
 }
 
 
+def _position_exposure(p: dict) -> float:
+    """Approximate dollar exposure of a held position for concentration math.
+
+    The old sector check used ``strike * 100`` for every record, which
+    (a) ignored ``type=="stock"`` positions entirely because they have no
+    ``strike`` field, and (b) undercounted assigned stock when the price
+    moved away from the strike. This helper returns a per-position
+    exposure that matches the denominator (portfolio_value, which is
+    market-value-based) more honestly.
+    """
+    ptype = p.get("type", "")
+    status = p.get("status", "")
+    shares = float(p.get("shares", 0) or 0)
+    mark = p.get("mark") or p.get("current_price")
+    entry = float(p.get("entry_price", 0) or 0)
+    strike = float(p.get("strike", 0) or 0)
+
+    # Only HELD positions contribute to concentration. The caller already
+    # filters by status, but be defensive here too.
+    if status not in ("open", "assigned"):
+        return 0.0
+
+    if ptype == "csp" and status == "open":
+        # Cash held aside against assignment.
+        return strike * 100
+    if ptype == "cc" and status == "open":
+        # The underlying shares — collateral against a call away.
+        if mark and shares:
+            return float(mark) * shares
+        return strike * 100  # fallback if the position record lacks shares/mark
+    if status == "assigned" or ptype == "stock":
+        # Stock exposure: use market value when available, fall back to
+        # cost basis. Either is better than ignoring the position.
+        if mark and shares:
+            return float(mark) * shares
+        if entry and shares:
+            return entry * shares
+        # Last-resort fallback for legacy CSP records that lacked shares
+        # but have a strike (treat as 1 contract = 100 shares).
+        return strike * 100
+    # Legacy open record without an explicit type but with a strike —
+    # treat as a CSP (this matches the pre-refactor behavior).
+    if status == "open" and strike > 0:
+        return strike * 100
+    return 0.0
+
+
 class RiskAgent:
     """Reviews every trade proposal. Can VETO. Cannot propose or execute."""
 
@@ -78,7 +125,7 @@ class RiskAgent:
         sector = SECTOR_MAP.get(ticker, "other")
         positions = self._load_positions()
         sector_value = sum(
-            p.get("strike", 0) * 100
+            _position_exposure(p)
             for p in positions
             if p.get("status") in ("open", "assigned")
             and SECTOR_MAP.get(p.get("ticker", ""), "other") == sector

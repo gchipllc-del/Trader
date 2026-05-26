@@ -62,15 +62,53 @@ def _save_trade_history(history: list[dict]):
         json.dump(history, f, indent=2)
 
 
+def _load_core_holdings() -> set[str]:
+    """Load the wheel_strategy.yaml :: core_holdings forever-hold set.
+    Returns uppercase tickers. Returns empty set on failure.
+    """
+    import yaml
+    from pathlib import Path
+    try:
+        path = Path(__file__).resolve().parent.parent / "config" / "wheel_strategy.yaml"
+        with open(path) as f:
+            strategy = yaml.safe_load(f) or {}
+        return {str(t).upper() for t in (strategy.get("core_holdings") or [])}
+    except Exception:
+        return set()
+
+
 def find_assigned_positions() -> list[dict]:
-    """Find positions that were assigned and need covered calls."""
+    """Find positions that were assigned and need covered calls.
+
+    2026-05-26: forever-hold protection. Tickers in
+    wheel_strategy.yaml.core_holdings (or any position explicitly
+    stamped hold_forever) are SKIPPED — the bot owns those long-term
+    and refuses to write CCs that could call them away. The skip is
+    logged so the operator sees that protection fired.
+    """
     positions = _load_positions()
-    return [
-        p for p in positions
-        if p.get("status") == "assigned"
-        and p.get("assigned_shares", 0) >= 100
-        and not p.get("cc_active")  # No active covered call yet
-    ]
+    core_holdings = _load_core_holdings()
+    eligible: list[dict] = []
+    skipped_core: list[str] = []
+    for p in positions:
+        if p.get("status") != "assigned":
+            continue
+        if p.get("assigned_shares", 0) < 100:
+            continue
+        if p.get("cc_active"):
+            continue
+        ticker = str(p.get("ticker", "")).upper()
+        if p.get("hold_forever") or ticker in core_holdings:
+            skipped_core.append(ticker)
+            continue
+        eligible.append(p)
+    if skipped_core:
+        log_event(
+            "cc_engine", "core_holdings_skipped_from_cc",
+            {"tickers": skipped_core, "count": len(skipped_core)},
+            result="success",
+        )
+    return eligible
 
 
 def scan_for_ccs(

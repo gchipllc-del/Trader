@@ -98,7 +98,13 @@ FACTOR_WEIGHTS: dict[str, float] = {
     "momentum":  0.15,
     "valuation": 0.10,
 }
-assert abs(sum(FACTOR_WEIGHTS.values()) - 1.0) < 1e-9, "weights must sum to 1.0"
+if abs(sum(FACTOR_WEIGHTS.values()) - 1.0) >= 1e-9:
+    # Hard validate — `assert` here gets stripped under `python -O`, which
+    # would silently let a typo'd config produce composite scores that
+    # don't reflect the documented weighting.
+    raise ValueError(
+        f"FACTOR_WEIGHTS must sum to 1.0, got {sum(FACTOR_WEIGHTS.values()):.6f}"
+    )
 
 
 @dataclass
@@ -342,12 +348,23 @@ def fetch_fundamentals(ticker: str) -> dict:
 def fetch_kronos_direction(ticker: str) -> Optional[str]:
     """Optional Kronos AI directional bias. Returns 'bullish', 'bearish',
     'neutral', or None on failure. Best-effort — failures are silent so
-    a Kronos outage doesn't break ranking."""
+    a Kronos outage doesn't break ranking.
+
+    For long-term holds we use a longer prediction window than the swing
+    engine (60 bars ≈ 12 trading weeks) so the signal aligns more with
+    multi-month trend bias than with day-to-day chop.
+    """
     try:
-        from lib.alpaca_client import AlpacaClient
-        from lib.historical_kronos import predict_kronos_direction
-        client = AlpacaClient()
-        return predict_kronos_direction(ticker, client)
+        from lib.kronos_forecaster import predict_price
+        # 60-bar daily prediction. Kronos paper-conformant defaults
+        # (T=0.6, top_p=0.90, N=10) inherit from predict_price.
+        forecast = predict_price(
+            ticker=ticker,
+            pred_bars=60,
+            interval="1d",
+            sample_count=10,
+        )
+        return getattr(forecast, "direction", None)
     except Exception:
         return None
 
