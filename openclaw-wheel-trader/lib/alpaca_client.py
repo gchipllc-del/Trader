@@ -2,6 +2,7 @@
 Alpaca API Client — thin wrapper with rate limiting and error handling.
 All broker communication goes through this module.
 """
+from __future__ import annotations
 
 import os
 import time

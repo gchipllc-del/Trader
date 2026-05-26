@@ -11,6 +11,7 @@ After CSP assignment, we hold 100 shares. This module:
 
 Source: Wheel Strategy + Candlestick Bible (bearish patterns) + Naked Forex (resistance zones)
 """
+from __future__ import annotations
 
 import json
 from datetime import datetime, timezone

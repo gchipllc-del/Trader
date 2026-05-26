@@ -11,6 +11,7 @@ Pipeline:
 
 This is the orchestrator — it calls zones.py, trend.py, candlestick.py, iv_rank.py
 """
+from __future__ import annotations
 
 import yaml
 from dataclasses import dataclass, asdict

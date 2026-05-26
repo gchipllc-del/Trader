@@ -8,6 +8,7 @@ Sprint 8: Advanced Enhancements
 
 Source: Video (Capitol Trades), Advanced Algorithmic Trading (Bayesian)
 """
+from __future__ import annotations
 
 import json
 from datetime import datetime, timezone, timedelta

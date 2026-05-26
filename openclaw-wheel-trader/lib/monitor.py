@@ -10,6 +10,7 @@ Runs every 5 minutes during market hours. Checks all open positions for:
 
 Source: Video pattern (cron monitoring), Wheel Strategy management rules
 """
+from __future__ import annotations
 
 import json
 import time

@@ -17,6 +17,7 @@ Security:
     - Results cached with TTL (30 min default)
     - No secrets in any log or error message
 """
+from __future__ import annotations
 
 import hashlib
 import json

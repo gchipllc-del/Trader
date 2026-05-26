@@ -8,6 +8,7 @@ selling the same security on the same day.
 This module tracks round trips and blocks trades that would
 violate the PDT rule, preventing account restriction.
 """
+from __future__ import annotations
 
 import json
 from datetime import datetime, timezone, timedelta

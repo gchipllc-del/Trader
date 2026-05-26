@@ -7,6 +7,7 @@ Checks:
 - Pattern Day Trader rules (if applicable)
 - Trading during restricted periods
 """
+from __future__ import annotations
 
 import json
 from datetime import datetime, timezone, timedelta

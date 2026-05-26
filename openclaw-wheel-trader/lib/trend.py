@@ -9,6 +9,7 @@ Three questions before any trade:
 This module answers question #1 using multiple timeframes.
 Source: Candlestick Trading Bible Ch. 51-70
 """
+from __future__ import annotations
 
 import pandas as pd
 import numpy as np

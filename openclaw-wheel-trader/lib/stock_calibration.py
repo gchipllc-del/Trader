@@ -12,6 +12,7 @@ Key metrics:
     - Signal Accuracy: Which signals (candlestick, momentum, Kronos, news) predict best?
     - Kronos Accuracy: When Kronos says bullish, does the stock go up?
 """
+from __future__ import annotations
 
 import json
 import math

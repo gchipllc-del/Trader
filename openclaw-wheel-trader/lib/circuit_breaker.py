@@ -2,6 +2,7 @@
 Circuit Breakers — hard limits that cannot be bypassed.
 If any breaker trips, trading halts until conditions clear or human intervenes.
 """
+from __future__ import annotations
 
 import time
 from datetime import datetime, timezone

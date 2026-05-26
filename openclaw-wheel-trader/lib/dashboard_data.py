@@ -4,6 +4,7 @@ Dashboard Data Layer — aggregates all data sources for both web and terminal d
 Every function returns a plain dict (JSON-serializable) and handles errors
 gracefully so the presentation layer never crashes.
 """
+from __future__ import annotations
 
 import json
 import time

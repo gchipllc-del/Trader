@@ -7,6 +7,7 @@ Step 3: EXECUTE — Only after steps 1 & 2 pass, send to Alpaca
 
 No single function call can place an order. This is by design.
 """
+from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, asdict

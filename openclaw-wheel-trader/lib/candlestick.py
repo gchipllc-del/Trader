@@ -10,6 +10,7 @@ Source: The Candlestick Trading Bible, chapters on each pattern
 Key principle: A pattern is only valid at a KEY LEVEL (support/resistance)
 in alignment with the TREND.
 """
+from __future__ import annotations
 
 import pandas as pd
 import numpy as np

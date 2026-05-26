@@ -13,6 +13,7 @@ is an advisory 4th voice — logged on every decision; it only blocks when
 
 The execution layer is behind all gates — no agent can directly call the broker.
 """
+from __future__ import annotations
 
 from pathlib import Path
 from datetime import datetime, timezone

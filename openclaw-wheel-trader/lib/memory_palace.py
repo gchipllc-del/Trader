@@ -21,6 +21,7 @@ Agent Diaries:
 Requires: pip install chromadb mempalace
 Falls back to SQLite-only mode if ChromaDB unavailable.
 """
+from __future__ import annotations
 
 import json
 import os

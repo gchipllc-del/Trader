@@ -7,6 +7,7 @@ We score zones by: touches, recency, width, and "room to the left."
 
 Source: Naked Forex Ch. 4-6
 """
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd

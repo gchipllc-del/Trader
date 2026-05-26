@@ -20,6 +20,7 @@ Security:
     - Rate limiting enforced
     - Graceful fallback if API key missing, provider unreachable, or credits exhausted
 """
+from __future__ import annotations
 
 import hashlib
 import json

@@ -10,6 +10,7 @@ Proves the Wheel Strategy works before risking real capital.
 
 Source: Advanced Algorithmic Trading (Bayesian, time series, ML)
 """
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd

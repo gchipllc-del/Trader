@@ -8,6 +8,7 @@ the CSP collateral threshold.
 
 This is the stepping stone to the full Wheel Strategy.
 """
+from __future__ import annotations
 
 import json
 from datetime import datetime, timezone

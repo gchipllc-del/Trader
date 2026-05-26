@@ -8,6 +8,7 @@ Checks:
 - Position count limits
 - Market regime appropriateness
 """
+from __future__ import annotations
 
 import json
 from pathlib import Path

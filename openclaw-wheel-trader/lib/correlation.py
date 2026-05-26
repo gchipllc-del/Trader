@@ -12,6 +12,7 @@ Uses:
     2. Historical price correlation (Pearson on log returns)
     3. Manual correlation groups for known clusters
 """
+from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path

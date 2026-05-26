@@ -10,6 +10,7 @@ Key metrics:
 - Calibration Curve: Predicted vs actual frequency by probability bucket
 - Source Accuracy: Which sources (LLM, base rate, news) are most accurate
 """
+from __future__ import annotations
 
 import json
 import math

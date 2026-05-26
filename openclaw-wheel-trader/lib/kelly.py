@@ -12,6 +12,7 @@ Kelly fraction: f = (p*reward - q*risk) / (reward*risk)
 
 Full Kelly is too aggressive — always use fractional Kelly (0.25 to 0.50).
 """
+from __future__ import annotations
 
 from pathlib import Path
 import yaml

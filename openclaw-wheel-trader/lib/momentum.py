@@ -6,6 +6,7 @@ that don't require traditional candlestick confirmation.
 Fast-moving stocks with strong momentum can generate signals
 on their own when combined with trend alignment.
 """
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd

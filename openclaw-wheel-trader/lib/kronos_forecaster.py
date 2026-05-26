@@ -42,6 +42,7 @@ Security:
     - Results cached to avoid redundant GPU/CPU inference
     - No secrets in any log or error message
 """
+from __future__ import annotations
 
 import hashlib
 import json

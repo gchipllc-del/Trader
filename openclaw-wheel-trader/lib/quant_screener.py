@@ -13,6 +13,7 @@ Used at every phase:
   Phase 2: rank underlyings for CSP selling
   Phase 3: rank full Wheel candidates
 """
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd

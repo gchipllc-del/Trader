@@ -4,6 +4,7 @@ Data Pipeline — fetches all market data needed by the trading engines.
 Orchestrates: bars → options chains → quotes/greeks → IV calculation
 Produces the exact data structures that csp_engine and cc_engine expect.
 """
+from __future__ import annotations
 
 import yaml
 from datetime import datetime, timezone, timedelta

@@ -10,6 +10,7 @@ The first leg of the Wheel. This module:
 
 Source: Wheel Strategy + Candlestick Bible + Naked Forex
 """
+from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
