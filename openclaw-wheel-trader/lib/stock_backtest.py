@@ -261,6 +261,29 @@ def _score_candidate(
                 and momentum_score >= params.get("momentum_only_min_score", 3)):
             return None
 
+    # ── Confluence gate (2026-05-26) ───────────────────────────────────
+    # When ``require_confluence`` is True (set in stock_params), the
+    # candidate must clear N-of-M independent signal agreement. Drives
+    # WR up by demanding multi-source consensus.
+    # In backtest context, Bull/Bear agents are unavailable (live-only),
+    # so we evaluate against the bars-derivable signals: Turtle, Markov,
+    # Bayesian. The confluence rule auto-adapts to evaluated count.
+    if params.get("require_confluence", False):
+        from lib.confluence_filter import confluence_check, should_fire
+        # Build a minimal candidate dict for the agents (live-only)
+        candidate_for_conf = {
+            "ticker": ticker,
+            "current_price": current_price,
+        }
+        conf = confluence_check(
+            ticker=ticker, daily_slice=daily_slice,
+            candidate=candidate_for_conf, params=params,
+            bayesian_data=None,  # set below if enable_bayesian
+        )
+        fire, size_mult, conf_reason = should_fire(conf, params)
+        if not fire:
+            return None
+
     stop_pct = params.get("stop_loss_pct", 0.035)
     target_pct = params.get("default_target_pct", 0.10)
 

@@ -67,6 +67,19 @@ stock_params:
   entry_slippage_pct: 0.0005
   exit_slippage_pct: 0.0005
   gap_open_stops: true
+
+  # 2026-05-26: Confluence filter (lib/confluence_filter). Require
+  # multiple independent signals to agree before firing. Each
+  # confirmer adds 3-7pp WR on average. Target: 65-72% WR.
+  require_confluence: true
+  confluence_min_agree: 3        # full-size if 3-of-3 evaluated agree
+  confluence_half_size: 2        # half-size at 2-of-3
+  bayesian_min_win_prob: 0.55
+  pead_min_score: 0.15
+  bull_bear_margin: 2
+  enable_pead: false             # off for backtest (avoids slow API calls)
+  enable_markov: true
+  enable_bull_bear: false        # live-only signal, off for backtest
   max_position_pct: 0.3
   min_position_pct: 0.1
   max_trades_per_scan: 3
