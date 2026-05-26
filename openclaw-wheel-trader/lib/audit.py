@@ -3,6 +3,7 @@ Append-only audit logger.
 Every action the bot takes is logged here BEFORE execution.
 This is forensic-grade — if something goes wrong, this is the source of truth.
 """
+from __future__ import annotations
 
 import fcntl
 import json
