@@ -1086,6 +1086,67 @@ def execute_stock_buy(
             check_stock_buys_enabled()
         except ImportError:
             pass
+
+        # 2026-05-26: Confluence gate (live mode). Backtest only had
+        # bars-based signals (Turtle + Markov + Bayesian, all correlated).
+        # Live has 2 GENUINELY ORTHOGONAL extras — PEAD (event-driven,
+        # from earnings calendar) and Bull/Bear (fundamental review).
+        # When require_confluence is set, run all 5 and demand N-of-M.
+        # This is the real WR-pushing layer per Bernard-Thomas-style
+        # multi-signal-confluence research.
+        try:
+            from lib.confluence_filter import confluence_check, should_fire
+            import yaml as _yaml
+            from pathlib import Path as _Path
+            _sp_path = _Path(__file__).resolve().parent.parent / "config" / "wheel_strategy.yaml"
+            with open(_sp_path) as _f:
+                _strat = _yaml.safe_load(_f) or {}
+            _live_params = dict(_strat.get("stock_params", {}))
+            if _live_params.get("require_confluence", False):
+                # Enable BOTH PEAD and Bull/Bear in live mode — these
+                # are the independent signals that push WR past the
+                # backtest ceiling.
+                _live_params["enable_pead"] = True
+                _live_params["enable_bull_bear"] = True
+                _daily_slice = candidate.get("daily_slice")  # may be None
+                # Bayesian win prob from the candidate if present
+                _bayes = None
+                if "bayesian_win_prob" in candidate:
+                    _bayes = {"win_prob": candidate.get("bayesian_win_prob")}
+                if _daily_slice is not None:
+                    _conf = confluence_check(
+                        ticker=ticker, daily_slice=_daily_slice,
+                        candidate=candidate, params=_live_params,
+                        bayesian_data=_bayes,
+                    )
+                    _fire, _size_mult, _reason = should_fire(_conf, _live_params)
+                    if not _fire:
+                        log_event("stock_engine", "confluence_skip", {
+                            "ticker": ticker,
+                            "agreements": _conf.agreements,
+                            "disagreements": _conf.disagreements,
+                            "skipped": _conf.skipped,
+                            "reason": _reason,
+                        }, result="blocked")
+                        diary_write("strategy_agent",
+                            f"{ticker}|CONFLUENCE_SKIP|"
+                            f"{_conf.agreement_count}of{_conf.evaluated_count}|"
+                            f"{','.join(_conf.agreements) or 'none'}")
+                        return None
+                    # Half-size adjustment: shrink shares to half if
+                    # confluence is partial (3-of-N when 4 required, etc.)
+                    if _size_mult < 1.0 and shares > 1:
+                        shares = max(1, int(shares * _size_mult))
+                        log_event("stock_engine", "confluence_half_size", {
+                            "ticker": ticker,
+                            "new_shares": shares,
+                            "agreements": _conf.agreements,
+                        }, result="degraded")
+        except Exception as _e:
+            # Never block trade on confluence-system error — fail open
+            log_event("stock_engine", "confluence_check_error",
+                      {"ticker": ticker, "error": str(_e)[:200]},
+                      result="degraded")
     except CircuitBreakerTripped as e:
         log_event("stock_engine", "blocked", {"ticker": ticker, "error": str(e)})
         diary_write("strategy_agent", f"{ticker}|STOCK_BLOCKED|{e}")

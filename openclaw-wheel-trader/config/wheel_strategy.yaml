@@ -74,15 +74,21 @@ stock_params:
   require_confluence: true
   confluence_min_agree: 3        # full-size if 3-of-3 evaluated agree
   confluence_half_size: 2        # half-size at 2-of-3
-  # 2026-05-26: tightened thresholds after first backtest showed
-  # too-loose vote settings produced 50% WR (target 65-72%).
-  bayesian_min_win_prob: 0.65    # was 0.55
-  markov_min_signal: 0.20        # was 0.05 (strong bull bias only)
-  pead_min_score: 0.20           # was 0.15
+  # 2026-05-26: thresholds reverted after the tightening pass made WR
+  # WORSE (50% → 49%). Lesson: Turtle + Markov + Bayesian all read
+  # the same bars; tightening any of them doesn't add new information.
+  # The 50% WR backtest ceiling is the real cost of bars-only signals.
+  # To push WR > 50% we need event-driven (PEAD) + fundamentals
+  # (Bull/Bear), which only run cleanly in LIVE mode, not backtest.
+  bayesian_min_win_prob: 0.55
+  markov_min_signal: 0.05
+  pead_min_score: 0.15
   bull_bear_margin: 2
-  enable_pead: false             # off for backtest (avoids slow API calls)
+  enable_pead: false             # off for backtest (per-sim-date earnings
+                                 # cache not built yet); ENABLE IN LIVE
   enable_markov: true
-  enable_bull_bear: false        # live-only signal, off for backtest
+  enable_bull_bear: false        # off for backtest (live-only agents);
+                                 # ENABLE IN LIVE for orthogonal vote
   max_position_pct: 0.3
   min_position_pct: 0.1
   max_trades_per_scan: 3
