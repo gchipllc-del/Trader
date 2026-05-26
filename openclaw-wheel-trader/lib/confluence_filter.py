@@ -95,7 +95,7 @@ def _check_turtle(daily_slice, params: dict) -> Optional[bool]:
 
 
 def _check_markov(daily_slice, params: dict) -> Optional[bool]:
-    """True = Markov forecast says P(bull_tomorrow) > P(bear_tomorrow)."""
+    """True = Markov forecast shows STRONG bull bias (signal > threshold)."""
     try:
         from lib.markov_regime import (
             label_states, build_transition_matrix, signal_strength,
@@ -108,7 +108,12 @@ def _check_markov(daily_slice, params: dict) -> Optional[bool]:
         matrix = build_transition_matrix(labels[-100:])
         today_state = labels[-1]
         sig = signal_strength(matrix, today_state, horizon=1)
-        return sig > 0.05
+        # 2026-05-26: tightened from 0.05 → 0.20 to make Markov a meaningful
+        # vote instead of "any bullish lean". Demands the matrix forecast
+        # P(bull_tomorrow) - P(bear_tomorrow) > 20pp, which is a real
+        # statistical bias not just noise.
+        threshold = float(params.get("markov_min_signal", 0.20))
+        return sig > threshold
     except Exception:
         return None
 
