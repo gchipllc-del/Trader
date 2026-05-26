@@ -2411,7 +2411,8 @@ def main():
                                  "hermes-cycle", "hermes-review",
                                  "hermes-ledger", "hermes-mode",
                                  "cornelius", "goal-score",
-                                 "turtle", "turtle-scan", "turtle-backtest"],
+                                 "turtle", "turtle-scan", "turtle-backtest",
+                                 "pead", "pead-scan"],
                         help="Command to run")
     parser.add_argument("--signal", default="all",
                         help="build-cache: which signal to fill (kronos|news|llm|all)")
@@ -2661,6 +2662,33 @@ def main():
         ticker = args.ticker or "SPY"
         result = turtle_signal(ticker, lookback_days=365)
         print(render_summary(result))
+    elif args.command == "pead":
+        from lib.pead_signal import pead_score, render as _pead_render
+        print(_pead_render(pead_score(args.ticker or "NVDA")))
+    elif args.command == "pead-scan":
+        from lib.pead_signal import universe_scan as _pead_scan
+        import yaml as _yaml
+        with open("config/wheel_strategy.yaml") as _f:
+            _cfg = _yaml.safe_load(_f) or {}
+        universe = list(set(
+            (_cfg.get("core_holdings") or [])
+            + (_cfg.get("tickers") or [])
+        ))
+        print(f"Scanning {len(universe)} tickers for PEAD signals...\n")
+        results = _pead_scan(universe)
+        # Show only non-zero scores
+        active = [r for r in results if abs(r.get("score") or 0) > 0.01]
+        if not active:
+            print("No PEAD signals active right now.")
+        else:
+            print(f"  {'Ticker':<8} {'Days':>5} {'Surprise':>10} "
+                  f"{'Kind':<12} {'Score':>8}  Reason")
+            for r in active[:20]:
+                sp = r.get("surprise_pct")
+                sp_s = f"{sp:+.1%}" if sp is not None else "n/a"
+                print(f"  {r['ticker']:<8} {r.get('days_since', '?'):>5} "
+                      f"{sp_s:>10} {r.get('kind', '?'):<12} "
+                      f"{r.get('score', 0):>+8.3f}  {r.get('reason', '')[:40]}")
     elif args.command == "turtle-backtest":
         from lib.turtle_backtest import backtest_ticker, render_backtest, universe_backtest
         ticker = args.ticker or "SPY"

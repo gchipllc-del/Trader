@@ -169,12 +169,21 @@ def get_earnings_calendar_with_status(
     Callers that need to distinguish "definitely no earnings" from
     "we don't know" should use this; legacy callers can stay on
     get_earnings_calendar().
+
+    2026-05-26: negative ``days_ahead`` now queries PAST earnings —
+    e.g., days_ahead=-90 returns events from 90 days ago up to today.
+    Needed for PEAD signal which scores post-announcement drift.
     """
     today = datetime.now(timezone.utc).date()
-    end = today + timedelta(days=days_ahead)
+    if days_ahead >= 0:
+        date_from = today
+        date_to = today + timedelta(days=days_ahead)
+    else:
+        date_from = today + timedelta(days=days_ahead)  # days_ahead is negative
+        date_to = today
     data = _get(
         "/calendar/earnings",
-        {"symbol": ticker, "from": today.isoformat(), "to": end.isoformat()},
+        {"symbol": ticker, "from": date_from.isoformat(), "to": date_to.isoformat()},
         ttl_seconds=6 * 3600,
     )
     if not data or not isinstance(data, dict):
