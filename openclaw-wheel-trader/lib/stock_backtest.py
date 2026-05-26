@@ -261,28 +261,8 @@ def _score_candidate(
                 and momentum_score >= params.get("momentum_only_min_score", 3)):
             return None
 
-    # ── Confluence gate (2026-05-26) ───────────────────────────────────
-    # When ``require_confluence`` is True (set in stock_params), the
-    # candidate must clear N-of-M independent signal agreement. Drives
-    # WR up by demanding multi-source consensus.
-    # In backtest context, Bull/Bear agents are unavailable (live-only),
-    # so we evaluate against the bars-derivable signals: Turtle, Markov,
-    # Bayesian. The confluence rule auto-adapts to evaluated count.
-    if params.get("require_confluence", False):
-        from lib.confluence_filter import confluence_check, should_fire
-        # Build a minimal candidate dict for the agents (live-only)
-        candidate_for_conf = {
-            "ticker": ticker,
-            "current_price": current_price,
-        }
-        conf = confluence_check(
-            ticker=ticker, daily_slice=daily_slice,
-            candidate=candidate_for_conf, params=params,
-            bayesian_data=None,  # set below if enable_bayesian
-        )
-        fire, size_mult, conf_reason = should_fire(conf, params)
-        if not fire:
-            return None
+    # Confluence gate moved to AFTER bayesian_data computation below so
+    # the Bayesian signal can actually vote — see end of function.
 
     stop_pct = params.get("stop_loss_pct", 0.035)
     target_pct = params.get("default_target_pct", 0.10)
@@ -341,6 +321,32 @@ def _score_candidate(
             )
         except Exception:
             pass
+
+    # ── Confluence gate (2026-05-26) ───────────────────────────────────
+    # Now that bayesian_data, kronos, news, and (in live mode) PEAD are
+    # all populated, run the multi-signal agreement check.
+    # confluence_filter handles signal availability gracefully — missing
+    # signals count as "skipped", not as votes against.
+    if params.get("require_confluence", False):
+        from lib.confluence_filter import confluence_check, should_fire
+        # Normalize bayesian_data for the confluence check (object → dict)
+        bayes_dict = None
+        if bayesian_data is not None:
+            wp = getattr(bayesian_data, "win_probability", None)
+            if wp is not None:
+                bayes_dict = {"win_prob": float(wp)}
+        candidate_for_conf = {
+            "ticker": ticker,
+            "current_price": current_price,
+        }
+        conf = confluence_check(
+            ticker=ticker, daily_slice=daily_slice,
+            candidate=candidate_for_conf, params=params,
+            bayesian_data=bayes_dict,
+        )
+        fire, size_mult, conf_reason = should_fire(conf, params)
+        if not fire:
+            return None
 
     return {
         "ticker": ticker,
