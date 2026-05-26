@@ -169,6 +169,31 @@ def _score_candidate(
     closes = daily_slice["close"].values
     current_price = float(closes[-1])
 
+    # ── Turtle entry pre-filter (2026-05-26) ───────────────────────────
+    # Adapted from lib/turtle_signal. When ``require_turtle_entry`` is
+    # set in params (default OFF for back-compat), a candidate must
+    # ALSO clear:
+    #   - long regime: today's close > 200-period SMA
+    #   - donchian:    today's close > prior 40-bar high
+    # Otherwise return None (signal silenced). ATR-based stop overlay
+    # is left to caller; we keep the existing stop_pct flow below.
+    #
+    # The cron's existing momentum / composite scoring runs UNCHANGED
+    # afterward — Turtle is a quality gate, not a replacement.
+    if params.get("require_turtle_entry", False):
+        regime_window = params.get("turtle_regime_window", 200)
+        breakout_window = params.get("turtle_breakout_window", 40)
+        if len(closes) <= max(regime_window, breakout_window):
+            return None
+        sma_n = float(pd.Series(closes).rolling(regime_window).mean().iloc[-1])
+        if pd.isna(sma_n) or current_price <= sma_n:
+            return None  # bear regime
+        prior_high = float(
+            pd.Series(closes[:-1]).rolling(breakout_window).max().iloc[-1]
+        )
+        if pd.isna(prior_high) or current_price <= prior_high:
+            return None  # no breakout
+
     # Build a weekly-ish frame by resampling daily to 5-day buckets
     weekly = daily_slice["close"].resample("W").last().to_frame("close")
     weekly["high"] = daily_slice["high"].resample("W").max()
