@@ -2411,7 +2411,7 @@ def main():
                                  "hermes-cycle", "hermes-review",
                                  "hermes-ledger", "hermes-mode",
                                  "cornelius", "goal-score",
-                                 "turtle", "turtle-scan"],
+                                 "turtle", "turtle-scan", "turtle-backtest"],
                         help="Command to run")
     parser.add_argument("--signal", default="all",
                         help="build-cache: which signal to fill (kronos|news|llm|all)")
@@ -2661,6 +2661,30 @@ def main():
         ticker = args.ticker or "SPY"
         result = turtle_signal(ticker, lookback_days=365)
         print(render_summary(result))
+    elif args.command == "turtle-backtest":
+        from lib.turtle_backtest import backtest_ticker, render_backtest, universe_backtest
+        ticker = args.ticker or "SPY"
+        lookback = args.lookback if args.lookback else 1825
+        if "," in ticker:
+            tickers = [t.strip().upper() for t in ticker.split(",")]
+            results = universe_backtest(tickers, lookback_days=lookback)
+            print(f"Backtest over {lookback}d for {len(tickers)} tickers:\n")
+            print(f"  {'Ticker':<8} {'N':>4} {'WR':>7} {'R:R':>6} {'PF':>6} "
+                  f"{'CompRet':>10} {'MaxDD':>8}")
+            for r in results:
+                if "error" in r:
+                    print(f"  {r['ticker']:<8} ERROR — {r['error']}")
+                    continue
+                wr = r.get("win_rate")
+                wr_s = f"{wr*100:.1f}%" if wr is not None else "n/a"
+                rr_s = f"{r.get('rr_ratio'):.2f}" if r.get("rr_ratio") else "n/a"
+                pf_s = f"{r.get('profit_factor'):.2f}" if r.get("profit_factor") else "n/a"
+                print(f"  {r['ticker']:<8} {r['n_trades']:>4} {wr_s:>7} "
+                      f"{rr_s:>6} {pf_s:>6} "
+                      f"{r['compounded_return']*100:>+9.1f}% "
+                      f"{r['max_drawdown']*100:>+7.1f}%")
+        else:
+            print(render_backtest(backtest_ticker(ticker, lookback_days=lookback)))
     elif args.command == "turtle-scan":
         from lib.turtle_signal import universe_scan
         import yaml as _yaml
