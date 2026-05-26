@@ -511,32 +511,51 @@ def auto_reconcile_phantom_positions(
 
     # Now mutate positions.json under the file lock; for each phantom
     # find its open record and close it.
+    #
+    # IMPORTANT (2026-05-23 bugfix): If multiple open records exist for
+    # the same ticker — which can happen if direction-B backfill ran
+    # multiple times without dedup (see corresponding fix below) — we
+    # must only CREDIT realized_pnl to ONE of them. Otherwise mass-close
+    # of N zombie opens inflates reported P&L by Nx. We pick the most
+    # recent open record per ticker as canonical and "ghost-close" the
+    # rest with realized_pnl=0 + close_reason=duplicate_purge.
     targets = {a.evidence.get("ticker", "").upper() for a in phantom_alerts}
     with mutate_positions() as positions:
+        # Bucket open stock records by ticker
+        opens_by_ticker: dict[str, list[dict]] = {}
         for p in positions:
             if p.get("status") != "open":
                 continue
-            ticker = str(p.get("ticker", "")).upper()
-            if ticker not in targets:
+            t = str(p.get("ticker", "")).upper()
+            if t not in targets:
                 continue
             if p.get("type") != "stock":
                 continue
+            opens_by_ticker.setdefault(t, []).append(p)
 
-            entry = float(p.get("entry_price", 0) or 0)
-            qty = float(p.get("shares", 0) or p.get("quantity", 0) or 0)
+        for ticker, group in opens_by_ticker.items():
+            # Most recent first; the youngest open is canonical (least
+            # likely to have stale entry_price from old backfills).
+            group.sort(key=lambda r: str(r.get("opened_at", "")), reverse=True)
+            canonical = group[0]
+            zombies = group[1:]
+
+            entry = float(canonical.get("entry_price", 0) or 0)
+            qty = float(canonical.get("shares", 0) or canonical.get("quantity", 0) or 0)
             sell_info = fills_by_ticker.get(ticker)
 
+            # 1. Close the canonical record with real P&L
             if sell_info and sell_info["filled_avg_price"] > 0:
                 exit_price = sell_info["filled_avg_price"]
-                p["status"] = "closed"
-                p["closed_at"] = (
+                canonical["status"] = "closed"
+                canonical["closed_at"] = (
                     sell_info["submitted_at"].isoformat()
                     if hasattr(sell_info["submitted_at"], "isoformat")
                     else str(sell_info["submitted_at"])
                 )
-                p["exit_price"] = round(exit_price, 4)
-                p["close_reason"] = "auto_reconcile_broker_sold"
-                p["realized_pnl"] = round((exit_price - entry) * qty, 2)
+                canonical["exit_price"] = round(exit_price, 4)
+                canonical["close_reason"] = "auto_reconcile_broker_sold"
+                canonical["realized_pnl"] = round((exit_price - entry) * qty, 2)
                 reconciled += 1
                 tickers.append(ticker)
                 log_event("self_audit", "auto_reconciled", {
@@ -544,17 +563,16 @@ def auto_reconcile_phantom_positions(
                     "entry_price": entry,
                     "exit_price": exit_price,
                     "qty": qty,
-                    "realized_pnl": p["realized_pnl"],
+                    "realized_pnl": canonical["realized_pnl"],
                     "method": "matched_broker_sell",
+                    "zombies_ghost_closed": len(zombies),
                 }, result="success")
             else:
-                # No matching sell at broker — close flat with no P&L
-                # assumption. Safe default, audit-flagged for review.
-                p["status"] = "closed"
-                p["closed_at"] = now_iso
-                p["exit_price"] = entry
-                p["close_reason"] = "auto_reconcile_no_sell_found"
-                p["realized_pnl"] = 0.0
+                canonical["status"] = "closed"
+                canonical["closed_at"] = now_iso
+                canonical["exit_price"] = entry
+                canonical["close_reason"] = "auto_reconcile_no_sell_found"
+                canonical["realized_pnl"] = 0.0
                 no_sell += 1
                 tickers.append(ticker)
                 log_event("self_audit", "auto_reconciled", {
@@ -563,7 +581,17 @@ def auto_reconcile_phantom_positions(
                     "qty": qty,
                     "method": "no_sell_found_flat_close",
                     "needs_review": True,
+                    "zombies_ghost_closed": len(zombies),
                 }, result="degraded")
+
+            # 2. Ghost-close any zombies (duplicate-backfill artifacts)
+            #    with zero P&L so reports don't double-count.
+            for z in zombies:
+                z["status"] = "closed"
+                z["closed_at"] = now_iso
+                z["exit_price"] = float(z.get("entry_price", 0) or 0)
+                z["close_reason"] = "duplicate_purge"
+                z["realized_pnl"] = 0.0
 
     # ── Direction B: backfill broker-only positions into local ─────────
     # Broker has shares we don't track locally (bot bought but local
@@ -620,6 +648,30 @@ def auto_reconcile_phantom_positions(
                 qty = broker_qtys.get(sym, 0)
                 if qty <= 0:
                     continue
+
+                # IDEMPOTENCY CHECK (2026-05-23 bugfix). If we already
+                # have an OPEN stock record for this ticker, do not
+                # append another one. Without this check, every audit
+                # cycle would add a fresh duplicate row — the bug that
+                # produced 178x duplicates of CLF/WBD/KO and inflated
+                # logged P&L by $782. Skipping here means broker truth
+                # is already represented locally; nothing to backfill.
+                existing_open = next(
+                    (p for p in positions
+                     if str(p.get("ticker", "")).upper() == sym
+                     and p.get("status") == "open"
+                     and p.get("type") == "stock"),
+                    None,
+                )
+                if existing_open is not None:
+                    log_event("self_audit", "auto_backfill_skip_already_tracked", {
+                        "ticker": sym,
+                        "existing_order_id": existing_open.get("order_id"),
+                        "existing_entry": existing_open.get("entry_price"),
+                        "broker_qty": qty,
+                    }, result="success")
+                    continue
+
                 buy = buys_by_ticker.get(sym)
                 if buy and buy["filled_avg_price"] > 0:
                     entry_price = buy["filled_avg_price"]

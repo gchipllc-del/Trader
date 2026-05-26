@@ -945,6 +945,9 @@ class TestCryptoOrderGate:
         monkeypatch.setattr(stock_engine, "POSITIONS_PATH", pos_file)
         monkeypatch.setattr(stock_engine, "remember_trade_decision", lambda **kw: None)
         monkeypatch.setattr(stock_engine, "diary_write", lambda a, e: None)
+        # Bypass the SPY-gap stock-buys gate — separate live-state breaker.
+        monkeypatch.setattr("lib.circuit_breaker.check_stock_buys_enabled",
+                            lambda: True)
 
         calls = []
         monkeypatch.setattr("lib.stock_engine.step1_propose",
@@ -1219,6 +1222,9 @@ class TestCryptoOrderGate:
         monkeypatch.setattr(stock_engine, "POSITIONS_PATH", pos_file)
         monkeypatch.setattr(stock_engine, "remember_trade_decision", lambda **kw: None)
         monkeypatch.setattr(stock_engine, "diary_write", lambda a, e: None)
+        # Bypass the SPY-gap stock-buys gate — separate live-state breaker.
+        monkeypatch.setattr("lib.circuit_breaker.check_stock_buys_enabled",
+                            lambda: True)
 
         monkeypatch.setattr("lib.stock_engine.step1_propose", lambda i: i)
         monkeypatch.setattr("lib.stock_engine.step2_validate",
@@ -1328,6 +1334,19 @@ class TestCryptoOrderGate:
             saved = json.load(f)
         assert saved == []
 
+    def _recent_round_trip_record(self) -> dict:
+        """A closed same-day round trip dated today, so the pdt_guard
+        lookback window (7 business days) always includes it. Hardcoded
+        dates went stale every time the calendar advanced past the
+        lookback window."""
+        from datetime import datetime, timezone
+        day = datetime.now(timezone.utc).date().isoformat()
+        return {
+            "ticker": "TST", "type": "stock", "status": "closed",
+            "opened_at": f"{day}T14:00:00+00:00",
+            "closed_at": f"{day}T20:00:00+00:00",
+        }
+
     def test_pdt_count_uses_broker_when_client_passed(self, tmp_path, monkeypatch):
         """Wave 2 #8: pdt_guard should prefer the broker's daytrade_count
         over a positions.json scan, since concurrent fills can lag JSON
@@ -1336,11 +1355,7 @@ class TestCryptoOrderGate:
 
         # Set positions.json to a count of 1 (one same-day round trip).
         pos_file = tmp_path / "positions.json"
-        pos_file.write_text(json.dumps([{
-            "ticker": "TST", "type": "stock", "status": "closed",
-            "opened_at": "2026-04-30T14:00:00+00:00",
-            "closed_at": "2026-04-30T20:00:00+00:00",
-        }]))
+        pos_file.write_text(json.dumps([self._recent_round_trip_record()]))
         monkeypatch.setattr(pdt_guard, "POSITIONS_PATH", pos_file)
 
         # Broker says 3 (more recent fills not yet in positions.json).
@@ -1359,11 +1374,7 @@ class TestCryptoOrderGate:
         from lib import pdt_guard
 
         pos_file = tmp_path / "positions.json"
-        pos_file.write_text(json.dumps([{
-            "ticker": "TST", "type": "stock", "status": "closed",
-            "opened_at": "2026-04-30T14:00:00+00:00",
-            "closed_at": "2026-04-30T20:00:00+00:00",
-        }]))
+        pos_file.write_text(json.dumps([self._recent_round_trip_record()]))
         monkeypatch.setattr(pdt_guard, "POSITIONS_PATH", pos_file)
 
         client = MagicMock()

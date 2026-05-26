@@ -355,9 +355,8 @@ def run_csp_scan_and_execute(
     # CSP path. Now derives from broker equity vs morning baseline.
     daily_pnl_dollars = 0.0
     try:
-        baseline = json.load(open(
-            Path(__file__).parent.parent / "data" / "baseline_equity.json"
-        ))
+        with open(Path(__file__).parent.parent / "data" / "baseline_equity.json") as _bf:
+            baseline = json.load(_bf)
         portfolio_now = float(account.get("portfolio_value", 0) or 0)
         baseline_eq = float(baseline.get("baseline_equity", portfolio_now))
         daily_pnl_dollars = portfolio_now - baseline_eq

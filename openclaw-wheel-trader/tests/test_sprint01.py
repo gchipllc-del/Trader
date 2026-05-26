@@ -138,10 +138,15 @@ class TestCircuitBreakers:
     def test_open_orders_passes(self):
         assert check_open_orders(3, settings=self.STRICT_CB) is True
 
+    def test_open_orders_at_limit_passes(self):
+        # max_open_orders is the inclusive ceiling: hitting 5 is allowed,
+        # 6 is blocked. The earlier `>=` comparison silently capped one
+        # slot short of the configured limit.
+        assert check_open_orders(5, settings=self.STRICT_CB) is True
+
     def test_open_orders_trips(self):
-        # 5 open orders meets STRICT_CB's 5 max (>=) so trips
         with pytest.raises(CircuitBreakerTripped):
-            check_open_orders(5, settings=self.STRICT_CB)
+            check_open_orders(6, settings=self.STRICT_CB)
 
     def test_contracts_passes(self):
         assert check_contracts_per_order(1, settings=self.STRICT_CB) is True

@@ -103,11 +103,17 @@ class TestBullBearCombiner:
         assert result["delta"] == 5
 
     def test_bull_boost_suppressed_when_delta_too_small(self):
-        """Bull score barely beats bear score → don't boost (need delta ≥ 4)."""
+        """Bull score barely beats bear score → don't boost.
+
+        Pinned with ``use_dynamic_weights=False`` so the test asserts the
+        *static* threshold (raw delta >= 4) and isn't perturbed by the
+        running agent-accuracy stats — those stats correctly let bull
+        boost at smaller deltas when bull has been more accurate.
+        """
         from agents.bull_agent import combine_bull_bear
         bull = {"action": "BOOST", "size_multiplier": 1.25, "score": 7, "signals": []}
         bear = {"action": "PASS", "size_multiplier": 1.0, "score": 5, "signals": []}
-        result = combine_bull_bear(bull, bear)
+        result = combine_bull_bear(bull, bear, use_dynamic_weights=False)
         assert result["decision"] == "PASS"
         assert result["size_multiplier"] == 1.0
 
@@ -131,6 +137,9 @@ class TestBullBearStockEngineIntegration:
         monkeypatch.setattr(stock_engine, "POSITIONS_PATH", pos_file)
         monkeypatch.setattr(stock_engine, "diary_write", lambda a, e: None)
         monkeypatch.setattr(stock_engine, "remember_trade_decision", lambda **kw: None)
+        # Bypass the SPY-gap stock-buys gate — separate live-state breaker.
+        monkeypatch.setattr("lib.circuit_breaker.check_stock_buys_enabled",
+                            lambda: True)
 
         captured_intent = []
         monkeypatch.setattr("lib.stock_engine.step1_propose",

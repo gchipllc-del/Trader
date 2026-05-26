@@ -140,19 +140,24 @@ class ComplianceAgent:
         return {"pass": True, "reason": "No earnings conflict detected"}
 
     def _check_market_hours(self) -> dict:
-        """Basic check that we're in market hours (9:30 AM - 4:00 PM ET)."""
-        now = datetime.now(timezone.utc)
-        # Rough ET conversion (UTC-4 or UTC-5)
-        et_hour = (now.hour - 4) % 24  # Approximate EDT
+        """Basic check that we're in market hours (9:30 AM - 4:00 PM ET).
 
-        is_weekday = now.weekday() < 5
-        is_market_hours = 9 <= et_hour < 16
+        Uses zoneinfo so the answer is correct year-round; the previous
+        ``(now.hour - 4) % 24`` hardcoded EDT and silently shifted by one
+        hour during EST months (Nov–Mar).
+        """
+        from zoneinfo import ZoneInfo
+        et_now = datetime.now(ZoneInfo("America/New_York"))
+
+        is_weekday = et_now.weekday() < 5
+        is_market_hours = 9 <= et_now.hour < 16
 
         if not is_weekday:
             return {"pass": False, "reason": "Weekend — market closed"}
 
         if not is_market_hours:
-            return {"pass": False, "reason": f"Outside market hours (est ~{et_hour}:00 ET)"}
+            return {"pass": False,
+                    "reason": f"Outside market hours ({et_now.strftime('%H:%M')} ET)"}
 
         return {"pass": True, "reason": "Within market hours"}
 

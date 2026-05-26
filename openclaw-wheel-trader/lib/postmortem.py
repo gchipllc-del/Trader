@@ -295,7 +295,8 @@ def find_missed_opportunities(
     # Also exclude open positions with opened_at == today
     if POSITIONS_PATH.exists():
         try:
-            positions = json.load(open(POSITIONS_PATH))
+            with open(POSITIONS_PATH) as _f:
+                positions = json.load(_f)
             target_iso = target_date.isoformat()
             for p in positions:
                 if str(p.get("opened_at", ""))[:10] == target_iso:

@@ -174,7 +174,8 @@ def status_vol_sizing() -> dict[str, Any]:
     # vol_sizing_failed / step1_proposed for the meta dict if present.
     # Simpler: count recent positions whose kelly_sizing has vol_meta.
     try:
-        positions = json.load(open(_ROOT / "data" / "positions.json"))
+        with open(_ROOT / "data" / "positions.json") as _f:
+            positions = json.load(_f)
         recent = sorted(
             positions, key=lambda p: p.get("opened_at", ""), reverse=True,
         )[:10]

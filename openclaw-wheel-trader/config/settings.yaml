@@ -69,6 +69,20 @@ hermes:
   lookback_days: 14             # Review last 2 weeks of trades
   min_trades_to_optimize: 3     # Need at least 3 trades before tuning
 
+# --- Hermes Mode ---
+# Controls whether Hermes auto-applies tuned params or just proposes them.
+# "live" = apply automatically to wheel_strategy.yaml + this file.
+# "shadow" = log proposals only; human approves manually.
+hermes_mode: live
+
+# --- Market-Regime Entry Filter (added 2026-05-23) ---
+# Gates NEW positions when SPY downtrend OR VIX stressed; existing
+# positions are still managed normally. Defaults to enabled.
+# Toggle off with `enabled: false` if you want to bypass the gate
+# temporarily without removing code.
+regime_filter:
+  enabled: true
+
 # --- Rate Limiting ---
 rate_limits:
   alpaca_calls_per_minute: 120
