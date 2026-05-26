@@ -2410,7 +2410,8 @@ def main():
                                  "stock-buys-gate", "markov",
                                  "hermes-cycle", "hermes-review",
                                  "hermes-ledger", "hermes-mode",
-                                 "cornelius", "goal-score"],
+                                 "cornelius", "goal-score",
+                                 "turtle", "turtle-scan"],
                         help="Command to run")
     parser.add_argument("--signal", default="all",
                         help="build-cache: which signal to fill (kronos|news|llm|all)")
@@ -2655,6 +2656,34 @@ def main():
     elif args.command == "goal-score":
         from lib.hermes_goal_score import compute_goal_metrics, render
         print(render(compute_goal_metrics()))
+    elif args.command == "turtle":
+        from lib.turtle_signal import turtle_signal, render_summary
+        ticker = args.ticker or "SPY"
+        result = turtle_signal(ticker, lookback_days=365)
+        print(render_summary(result))
+    elif args.command == "turtle-scan":
+        from lib.turtle_signal import universe_scan
+        import yaml as _yaml
+        # Pull the universe from wheel_strategy.yaml (core_holdings + tickers)
+        with open("config/wheel_strategy.yaml") as _f:
+            _cfg = _yaml.safe_load(_f) or {}
+        universe = list(set(
+            (_cfg.get("core_holdings") or [])
+            + (_cfg.get("tickers") or [])
+        ))
+        print(f"Scanning {len(universe)} tickers for Turtle signals...")
+        fired = universe_scan(universe)
+        if not fired:
+            print("No Turtle signals firing today.")
+        else:
+            print(f"\n{len(fired)} signal(s) firing:\n")
+            for f in fired:
+                s = f.get('sizing', {})
+                print(f"  {f['ticker']:<6} ${f['today_price']:>8.2f}  "
+                      f"stop ${f['stop_price']:>8.2f} "
+                      f"({f['stop_distance_pct']:+.1%})  "
+                      f"size {s.get('shares', 0)} sh / "
+                      f"${s.get('sized_dollars', 0):.0f}")
     elif args.command == "markov":
         from lib.markov_regime import markov_summary, render_summary
         ticker = args.ticker or "SPY"
