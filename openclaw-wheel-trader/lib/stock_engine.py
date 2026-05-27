@@ -92,6 +92,7 @@ def score_stock_buy(
     weekly_df: pd.DataFrame,
     current_price: float,
     max_position_value: float,
+    is_backtest: bool = False,
 ) -> dict | None:
     """
     Score a stock as a buy candidate using trend + level + signal + momentum.
@@ -103,6 +104,11 @@ def score_stock_buy(
       - Momentum (0-4): RSI, MACD, volume surge, ROC
 
     Parameters are read from wheel_strategy.yaml so Hermes can tune them.
+
+    ``is_backtest`` skips wall-clock filters (time-of-day) that don't
+    apply when historical simulations run after-hours. Volume confirmation
+    and Turtle pre-filter still fire — they read from ``daily_df`` and are
+    independent of when the function is actually called.
     """
     if len(daily_df) < 30 or len(weekly_df) < 10:
         return None
@@ -114,6 +120,61 @@ def score_stock_buy(
     default_target_pct = stock_cfg.get("default_target_pct", 0.10)
     allow_momentum_only = stock_cfg.get("allow_momentum_only", False)
     support_distance_tiers = stock_cfg.get("support_distance_tiers", [0.03, 0.05, 0.08])
+
+    # ─── Time-of-day filter ───────────────────────────────────────────
+    # 2026-05-27: skip entries in the first/last 30 min of the trading
+    # day. Empirically the highest-noise window — opening-auction
+    # imbalances and closing-imbalance flows trigger false breakouts
+    # that the rest of the stack will then chase. Active window: 10:00
+    # ET — 15:30 ET (30 min after open through 30 min before close).
+    #
+    # LIVE ONLY — backtest scores at sim-date close so wall-clock
+    # ``now()`` doesn't apply. Default ON; toggle with
+    # stock_params.enable_time_of_day_filter.
+    if not is_backtest and stock_cfg.get("enable_time_of_day_filter", True):
+        try:
+            from datetime import datetime, timezone, timedelta
+            # ET is UTC-4 during DST, UTC-5 standard. Use a simple
+            # +0 offset detection rather than pytz to keep deps minimal.
+            now_utc = datetime.now(timezone.utc)
+            # Convert to ET via DST-aware fixed offset based on
+            # the US 2nd-Sunday-of-March rule (good enough for trading
+            # hours classification).
+            year = now_utc.year
+            # DST: 2nd Sun of March to 1st Sun of November
+            import calendar
+            # Use monthrange to get accurate day count per month (March 31,
+            # November 30) — earlier version walked range(1,32) which blew
+            # up on November.
+            mar_days = calendar.monthrange(year, 3)[1]
+            nov_days = calendar.monthrange(year, 11)[1]
+            march_sundays = [d for d in range(1, mar_days + 1)
+                             if calendar.weekday(year, 3, d) == 6][:2]
+            dst_start = datetime(year, 3, march_sundays[1], 2, 0, tzinfo=timezone.utc)
+            nov_sundays = [d for d in range(1, nov_days + 1)
+                           if calendar.weekday(year, 11, d) == 6][:1]
+            dst_end = datetime(year, 11, nov_sundays[0], 2, 0, tzinfo=timezone.utc)
+            et_offset = -4 if dst_start <= now_utc < dst_end else -5
+            now_et = now_utc + timedelta(hours=et_offset)
+            hhmm = now_et.hour * 100 + now_et.minute
+            # First 30 min: 9:30–9:59 ET (930–959); last 30 min: 15:30–15:59 ET
+            if 930 <= hhmm < 1000:
+                log_event("stock_engine", "time_of_day_skip", {
+                    "ticker": ticker, "et_time": now_et.strftime("%H:%M"),
+                    "reason": "first_30min_volatility_window",
+                })
+                return None
+            if 1530 <= hhmm < 1600:
+                log_event("stock_engine", "time_of_day_skip", {
+                    "ticker": ticker, "et_time": now_et.strftime("%H:%M"),
+                    "reason": "last_30min_volatility_window",
+                })
+                return None
+        except Exception as e:
+            log_event("stock_engine", "time_of_day_filter_error", {
+                "ticker": ticker, "error": str(e)[:200],
+            }, result="degraded")
+            # Fail OPEN — don't block trades on a clock bug.
 
     # ─── Turtle pre-filter ────────────────────────────────────────────
     # 2026-05-27: this gate was active in backtest but had no live wiring,
@@ -159,6 +220,38 @@ def score_stock_buy(
             # On error, FAIL OPEN — don't block the trade on a Turtle bug.
             # Backtest still has its own check; live falls back to the
             # composite+confluence stack.
+
+    # ─── Volume confirmation gate ─────────────────────────────────────
+    # 2026-05-27: a Turtle breakout on DEAD VOLUME usually fails because
+    # there's no real demand behind the move — just a slow drift through
+    # the prior high. Require today's volume to be at least
+    # ``volume_confirmation_multiplier`` × the 20-day average. Default
+    # 1.0 (above average); set to 1.5 to require a true volume thrust.
+    # Filters apply in BOTH live and backtest since they read from
+    # daily_df directly.
+    if stock_cfg.get("enable_volume_confirmation", True):
+        try:
+            vol_window = int(stock_cfg.get("volume_confirmation_window", 20))
+            vol_mult = float(stock_cfg.get("volume_confirmation_multiplier", 1.0))
+            if "volume" in daily_df.columns and len(daily_df) > vol_window:
+                vols = daily_df["volume"].astype(float).values
+                today_vol = float(vols[-1])
+                avg_vol = float(sum(vols[-(vol_window + 1):-1]) / vol_window)
+                if avg_vol > 0 and today_vol < avg_vol * vol_mult:
+                    log_event("stock_engine", "volume_confirmation_veto", {
+                        "ticker": ticker,
+                        "today_vol": int(today_vol),
+                        "avg_vol_n": vol_window,
+                        "avg_vol": int(avg_vol),
+                        "multiplier_required": vol_mult,
+                        "reason": "today_volume_below_avg_threshold",
+                    })
+                    return None
+        except Exception as e:
+            log_event("stock_engine", "volume_filter_error", {
+                "ticker": ticker, "error": str(e)[:200],
+            }, result="degraded")
+            # Fail OPEN — don't block on a volume calc bug
 
     # --- Trend Score (0-3) ---
     mtf = multi_timeframe_analysis(weekly_df, daily_df)

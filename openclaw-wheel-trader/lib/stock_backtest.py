@@ -194,6 +194,24 @@ def _score_candidate(
         if pd.isna(prior_high) or current_price <= prior_high:
             return None  # no breakout
 
+    # ── Volume confirmation gate (2026-05-27) ──────────────────────────
+    # Mirror of stock_engine.score_stock_buy volume check. Turtle breakouts
+    # on dead volume usually fail — require today's volume >=
+    # ``volume_confirmation_multiplier`` × N-day average (default 1.0 →
+    # at least average). Set to 1.5 to demand a true volume thrust.
+    if params.get("enable_volume_confirmation", True):
+        try:
+            vol_window = int(params.get("volume_confirmation_window", 20))
+            vol_mult = float(params.get("volume_confirmation_multiplier", 1.0))
+            if "volume" in daily_slice.columns and len(daily_slice) > vol_window:
+                vols = daily_slice["volume"].astype(float).values
+                today_vol = float(vols[-1])
+                avg_vol = float(sum(vols[-(vol_window + 1):-1]) / vol_window)
+                if avg_vol > 0 and today_vol < avg_vol * vol_mult:
+                    return None
+        except Exception:
+            pass  # fail open
+
     # Build a weekly-ish frame by resampling daily to 5-day buckets
     weekly = daily_slice["close"].resample("W").last().to_frame("close")
     weekly["high"] = daily_slice["high"].resample("W").max()

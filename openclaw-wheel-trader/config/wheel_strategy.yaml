@@ -57,7 +57,7 @@ stock_params:
   # stop) and PLTR stopped at -3.8% (would have stopped earlier under
   # old stop too, slightly less harm). Reverting until require_turtle_entry
   # is enforced in stock_engine.py — then we can re-tighten safely.
-  stop_loss_pct: 0.035
+  stop_loss_pct: 0.03
   default_target_pct: 0.1
   trailing_stop_pct: 0.02
 
@@ -107,9 +107,23 @@ stock_params:
   # both live and backtest since the agent fails gracefully (returns
   # NEUTRAL = "no opinion") when no Finnhub key or no data.
   enable_fundamentals: true
+  # 2026-05-27: Time-of-day filter — skip entries in the first/last
+  # 30 min of trading (9:30-10:00 ET and 15:30-16:00 ET). Opening
+  # and closing auction noise produces the most false breakouts.
+  # Active window after filter: 10:00 ET — 15:30 ET.
+  # LIVE ONLY (backtest bypasses since it runs at sim-date close).
+  enable_time_of_day_filter: true
+  # 2026-05-27: Volume confirmation — require today's bar volume to
+  # be >= multiplier × N-day average. Filters Turtle breakouts on
+  # dead tape (no demand behind the move → no follow-through). Set
+  # multiplier 1.0 for "above average", 1.5 for "true volume thrust".
+  # Applies in BOTH live and backtest.
+  enable_volume_confirmation: true
+  volume_confirmation_window: 20
+  volume_confirmation_multiplier: 1.0
   max_position_pct: 0.3
   min_position_pct: 0.1
-  max_trades_per_scan: 4
+  max_trades_per_scan: 3
   max_concurrent_positions: 5
   allow_momentum_only: true
   trailing_stop_tiered:
