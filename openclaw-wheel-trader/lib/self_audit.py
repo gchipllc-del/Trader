@@ -519,6 +519,37 @@ def auto_reconcile_phantom_positions(
     # of N zombie opens inflates reported P&L by Nx. We pick the most
     # recent open record per ticker as canonical and "ghost-close" the
     # rest with realized_pnl=0 + close_reason=duplicate_purge.
+    # 2026-05-27 ANTI-PING-PONG GRACE PERIOD
+    #
+    # The broker's get_positions() endpoint is eventually consistent —
+    # immediately after a fill it sometimes reports qty=0 for ~5-10
+    # minutes before stabilizing. Without a grace period the audit
+    # closes the fresh local record as "phantom" (no_sell_found), then
+    # next cycle the broker reports the position again and Direction B
+    # backfills it. Net result: 300+ zombie $0 closes per day per ticker,
+    # masking real bugs in audit logs and bloating positions.json.
+    #
+    # Fix: SKIP phantom reconciliation for any local position opened
+    # within PHANTOM_GRACE_MINUTES. By the time a position has been
+    # local-open for 15+ minutes, broker eventual consistency has
+    # converged and a persistent drift is real (genuine missed sell,
+    # broker manual close, etc).
+    PHANTOM_GRACE_MINUTES = 15
+    grace_cutoff = _dt.now(_tz.utc) - _td(minutes=PHANTOM_GRACE_MINUTES)
+
+    def _opened_recently(pos: dict) -> bool:
+        """True if position was opened within the grace window."""
+        opened_at = pos.get("opened_at", "")
+        if not opened_at:
+            return False
+        try:
+            ts = _dt.fromisoformat(str(opened_at).replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=_tz.utc)
+            return ts > grace_cutoff
+        except (ValueError, TypeError):
+            return False
+
     targets = {a.evidence.get("ticker", "").upper() for a in phantom_alerts}
     with mutate_positions() as positions:
         # Bucket open stock records by ticker
@@ -530,6 +561,15 @@ def auto_reconcile_phantom_positions(
             if t not in targets:
                 continue
             if p.get("type") != "stock":
+                continue
+            # Anti-ping-pong: skip positions still inside the grace window
+            if _opened_recently(p):
+                log_event("self_audit", "phantom_skip_grace_window", {
+                    "ticker": t,
+                    "opened_at": p.get("opened_at"),
+                    "grace_minutes": PHANTOM_GRACE_MINUTES,
+                    "reason": "broker_eventual_consistency_buffer",
+                }, result="success")
                 continue
             opens_by_ticker.setdefault(t, []).append(p)
 
@@ -669,6 +709,43 @@ def auto_reconcile_phantom_positions(
                         "existing_order_id": existing_open.get("order_id"),
                         "existing_entry": existing_open.get("entry_price"),
                         "broker_qty": qty,
+                    }, result="success")
+                    continue
+
+                # 2026-05-27 ANTI-PING-PONG: if we CLOSED this ticker
+                # within PHANTOM_GRACE_MINUTES ago, don't immediately
+                # backfill — the broker may be flapping. Wait for the
+                # grace window to expire so the next audit cycle sees a
+                # truly persistent drift before re-creating the local
+                # record.
+                recent_close_cutoff = _dt.now(_tz.utc) - _td(minutes=PHANTOM_GRACE_MINUTES)
+                recent_close = None
+                for p in positions:
+                    if p.get("status") != "closed":
+                        continue
+                    if str(p.get("ticker", "")).upper() != sym:
+                        continue
+                    if p.get("type") != "stock":
+                        continue
+                    closed_at = p.get("closed_at", "")
+                    if not closed_at:
+                        continue
+                    try:
+                        ts = _dt.fromisoformat(str(closed_at).replace("Z", "+00:00"))
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=_tz.utc)
+                        if ts > recent_close_cutoff:
+                            recent_close = p
+                            break
+                    except (ValueError, TypeError):
+                        continue
+                if recent_close is not None:
+                    log_event("self_audit", "backfill_skip_grace_window", {
+                        "ticker": sym,
+                        "recent_close_at": recent_close.get("closed_at"),
+                        "recent_close_reason": recent_close.get("close_reason"),
+                        "grace_minutes": PHANTOM_GRACE_MINUTES,
+                        "reason": "broker_flapping_after_recent_close",
                     }, result="success")
                     continue
 
