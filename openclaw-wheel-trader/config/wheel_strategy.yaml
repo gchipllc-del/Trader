@@ -1,33 +1,33 @@
 tickers_phase1:
-- F
-- BAC
-- VALE
-- WBD
-- KO
-- NIO
-- RIVN
-- NU
-- CCL
-- AAL
-- CLF
-- GRAB
-- PLTR
-- UBER
-- TSLA
-- AMD
-- NVDA
-- AVGO
-- COIN
-- HOOD
-- AFRM
-- PYPL
-- SHOP
-- MARA
-- RIOT
-- RBLX
-- U
-- DKNG
-- LCID
+  - F
+  - BAC
+  - VALE
+  - WBD
+  - KO
+  - NIO
+  - RIVN
+  - NU
+  - CCL
+  - AAL
+  - CLF
+  - GRAB
+  - PLTR
+  - UBER
+  - TSLA
+  - AMD
+  - NVDA
+  - AVGO
+  - COIN
+  - HOOD
+  - AFRM
+  - PYPL
+  - SHOP
+  - MARA
+  - RIOT
+  - RBLX
+  - U
+  - DKNG
+  - LCID
 quant:
   min_sharpe: -0.5
   max_drawdown: -0.55
@@ -116,34 +116,34 @@ stock_params:
     enabled: true
     tighten_on_rsi_exhaustion: true
     tiers:
-    - min_pnl: 0.2
-      trail: 0.005
-    - min_pnl: 0.12
-      trail: 0.008
-    - min_pnl: 0.07
-      trail: 0.012
-    - min_pnl: 0.03
-      trail: 0.018
-    - min_pnl: 0.0
-      trail: 0.025
+      - min_pnl: 0.2
+        trail: 0.005
+      - min_pnl: 0.12
+        trail: 0.008
+      - min_pnl: 0.07
+        trail: 0.012
+      - min_pnl: 0.03
+        trail: 0.018
+      - min_pnl: 0.0
+        trail: 0.025
   support_distance_tiers:
-  - 0.04
-  - 0.07
-  - 0.1
+    - 0.04
+    - 0.07
+    - 0.1
   enable_scale_out: true
   partial_exit_threshold: 0.07
   partial_exit_fraction: 0.5
 core_holdings:
-- TSM
-- MU
-- AVGO
-- META
-- MSFT
-- CBRS
+  - TSM
+  - MU
+  - AVGO
+  - META
+  - MSFT
+  - CBRS
 tickers_crypto:
-- BTC/USD
-- ETH/USD
-- SOL/USD
+  - BTC/USD
+  - ETH/USD
+  - SOL/USD
 crypto_params:
   enabled: true
   min_trend_score: 7
@@ -169,20 +169,20 @@ crypto_params:
   kelly_fraction_high_conviction: 0.65
   kelly_fraction_low_conviction: 0.2
 tickers_phase2:
-- F
-- NIO
-- SOFI
-- AAL
-- SNAP
+  - F
+  - NIO
+  - SOFI
+  - AAL
+  - SNAP
 tickers:
-- AAPL
-- MSFT
-- NVDA
-- AMD
-- AMZN
-- META
-- GOOGL
-- SPY
+  - AAPL
+  - MSFT
+  - NVDA
+  - AMD
+  - AMZN
+  - META
+  - GOOGL
+  - SPY
 csp:
   delta_min: -0.35
   delta_max: -0.2
@@ -213,20 +213,20 @@ risk:
 confirmation:
   min_composite_score: 7
   required_timeframes:
-  - weekly
-  - daily
-  - 4hour
+    - weekly
+    - daily
+    - 4hour
   bullish_patterns:
-  - pin_bar
-  - bullish_engulfing
-  - morning_star
-  - hammer
-  - dragonfly_doji
+    - pin_bar
+    - bullish_engulfing
+    - morning_star
+    - hammer
+    - dragonfly_doji
   bearish_patterns:
-  - shooting_star
-  - bearish_engulfing
-  - evening_star
-  - gravestone_doji
+    - shooting_star
+    - bearish_engulfing
+    - evening_star
+    - gravestone_doji
 zones:
   min_touches: 2
   zone_width_pct: 0.02

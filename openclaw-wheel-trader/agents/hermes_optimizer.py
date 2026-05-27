@@ -74,13 +74,17 @@ STEP_SIZES = {
 
 
 def _load_strategy() -> dict:
-    with open(STRATEGY_PATH) as f:
-        return yaml.safe_load(f)
+    # 2026-05-27: comment-preserving round-trip — pyyaml.safe_load +
+    # safe_dump cycle was stripping every inline comment from
+    # wheel_strategy.yaml on each Hermes apply. ruamel round-trip mode
+    # keeps comments + ordering + indentation intact.
+    from lib.yaml_rt import rt_load
+    return rt_load(STRATEGY_PATH)
 
 
 def _save_strategy(strategy: dict):
-    with open(STRATEGY_PATH, "w") as f:
-        yaml.safe_dump(strategy, f, default_flow_style=False, sort_keys=False)
+    from lib.yaml_rt import rt_dump
+    rt_dump(strategy, STRATEGY_PATH)
 
 
 def _load_positions() -> list[dict]:
@@ -517,12 +521,12 @@ def apply_adjustments(recommendations: list[dict]) -> dict:
             }
 
     # Also update circuit breaker max_position_pct if it changed
+    # 2026-05-27: round-trip mode to preserve settings.yaml comments
     if "max_position_pct" in changes:
-        with open(SETTINGS_PATH) as f:
-            settings = yaml.safe_load(f)
+        from lib.yaml_rt import rt_load, rt_dump
+        settings = rt_load(SETTINGS_PATH)
         settings["circuit_breakers"]["max_position_pct"] = changes["max_position_pct"]["new"]
-        with open(SETTINGS_PATH, "w") as f:
-            yaml.safe_dump(settings, f, default_flow_style=False, sort_keys=False)
+        rt_dump(settings, SETTINGS_PATH)
 
     if changes:
         _save_strategy(strategy)

@@ -54,13 +54,17 @@ def get_mode() -> HermesMode:
 
 
 def set_mode(mode: HermesMode) -> None:
-    """Persist hermes_mode to settings.yaml."""
+    """Persist hermes_mode to settings.yaml.
+
+    2026-05-27: switched to comment-preserving round-trip (lib.yaml_rt)
+    so this no longer strips inline docs from settings.yaml. Previously
+    every Hermes run wiped the comments and required manual restore.
+    """
+    from lib.yaml_rt import rt_load, rt_dump
     mode = "live" if mode == "live" else "review"
-    with open(SETTINGS_PATH) as f:
-        s = yaml.safe_load(f) or {}
+    s = rt_load(SETTINGS_PATH)
     s["hermes_mode"] = mode
-    with open(SETTINGS_PATH, "w") as f:
-        yaml.safe_dump(s, f, default_flow_style=False, sort_keys=False)
+    rt_dump(s, SETTINGS_PATH)
 
 
 # ─── Prior-experiment closing ─────────────────────────────────────────
@@ -116,27 +120,24 @@ def _revert_param(param: str, old_value) -> None:
     legacy apply_adjustments writes both files on forward; without this
     parallel update the rollback leaves settings.yaml stale.
     """
+    # 2026-05-27: comment-preserving round-trip — was stripping all
+    # inline YAML comments on every Hermes rollback.
+    from lib.yaml_rt import rt_load, rt_dump
     try:
-        with open(STRATEGY_PATH) as f:
-            strategy = yaml.safe_load(f) or {}
+        strategy = rt_load(STRATEGY_PATH)
     except OSError:
         return
     sp = strategy.setdefault("stock_params", {})
     sp[param] = old_value
-    with open(STRATEGY_PATH, "w") as f:
-        yaml.safe_dump(strategy, f, default_flow_style=False, sort_keys=False)
+    rt_dump(strategy, STRATEGY_PATH)
 
     # Mirror to settings.yaml for params that live in both
     SETTINGS_MIRRORED = {"max_position_pct"}
     if param in SETTINGS_MIRRORED:
         try:
-            with open(SETTINGS_PATH) as f:
-                settings = yaml.safe_load(f) or {}
+            settings = rt_load(SETTINGS_PATH)
             settings.setdefault("circuit_breakers", {})[param] = old_value
-            with open(SETTINGS_PATH, "w") as f:
-                yaml.safe_dump(
-                    settings, f, default_flow_style=False, sort_keys=False
-                )
+            rt_dump(settings, SETTINGS_PATH)
         except OSError:
             pass
 
