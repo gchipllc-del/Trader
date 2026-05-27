@@ -496,20 +496,32 @@ def run_backtest(
         "starting_capital": starting_capital, "params": params,
     })
 
-    # Fetch historical bars (need ~50d warmup before sim window for MA50).
+    # Fetch historical bars + WARMUP for indicator windows.
+    #
+    # 2026-05-27: warmup bumped from 60 → 250 days. The Turtle pre-filter
+    # needs the 200-bar SMA + 40-bar Donchian high — that's 240 bars
+    # minimum before the first sim date can even produce a signal. Previously
+    # warmup=60 meant a 60d backtest fetched only 120d total bars, so every
+    # Turtle gate call returned None (insufficient data) and the backtest
+    # produced 0 trades regardless of the rest of the strategy. The 250
+    # ceiling covers the longest indicator we currently use; if we ever add
+    # a 500-MA, bump this again.
+    #
     # Retry on empty response: Alpaca occasionally returns an empty dict
     # right after the laptop wakes from sleep, even though the same call
     # would succeed seconds later. Without this, multi-variant overnight
     # runs lose hours of work to one transient miss.
+    WARMUP_DAYS = 250
     client = AlpacaClient()
     universe = list(set(tickers + (["SPY"] if spy_baseline else [])))
-    print(f"  Fetching {days_back+60}d bars for {len(universe)} tickers...")
+    fetch_days = days_back + WARMUP_DAYS
+    print(f"  Fetching {fetch_days}d bars for {len(universe)} tickers...")
     bars = None
     for attempt, delay in enumerate((0, 5, 15, 45), start=1):
         if delay:
             print(f"    bars empty, retrying in {delay}s (attempt {attempt}/4)...")
             time.sleep(delay)
-        bars = client.get_bars(universe, timeframe="1Day", limit=days_back + 60)
+        bars = client.get_bars(universe, timeframe="1Day", limit=fetch_days)
         if bars:
             break
     if not bars:
