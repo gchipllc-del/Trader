@@ -94,6 +94,19 @@ stock_params:
   enable_markov: true
   enable_bull_bear: false        # off for backtest (live-only agents);
                                  # ENABLE IN LIVE for orthogonal vote
+  # 2026-05-27: When bull_bear is ON, use the 5-round structured
+  # debate (agents/debate.py) instead of one-shot score comparison.
+  # Each side rebuts the other; facilitator synthesizes net action.
+  # Pattern from hopit-ai/india-trade-cli (Vibe Trading), adapted to
+  # our rule-based agents. Set to false to fall back to legacy raw-
+  # score comparison gated by bull_bear_margin.
+  enable_debate: true
+  # 2026-05-27: Fundamentals Analyst — reads Finnhub balance-sheet
+  # metrics (ROE, PE, D/E, current ratio, beta). Orthogonal to all
+  # other confluence signals which read price/news. Defaults ON in
+  # both live and backtest since the agent fails gracefully (returns
+  # NEUTRAL = "no opinion") when no Finnhub key or no data.
+  enable_fundamentals: true
   max_position_pct: 0.3
   min_position_pct: 0.1
   max_trades_per_scan: 4

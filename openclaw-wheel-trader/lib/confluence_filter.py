@@ -149,7 +149,16 @@ def _check_pead(ticker: str, params: dict) -> Optional[bool]:
 
 
 def _check_bull_bear(ticker: str, candidate: dict, params: dict) -> Optional[bool]:
-    """True = bull agent score > bear agent score + margin.
+    """True = bull agent wins the bull/bear face-off.
+
+    Two modes:
+      ``enable_debate: true``  (default ON in live) — runs the 5-round
+        structured debate from agents/debate.py. Maps VETO/DOWNSIZE
+        → False, BOOST → True, NEUTRAL → None (skipped). Catches setups
+        where the bull has higher raw score but the bear's specific
+        objection (e.g., earnings imminent) is structurally fatal.
+      ``enable_debate: false`` — original behavior: compare raw scores
+        with the configured margin.
 
     Live-only — backtest doesn't have agent reasoning. Returns None in
     backtest context so the signal counts as 'skipped', not 'disagreed'.
@@ -157,14 +166,62 @@ def _check_bull_bear(ticker: str, candidate: dict, params: dict) -> Optional[boo
     if not params.get("enable_bull_bear", False):
         return None
     try:
+        from lib.memory_palace import get_current_regime
+        regime = get_current_regime() or "unknown"
+
+        if params.get("enable_debate", True):
+            # 2026-05-27: 5-round structured debate (india-trade-cli pattern,
+            # adapted to our rule-based agents). Each side gets to rebut
+            # the other's reasoning, then a facilitator synthesizes.
+            from agents.debate import run_debate
+            transcript = run_debate(candidate, regime=regime)
+            action = transcript["final"]["action"]
+            if action == "BOOST":
+                return True
+            if action in ("VETO", "DOWNSIZE"):
+                return False
+            return None  # NEUTRAL — let other confluence signals decide
+
+        # Legacy non-debate path
         from agents.bull_agent import BullAgent
         from agents.bear_agent import BearAgent
-        from lib.memory_palace import get_current_regime
         margin = int(params.get("bull_bear_margin", 2))
-        regime = get_current_regime() or "unknown"
         bull = BullAgent().review(candidate, regime=regime)
         bear = BearAgent().review(candidate, regime=regime)
         return int(bull.get("score", 0)) > int(bear.get("score", 0)) + margin
+    except Exception:
+        return None
+
+
+def _check_fundamentals(ticker: str, params: dict) -> Optional[bool]:
+    """True = FundamentalsAgent verdict is STRONG (score >= 7/10).
+
+    2026-05-27: orthogonal to all other signals — reads the balance
+    sheet, not the price chart or news. The other five all derive from
+    bars or headlines, which is why backtest WR ceilings at ~50%.
+    Fundamentals adds an independent axis: a company with negative ROE
+    and rising leverage is structurally riskier than its chart suggests.
+
+    Returns:
+      True  if STRONG (score >= 7)        — confluence vote FOR
+      False if WEAK   (score <= 3)        — confluence vote AGAINST
+      None  if NEUTRAL (4-6)              — "no opinion", counts as skipped
+
+    Disabled with ``enable_fundamentals: false`` in stock_params.
+    Defaults ON since Finnhub is already wired and the agent fails
+    gracefully (returns NEUTRAL) when no key or no data.
+    """
+    if not params.get("enable_fundamentals", True):
+        return None
+    try:
+        from agents.fundamentals_agent import FundamentalsAgent
+        result = FundamentalsAgent().review({"ticker": ticker})
+        verdict = result.get("verdict", "NEUTRAL")
+        if verdict == "STRONG":
+            return True
+        if verdict == "WEAK":
+            return False
+        return None  # NEUTRAL is "no opinion" — don't penalize the candidate
     except Exception:
         return None
 
@@ -176,23 +233,24 @@ def confluence_check(
     params: dict,
     bayesian_data: dict | None = None,
 ) -> ConfluenceResult:
-    """Run all 5 signal checks and return a structured result.
+    """Run all 6 signal checks and return a structured result.
 
-    Signals that return None (insufficient data, no API key, etc.)
-    count as SKIPPED — not as a vote against. This matters because
-    backtest can't call the live Bull/Bear agents; PEAD may be off
-    if no Finnhub key. The result.agreement_ratio is computed against
-    the EVALUATED signals (excludes skipped) so a 2-of-3 evaluated
-    counts as 67% confluence, not 40%.
+    Signals that return None (insufficient data, no API key, NEUTRAL
+    fundamentals, etc.) count as SKIPPED — not as a vote against. This
+    matters because backtest can't call the live Bull/Bear agents; PEAD
+    may be off if no Finnhub key. The result.agreement_ratio is computed
+    against the EVALUATED signals (excludes skipped) so a 2-of-3
+    evaluated counts as 67% confluence, not 40%.
     """
     res = ConfluenceResult(ticker=ticker)
 
     checks = [
-        ("turtle",   _check_turtle(daily_slice, params)),
-        ("markov",   _check_markov(daily_slice, params) if params.get("enable_markov", True) else None),
-        ("bayesian", _check_bayesian(bayesian_data, params)),
-        ("pead",     _check_pead(ticker, params) if params.get("enable_pead", True) else None),
-        ("bull_bear", _check_bull_bear(ticker, candidate, params)),
+        ("turtle",       _check_turtle(daily_slice, params)),
+        ("markov",       _check_markov(daily_slice, params) if params.get("enable_markov", True) else None),
+        ("bayesian",     _check_bayesian(bayesian_data, params)),
+        ("pead",         _check_pead(ticker, params) if params.get("enable_pead", True) else None),
+        ("bull_bear",    _check_bull_bear(ticker, candidate, params)),
+        ("fundamentals", _check_fundamentals(ticker, params)),
     ]
 
     for name, result in checks:

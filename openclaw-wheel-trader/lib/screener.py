@@ -106,12 +106,28 @@ def score_csp_candidate(
         return None
 
     # Premium calculation
+    # 2026-05-27: per wheel-it idea — rank by EXTRINSIC premium only.
+    # For an in-the-money put (strike > underlying), the bid includes
+    # intrinsic value = strike - underlying. That's NOT edge collected;
+    # it's just the price of being long the stock at the strike. Counting
+    # intrinsic as "premium yield" inflates apparent annualized return
+    # and biases the ranker toward deep-ITM puts that are really stock
+    # proxies. We need the underlying price to subtract intrinsic, so
+    # pull current_price up before the annualized calc.
+    current_price = float(daily_df["close"].iloc[-1])
     mid_price = (bid + ask) / 2
     collateral = strike * 100
     if collateral == 0:
         return None
 
-    annualized = (mid_price * 100 / collateral) * (365 / max(dte, 1))
+    intrinsic = max(0.0, strike - current_price)   # ITM put intrinsic
+    extrinsic = mid_price - intrinsic
+    if extrinsic <= 0:
+        # Premium is 100% intrinsic — it's a stock-replacement bet, not
+        # a wheel premium-collection trade. Skip.
+        return None
+
+    annualized = (extrinsic * 100 / collateral) * (365 / max(dte, 1))
     if annualized < csp_cfg["min_annualized_return"]:
         return None
     max_ann = csp_cfg.get("max_annualized_return")
@@ -130,7 +146,6 @@ def score_csp_candidate(
         return None  # Don't sell puts into a strong downtrend
 
     # --- Level Score (0-3) ---
-    current_price = daily_df["close"].iloc[-1]
     zones = detect_zones(daily_df, current_price)
     nearest_support = get_nearest_support(zones, current_price)
 
@@ -245,12 +260,25 @@ def score_cc_candidate(
     if spread > cc_cfg["max_bid_ask_spread"]:
         return None
 
+    # 2026-05-27: extrinsic-only ranking (matches score_csp_candidate fix
+    # above; per wheel-it idea). For an ITM call (strike < underlying),
+    # the bid includes intrinsic = underlying - strike. That's not edge
+    # collected from selling the call; it's the value of being short the
+    # stock at strike. Subtract before computing annualized yield.
+    current_price = float(daily_df["close"].iloc[-1])
     mid_price = (bid + ask) / 2
     share_value = strike * 100
     if share_value == 0:
         return None
 
-    annualized = (mid_price * 100 / share_value) * (365 / max(dte, 1))
+    intrinsic = max(0.0, current_price - strike)  # ITM call intrinsic
+    extrinsic = mid_price - intrinsic
+    if extrinsic <= 0:
+        # Premium is 100% intrinsic — deep ITM, behaves like a short stock
+        # position not a premium-collection trade. Skip.
+        return None
+
+    annualized = (extrinsic * 100 / share_value) * (365 / max(dte, 1))
     if annualized < cc_cfg["min_annualized_return"]:
         return None
     max_ann = cc_cfg.get("max_annualized_return")
