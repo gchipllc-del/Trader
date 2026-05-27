@@ -47,14 +47,19 @@ stock_params:
   turtle_breakout_window: 40
   min_composite_score: 4
   momentum_only_min_score: 2
-  # 2026-05-26: tighter_stop variant was the winner under Turtle filter
-  # (+5.13% vs SPY +9.72%, only 4.59pp behind — INSIDE the 5pp gate
-  # threshold). Promote those values to defaults so the "current"
-  # backtest variant matches the live config and the gate auto-enables.
-  # Was: stop_loss_pct=0.035, trailing_stop_pct=0.02
-  stop_loss_pct: 0.025
+  # 2026-05-27: REVERTED to original wider stops after live divergence
+  # found. The tighter_stop variant was promoted on 2026-05-26 based on
+  # a BACKTEST that ran with Turtle pre-filter active, but the Turtle
+  # gate (`require_turtle_entry`) was never wired into the LIVE entry
+  # path — only backtest. Result: live got tighter stops WITHOUT the
+  # entry filter, so the same loose entries hit faster stop-outs. On
+  # 2026-05-27 BAC stopped at -2.7% (would have ridden under old 3.5%
+  # stop) and PLTR stopped at -3.8% (would have stopped earlier under
+  # old stop too, slightly less harm). Reverting until require_turtle_entry
+  # is enforced in stock_engine.py — then we can re-tighten safely.
+  stop_loss_pct: 0.035
   default_target_pct: 0.1
-  trailing_stop_pct: 0.015
+  trailing_stop_pct: 0.02
 
   # 2026-05-26: paper-to-live realism knobs (after the Kalshi paper-vs-live
   # divergence lesson). The backtest now models:

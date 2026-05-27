@@ -115,6 +115,51 @@ def score_stock_buy(
     allow_momentum_only = stock_cfg.get("allow_momentum_only", False)
     support_distance_tiers = stock_cfg.get("support_distance_tiers", [0.03, 0.05, 0.08])
 
+    # ─── Turtle pre-filter ────────────────────────────────────────────
+    # 2026-05-27: this gate was active in backtest but had no live wiring,
+    # so live entries weren't being filtered the way the backtest reported.
+    # That paper-vs-live divergence caused today's PLTR loss (Turtle T:0
+    # in the scan log, but bought anyway). Now matched: require_turtle_entry
+    # is a HARD veto in both paths.
+    #
+    # Two-condition gate (long regime + Donchian breakout up):
+    #   - close > SMA(turtle_regime_window)  — trend up
+    #   - close > prior turtle_breakout_window-bar high — breakout
+    # Veto is silent (return None) and audit-logged for forensics.
+    if stock_cfg.get("require_turtle_entry", False):
+        try:
+            from lib.turtle_signal import classify_regime, donchian_break
+            regime_window = int(stock_cfg.get("turtle_regime_window", 200))
+            breakout_window = int(stock_cfg.get("turtle_breakout_window", 40))
+            closes = daily_df["close"].astype(float).tolist()
+            if len(closes) <= max(regime_window, breakout_window):
+                log_event("stock_engine", "turtle_skip_short_data", {
+                    "ticker": ticker, "bars": len(closes),
+                    "needed": max(regime_window, breakout_window),
+                })
+                return None
+            regime = classify_regime(closes, regime_window)
+            if regime != "long":
+                log_event("stock_engine", "turtle_veto_regime", {
+                    "ticker": ticker, "regime": regime,
+                    "reason": "not_long_regime_close_below_200sma",
+                })
+                return None
+            breakout = donchian_break(closes, breakout_window)
+            if breakout != "breakout_up":
+                log_event("stock_engine", "turtle_veto_breakout", {
+                    "ticker": ticker, "breakout": breakout,
+                    "reason": f"no_donchian_breakout_up_({breakout_window}bar)",
+                })
+                return None
+        except Exception as e:
+            log_event("stock_engine", "turtle_filter_error", {
+                "ticker": ticker, "error": str(e)[:200],
+            }, result="degraded")
+            # On error, FAIL OPEN — don't block the trade on a Turtle bug.
+            # Backtest still has its own check; live falls back to the
+            # composite+confluence stack.
+
     # --- Trend Score (0-3) ---
     mtf = multi_timeframe_analysis(weekly_df, daily_df)
     trend_score = mtf["alignment_score"]
