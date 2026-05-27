@@ -58,18 +58,21 @@ stock_params:
   # old stop too, slightly less harm). Reverting until require_turtle_entry
   # is enforced in stock_engine.py — then we can re-tighten safely.
   stop_loss_pct: 0.03
-  # 2026-05-27 (PM): promoted default_target_pct 0.10 → 0.15 based on
-  # wider_target backtest variant winning across both 60d and 180d windows
-  # under current filter regime (Turtle + confluence + volume confirmation).
-  # 60d:  current -1.07% Sharpe 0.49  vs wider_target -0.03% Sharpe 0.96
-  # 180d: current -3.33% Sharpe -0.28 vs wider_target -2.57% Sharpe -0.05
-  # Same 22-25 trades, same 44-50% WR — only avg winner changes
-  # (+2.70% → +3.15%, the +0.45pp captured by letting trades ride further).
-  # Safe to promote now that Turtle is wired into live entry (stock_engine.py
-  # ~line 190), so the backtest entry set matches what live will produce.
-  # Cost: max drawdown widens slightly (-5.57% → -5.90% at 180d) since
-  # trades occasionally give back more before trailing fires — accepted.
-  default_target_pct: 0.15
+  # 2026-05-27 (PM): REVERTED the earlier 0.10 → 0.15 promotion after a
+  # second look at the backtest. The "wider_target" variant won in v1
+  # backtest only because the backtest always used current_price × (1 +
+  # default_target_pct) as the profit target — but the LIVE engine
+  # (lib/stock_engine.py:362) snaps target_price to the nearest
+  # resistance zone whenever one is detected and only falls back to the
+  # flat percentage when no zone exists. Once the backtest was updated
+  # to mirror that snap (and also model partial exits + tiered trailing
+  # like live does), wider_target produced byte-for-byte identical
+  # trades to current. The +0.45pp avg_winner improvement was an
+  # artifact of a flat-target world the live engine doesn't operate in.
+  # See logs/backtest_2026-05-27_180d_v2.log for the validating run.
+  # Same shape as the 2026-05-26 tighter_stop misfire — third in a
+  # series of backtest-vs-live divergences caught before push.
+  default_target_pct: 0.1
   trailing_stop_pct: 0.02
 
   # 2026-05-26: paper-to-live realism knobs (after the Kalshi paper-vs-live
@@ -140,20 +143,18 @@ stock_params:
   trailing_stop_tiered:
     enabled: true
     tighten_on_rsi_exhaustion: true
-    # 2026-05-27 (PM): thresholds scaled 1.5× along with default_target_pct
-    # (0.10 → 0.15). Without this, a trade at 7% PnL hits the 1.2% "tight"
-    # trail and a normal pullback exits before the wider 15% target. Trail
-    # values unchanged — only the PnL bands at which they kick in. LIVE-ONLY
-    # (backtest uses flat trailing_stop_pct), so this scaling is the same
-    # logical extension as the target change, not directly backtested.
+    # 2026-05-27 (PM): REVERTED the 1.5× threshold scaling that
+    # accompanied the default_target_pct 0.10 → 0.15 promotion — see
+    # default_target_pct comment above for why the underlying promotion
+    # was rolled back.
     tiers:
-      - min_pnl: 0.3
+      - min_pnl: 0.2
         trail: 0.005
-      - min_pnl: 0.18
+      - min_pnl: 0.12
         trail: 0.008
-      - min_pnl: 0.105
+      - min_pnl: 0.07
         trail: 0.012
-      - min_pnl: 0.045
+      - min_pnl: 0.03
         trail: 0.018
       - min_pnl: 0.0
         trail: 0.025

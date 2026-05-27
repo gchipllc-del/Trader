@@ -156,7 +156,7 @@ def _score_candidate(
         (all gated by enable_* flags so the simple backtest stays fast)
     """
     try:
-        from lib.zones import detect_zones, get_nearest_support
+        from lib.zones import detect_zones, get_nearest_support, get_nearest_resistance
         from lib.candlestick import get_latest_signal
         from lib.momentum import analyze_momentum
         from lib.screener import _load_strategy_config  # for trend helper
@@ -235,9 +235,14 @@ def _score_candidate(
         trend_score += 1
 
     # ── Level score (0-3) — proximity to nearest support ──
+    # Also capture nearest resistance for the profit-target snap below
+    # (matches live behavior in stock_engine.py: target = resistance level
+    # when available, falls back to current_price × (1 + default_target_pct)).
+    nearest_resistance = None
     try:
         zones = detect_zones(daily_slice, current_price)
         support = get_nearest_support(zones, current_price)
+        nearest_resistance = get_nearest_resistance(zones, current_price)
         level_score = 0
         if support:
             dist = abs(current_price - support.level) / support.level
@@ -284,6 +289,14 @@ def _score_candidate(
 
     stop_pct = params.get("stop_loss_pct", 0.035)
     target_pct = params.get("default_target_pct", 0.10)
+    # Live snaps target to nearest resistance when available; fallback is
+    # current_price × (1 + target_pct). Previously the backtest used the
+    # flat fallback unconditionally, which silently inflated avg_winner
+    # for any variant that widened default_target_pct (e.g. wider_target).
+    if nearest_resistance is not None and nearest_resistance.level > current_price:
+        target_price = float(nearest_resistance.level)
+    else:
+        target_price = current_price * (1 + target_pct)
 
     # ── Optional enrichment signals (Tier S — all cached on first call) ──
     kronos_data = None
@@ -374,7 +387,7 @@ def _score_candidate(
         "level_score": level_score,
         "signal_score": signal_score,
         "momentum_score": momentum_score,
-        "target_price": current_price * (1 + target_pct),
+        "target_price": target_price,
         "stop_loss": current_price * (1 - stop_pct),
         "trailing_stop_pct": params.get("trailing_stop_pct", 0.02),
         "kronos_expected_return": kronos_data.get("expected_return") if kronos_data else None,
@@ -421,24 +434,36 @@ def _check_exits(
     pos: _SimPosition,
     bar: pd.Series,
     params: dict,
-) -> tuple[float | None, str]:
+) -> tuple[float | None, str, int | None]:
     """
-    Return (exit_price, reason) if any exit condition is triggered today.
+    Return (exit_price, reason, partial_shares).
+
+    `partial_shares` is None for full exits and an int when only some shares
+    are sold (scale-out). The caller reduces pos.shares and keeps the
+    position open when partial_shares is set.
 
     Logic order (mirrors live monitor):
-      1. Stop loss hit on the day's low → exit at stop_loss price (worst case)
-      2. Target hit on the day's high → exit at target_price
-      3. Update high-water; trailing stop hit → exit at trailing price
+      1. Scale-out (partial) at partial_exit_threshold if enable_scale_out
+         and not yet partial_exited
+      2. Stop loss hit on the day's low → exit at stop_loss price (worst case)
+      3. Target hit on the day's high → exit at target_price
+      4. Update high-water; trailing stop hit → exit at trailing price
+         (tiered widths from trailing_stop_tiered when enabled)
 
     2026-05-26: paper-to-live realism additions:
       - exit_slippage_pct (default 0.0005, 5 bps): live SELL market orders
         fill at BID, not mid/close. Applied to every exit price.
       - gap_open_stops (default True): if today's OPEN gapped below the
         stop_loss, exit at the OPEN price (worst-case real outcome),
-        not at stop_loss. This is what actually happens in live: a 2%
-        overnight gap blows through a 1% stop, and the order fills
-        at the much-worse open price. Without this the backtest
-        systematically overstates returns on volatile names.
+        not at stop_loss.
+
+    2026-05-27: live-parity additions to close out the backtest-vs-live
+    divergence found while validating the wider_target variant:
+      - scale_out: partial exit at partial_exit_threshold (live default +7%)
+      - trailing_stop_tiered: trail tightens as PnL grows (lib/stock_engine
+        applies these in the live monitor; previously backtest only used
+        the flat trailing_stop_pct, so any winners-let-run effect was
+        invisible).
     """
     high = float(bar["high"])
     low = float(bar["low"])
@@ -452,34 +477,66 @@ def _check_exits(
         # SELL fills at BID → price × (1 - slippage)
         return price * (1.0 - exit_slip) if side == "sell" else price * (1.0 + exit_slip)
 
+    # ── Scale-out (partial exit) ───────────────────────────────────
+    # Mirror live: sell partial_exit_fraction of remaining shares the
+    # first time price reaches partial_exit_threshold above entry.
+    # Caller is responsible for reducing pos.shares and setting
+    # pos.partial_exited = True. Need ≥2 shares so we can split.
+    if (params.get("enable_scale_out", False)
+            and not pos.partial_exited
+            and pos.shares >= 2):
+        threshold = float(params.get("partial_exit_threshold", 0.07))
+        fraction = float(params.get("partial_exit_fraction", 0.5))
+        partial_price = pos.entry_price * (1.0 + threshold)
+        if high >= partial_price:
+            shares_to_sell = max(1, int(pos.shares * fraction))
+            # Cap at shares-1 so the position remains alive for normal
+            # stop/target/trail evaluation on subsequent bars.
+            shares_to_sell = min(shares_to_sell, pos.shares - 1)
+            return _slip(partial_price), "scale_out", shares_to_sell
+
     # Stop loss — with gap-through detection
     if low <= pos.stop_loss:
-        # If the OPEN was already below the stop, real fill happened at
-        # open (worse than stop_price). Without gap-handling the
-        # backtest assumes idealized fill at stop_price exactly.
         if gap_aware and open_p < pos.stop_loss:
-            return _slip(open_p), "stop_loss_gap_through"
-        return _slip(pos.stop_loss), "stop_loss"
+            return _slip(open_p), "stop_loss_gap_through", None
+        return _slip(pos.stop_loss), "stop_loss", None
 
     # Target
     if high >= pos.target_price:
-        # Gap-up through target: real fill is at open, which is BETTER
-        # than target. Use the more generous value for realism.
         if gap_aware and open_p > pos.target_price:
-            return _slip(open_p), "target_hit_gap_up"
-        return _slip(pos.target_price), "target_hit"
+            return _slip(open_p), "target_hit_gap_up", None
+        return _slip(pos.target_price), "target_hit", None
 
-    # Trailing
+    # Trailing — with optional tiered widths
     if close > pos.high_water_mark:
         pos.high_water_mark = close
-    trail_price = pos.high_water_mark * (1 - pos.trailing_stop_pct)
-    if low <= trail_price and pos.high_water_mark > pos.entry_price * 1.02:
-        # Only trail-stop if we're at least +2% from entry
-        if gap_aware and open_p < trail_price:
-            return _slip(open_p), "trailing_stop_gap_through"
-        return _slip(trail_price), "trailing_stop"
 
-    return None, ""
+    # Pick trail width: tier ladder (live default) or flat fallback
+    tiered_cfg = params.get("trailing_stop_tiered", {})
+    chosen_trail = pos.trailing_stop_pct
+    if tiered_cfg.get("enabled", False) and pos.high_water_mark > pos.entry_price:
+        pnl_at_peak = (pos.high_water_mark - pos.entry_price) / pos.entry_price
+        tiers = tiered_cfg.get("tiers", [
+            {"min_pnl": 0.20, "trail": 0.005},
+            {"min_pnl": 0.12, "trail": 0.008},
+            {"min_pnl": 0.07, "trail": 0.012},
+            {"min_pnl": 0.03, "trail": 0.018},
+            {"min_pnl": 0.00, "trail": 0.025},
+        ])
+        for t in sorted(tiers, key=lambda x: -x["min_pnl"]):
+            if pnl_at_peak >= t["min_pnl"]:
+                chosen_trail = float(t["trail"])
+                break
+        # RSI-exhaustion tightening from live is skipped here: it needs a
+        # live momentum lookup we don't recompute per-bar in backtest.
+
+    trail_price = pos.high_water_mark * (1 - chosen_trail)
+    if low <= trail_price and pos.high_water_mark > pos.entry_price * 1.02:
+        if gap_aware and open_p < trail_price:
+            return _slip(open_p), "trailing_stop_gap_through", None
+        return _slip(trail_price), "trailing_stop", None
+
+    return None, "", None
 
 
 def run_backtest(
@@ -581,8 +638,31 @@ def run_backtest(
                 still_open.append(pos)
                 continue
             bar = df.loc[sim_date]
-            exit_price, reason = _check_exits(pos, bar, params)
-            if exit_price is not None:
+            exit_price, reason, partial_shares = _check_exits(pos, bar, params)
+            if exit_price is not None and partial_shares is not None:
+                # Partial scale-out: book a trade on the sold shares,
+                # reduce the position, leave it open for further evolution.
+                sold = min(partial_shares, pos.shares - 1) if pos.shares > 1 else 0
+                if sold > 0:
+                    partial_pnl = (exit_price - pos.entry_price) * sold
+                    partial_pnl_pct = (exit_price - pos.entry_price) / pos.entry_price
+                    cash += sold * exit_price
+                    closed_trades.append(BacktestTrade(
+                        ticker=pos.ticker,
+                        entry_date=pos.entry_date,
+                        entry_price=pos.entry_price,
+                        exit_date=sim_date,
+                        exit_price=exit_price,
+                        shares=sold,
+                        realized_pnl=partial_pnl,
+                        pnl_pct=partial_pnl_pct,
+                        composite_score=pos.composite_score,
+                        close_reason=reason,
+                    ))
+                    pos.shares -= sold
+                    pos.partial_exited = True
+                still_open.append(pos)
+            elif exit_price is not None:
                 pnl = (exit_price - pos.entry_price) * pos.shares
                 pnl_pct = (exit_price - pos.entry_price) / pos.entry_price
                 cash += pos.shares * exit_price
