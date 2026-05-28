@@ -206,6 +206,21 @@ crypto_params:
   min_trend_score: 7
   min_rsi: 42
   max_rsi: 62
+  # 2026-05-28: crypto dip-buy mean-reversion fallback. When the
+  # breakout/momentum filter above doesn't fire AND the asset is
+  # oversold (RSI < dipbuy_rsi_threshold) within a long regime
+  # (close > 200-bar SMA), take the mean-reversion entry instead.
+  # Today's crypto is BTC/ETH/SOL at RSI 19-25 — textbook dip-buy
+  # conditions that the standard filter rejects. Mirrors the
+  # lib/dipbuy_signal sleeve used for stocks. Mutually exclusive
+  # with the breakout entry (a bar can't be both above min_rsi 42
+  # AND below dipbuy_rsi_threshold 30).
+  enable_dipbuy: true
+  dipbuy_rsi_threshold: 30
+  # Crypto fetches 120 daily bars (see get_crypto_bars in lib.alpaca_client);
+  # a 200-bar regime check is impossible. Use 100 instead — for crypto, a
+  # 100-day SMA is still the "intermediate trend" signal we want.
+  dipbuy_regime_window: 100
   stop_loss_pct: 0.015
   target_pct: 0.03
   trailing_stop_pct: 0.01

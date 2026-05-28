@@ -348,21 +348,53 @@ def scan_crypto(
         passes_trend = trend_score >= min_trend
         passes_rsi = min_rsi <= rsi <= max_rsi
 
+        # 2026-05-28: dip-buy fallback for crypto (mirrors lib.dipbuy_signal
+        # for stocks). When the breakout/momentum filter doesn't fire AND
+        # the asset is oversold within a long-regime, take the
+        # mean-reversion entry instead. Crypto is currently sitting at
+        # RSI 19-25 across BTC/ETH/SOL — the regular filter rejects all
+        # of it for being "too oversold". But oversold-in-long-regime is
+        # textbook dip-buy.
+        #
+        # Two conditions for crypto dipbuy:
+        #   1. close > 200-bar SMA (long regime, mirrors Turtle)
+        #   2. RSI < dipbuy_rsi_threshold (default 30)
+        # Mutually exclusive with the breakout entry — if min_rsi >= 40
+        # and dipbuy_rsi_threshold <= 30, a single bar can't satisfy both.
+        crypto_dipbuy_enabled = crypto_cfg.get("enable_dipbuy", True)
+        dipbuy_passed = False
+        if crypto_dipbuy_enabled and not (passes_trend and passes_rsi):
+            try:
+                dipbuy_rsi_thresh = float(crypto_cfg.get("dipbuy_rsi_threshold", 30))
+                regime_window = int(crypto_cfg.get("dipbuy_regime_window", 200))
+                closes_list = df["close"].astype(float).tolist()
+                if len(closes_list) > regime_window:
+                    sma_n = sum(closes_list[-regime_window:]) / regime_window
+                    long_regime = current_price > sma_n
+                    oversold = rsi < dipbuy_rsi_thresh
+                    if long_regime and oversold:
+                        dipbuy_passed = True
+            except Exception:
+                pass
+
         # Compact feature display for visibility into why a candidate passed
         flags = []
         for k in ("above_ma20","ma20_rising","macd_bullish","macd_hist_rising",
                   "bb_healthy","volume_thrust","atr_strong","rsi_healthy"):
             if trend_details.get(k):
                 flags.append(k.split("_")[0][:3])
+        if dipbuy_passed:
+            flags.append("DIP")
 
+        status = "PASS" if (passes_trend and passes_rsi) else ("DIPBUY" if dipbuy_passed else "skip")
         line = (
             f"  {sym:<10} ${current_price:>10.2f}  trend={trend_score}/10  "
             f"RSI={rsi:.1f}  feats=[{','.join(flags) or '-'}]  "
-            f"{'PASS' if (passes_trend and passes_rsi) else 'skip'}"
+            f"{status}"
         )
         print(line)
 
-        if not (passes_trend and passes_rsi):
+        if not (passes_trend and passes_rsi) and not dipbuy_passed:
             continue
 
         # ── B6: ATR-adaptive target/stop sizing ─────────────────
@@ -383,6 +415,18 @@ def scan_crypto(
             vol_label = "fixed"
         target_pct_eff = base_target_pct * vol_mult
         stop_pct_eff = base_stop_pct * vol_mult
+
+        # 2026-05-28: dip-buy entries get a WIDER STOP only — mean-
+        # reversion needs room to weather more of the dip before the
+        # bounce. Target is LEFT alone because oversold-to-mean is
+        # usually a larger move than the standard breakout target,
+        # and lowering it would push the cost gate to reject otherwise-
+        # good trades. Stop = 1.5× base (e.g. 1.5%→2.25%).
+        if dipbuy_passed:
+            stop_pct_eff = stop_pct_eff * 1.5
+            print(f"     📉 {sym} DIPBUY entry — stop widened to {stop_pct_eff:.4f} "
+                  f"(target {target_pct_eff:.4f} unchanged)")
+
         if vol_mult != 1.0:
             print(f"     📐 {sym} vol_mult={vol_mult} ({vol_label}, atr/price={atr_pct:.4f}) "
                   f"→ target {target_pct_eff:.4f}, stop {stop_pct_eff:.4f}")
