@@ -37,14 +37,17 @@ stock_params:
   # 2026-05-26: Turtle pre-filter (lib/turtle_signal). When True, every
   # candidate must also clear:
   #   - long regime: today's close > 200-period SMA
-  #   - donchian:    today's close > prior 40-bar high
-  # Backtest validation: across the 24-ticker universe over 2y, 11 of 13
-  # successful runs profitable, R:R 4-7×, +12-305% compounded.
-  # The Turtle gate sits ABOVE the existing composite+momentum scoring,
-  # so this is additive selectivity, not a replacement.
+  #   - donchian:    today's close > prior turtle_breakout_window-bar high
+  #
+  # 2026-05-28: loosened breakout window 40 → 20 (System-2 → System-1).
+  # The 40-bar gate was rejecting ~10 candidates per scan, starving the
+  # ~61% WR strategy (verified from 47-day real trade record). 20-bar
+  # is the classic Dennis System-1 — more sensitive to shorter-term
+  # breakouts. Regime filter (200-MA) still enforced — bot still won't
+  # buy in downtrends, just catches breakouts earlier in uptrends.
   require_turtle_entry: true
   turtle_regime_window: 200
-  turtle_breakout_window: 40
+  turtle_breakout_window: 20
   min_composite_score: 4
   momentum_only_min_score: 2
   # 2026-05-27: REVERTED to original wider stops after live divergence
