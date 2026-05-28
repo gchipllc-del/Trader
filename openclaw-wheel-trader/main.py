@@ -267,6 +267,26 @@ def cmd_build_cache(signal: str = "all", days_back: int = 180):
     if signal in ("llm", "all"):
         signals_to_run.append("llm")
 
+    # PEAD is per-ticker, not per (ticker, date) — one Finnhub call
+    # per ticker covers the entire backtest window. Handled outside the
+    # main loop to avoid wasted iterations.
+    if signal in ("pead", "all"):
+        print(f"  --- Building pead cache (per-ticker, not per-date) ---")
+        try:
+            from lib.historical_pead import build_cache as pead_build_cache
+            pead_result = pead_build_cache(tickers, force=False)
+            print(
+                f"  pead done: built={pead_result['built']} "
+                f"skipped={pead_result['skipped']} "
+                f"failed={len(pead_result['failed'])}/{pead_result['total']}"
+            )
+            if pead_result["failed"]:
+                print(f"    failed tickers: {', '.join(pead_result['failed'][:10])}"
+                      + (f" (+{len(pead_result['failed'])-10} more)"
+                         if len(pead_result['failed']) > 10 else ""))
+        except Exception as e:
+            print(f"  pead cache build failed: {str(e)[:200]}")
+
     for sig in signals_to_run:
         print(f"  --- Building {sig} cache ---")
         if sig == "kronos":
@@ -2415,7 +2435,7 @@ def main():
                                  "pead", "pead-scan", "paper-live-drift"],
                         help="Command to run")
     parser.add_argument("--signal", default="all",
-                        help="build-cache: which signal to fill (kronos|news|llm|all)")
+                        help="build-cache: which signal to fill (kronos|news|llm|pead|all)")
     parser.add_argument("--with-signals", action="store_true",
                         help="backtest-stocks: enable Kronos+News+LLM+Bayesian enrichment "
                              "(needs caches built first; bayesian works without cache)")

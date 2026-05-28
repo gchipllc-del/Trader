@@ -133,12 +133,23 @@ def _check_bayesian(bayesian_data: dict | None, params: dict) -> Optional[bool]:
     return wp >= min_prob
 
 
-def _check_pead(ticker: str, params: dict) -> Optional[bool]:
-    """True = PEAD score > min threshold (positive drift window)."""
+def _check_pead(ticker: str, params: dict, sim_date=None) -> Optional[bool]:
+    """True = PEAD score >= min threshold (positive drift window).
+
+    When ``sim_date`` is provided (backtest mode), routes through
+    ``historical_pead.get_historical_pead`` so the earnings event is
+    the most recent one BEFORE sim_date and days_since is computed
+    relative to sim_date. When ``sim_date`` is None (live), uses
+    ``pead_signal.pead_score`` which reads today's calendar.
+    """
     try:
-        from lib.pead_signal import pead_score
         min_score = float(params.get("pead_min_score", 0.15))
-        result = pead_score(ticker)
+        if sim_date is not None:
+            from lib.historical_pead import get_historical_pead
+            result = get_historical_pead(ticker, sim_date)
+        else:
+            from lib.pead_signal import pead_score
+            result = pead_score(ticker)
         score = float(result.get("score") or 0)
         kind = result.get("kind", "no_data")
         if kind == "no_data":
@@ -232,6 +243,7 @@ def confluence_check(
     candidate: dict,
     params: dict,
     bayesian_data: dict | None = None,
+    sim_date=None,
 ) -> ConfluenceResult:
     """Run all 6 signal checks and return a structured result.
 
@@ -248,7 +260,7 @@ def confluence_check(
         ("turtle",       _check_turtle(daily_slice, params)),
         ("markov",       _check_markov(daily_slice, params) if params.get("enable_markov", True) else None),
         ("bayesian",     _check_bayesian(bayesian_data, params)),
-        ("pead",         _check_pead(ticker, params) if params.get("enable_pead", True) else None),
+        ("pead",         _check_pead(ticker, params, sim_date=sim_date) if params.get("enable_pead", True) else None),
         ("bull_bear",    _check_bull_bear(ticker, candidate, params)),
         ("fundamentals", _check_fundamentals(ticker, params)),
     ]

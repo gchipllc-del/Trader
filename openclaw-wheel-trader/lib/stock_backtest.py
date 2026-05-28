@@ -416,6 +416,7 @@ def _score_candidate(
             ticker=ticker, daily_slice=daily_slice,
             candidate=candidate_for_conf, params=params,
             bayesian_data=bayes_dict,
+            sim_date=sim_date,  # routes PEAD to historical_pead.get_historical_pead
         )
         fire, size_mult, conf_reason = should_fire(conf, params)
         if not fire:
