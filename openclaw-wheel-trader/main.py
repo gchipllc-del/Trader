@@ -505,6 +505,32 @@ def cmd_scan():
         cash = account["cash"]
         phase = get_current_phase(portfolio)
 
+        # 2026-05-28: keep the unified goals file's current_equity FRESH —
+        # was reporting $1,559 (stale baseline) while real equity sat at
+        # $1,507 today. Anyone reading goals.json (CLI, dashboard,
+        # downstream automation) needs live broker-truth, not a baseline
+        # snapshot. Fail-safe: log + swallow on error so a goals-file
+        # blip never breaks the scan.
+        try:
+            from tradingcore.unified_goals import update_current_equity
+            update_current_equity("traderbot", float(portfolio))
+            # While we have the live number, ALSO call the hard-floor
+            # check proactively. The existing wiring only runs it on
+            # entry attempts — if Turtle keeps rejecting every candidate
+            # (today's situation) the breaker never gets a chance to
+            # write its halt state. This makes the halt visible in
+            # goals.json as soon as equity dips below the trigger.
+            from lib.circuit_breaker import check_hard_floor, CircuitBreakerTripped
+            try:
+                check_hard_floor(float(portfolio))
+            except CircuitBreakerTripped:
+                pass  # halt state was just written; let the scan continue
+                       # the existing run_all_checks call will block any
+                       # entry attempt below the floor anyway
+        except Exception as _e:
+            log_event("main", "goals_equity_sync_failed",
+                      {"error": str(_e)[:200]}, result="degraded")
+
         # PDT check (uses broker's authoritative daytrade_count via client)
         from lib.pdt_guard import check_pdt
         pdt = check_pdt(portfolio, client=client)
