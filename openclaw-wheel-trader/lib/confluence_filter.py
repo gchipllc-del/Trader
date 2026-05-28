@@ -280,8 +280,23 @@ def should_fire(
     half-size band keeps the bot active on medium-confluence setups
     without burning full capital.
     """
+    # 2026-05-27: tiered conviction sizing extension. With the 6-signal
+    # confluence stack (Turtle + Markov + Bayesian + PEAD + Bull/Bear +
+    # Fundamentals), 5 or 6 agreeing is meaningfully rarer and more
+    # informative than 3-4. Press harder on those:
+    #   5+ agree → 1.50x  (strong_confluence)
+    #   6+ agree → 1.75x  (super_confluence, capped by size_cap)
+    # Falls back to legacy 1.0 / 0.5 ladder if enable_tiered_sizing is
+    # OFF or the new thresholds aren't met.
     min_agree = int(params.get("confluence_min_agree", 4))
     half_threshold = int(params.get("confluence_half_size", 3))
+    enable_tiered = bool(params.get("enable_tiered_sizing", True))
+    strong_threshold = int(params.get("confluence_strong_size", 5))
+    super_threshold = int(params.get("confluence_super_size", 6))
+    strong_mult = float(params.get("conviction_size_strong", 1.50))
+    super_mult = float(params.get("conviction_size_super", 1.75))
+    size_cap = float(params.get("conviction_size_cap", 1.75))
+
     n_agree = result.agreement_count
     n_eval = result.evaluated_count
     if n_eval == 0:
@@ -289,6 +304,23 @@ def should_fire(
     # Adjust thresholds if signals are skipped (don't penalize for unavailable signals)
     effective_min = min(min_agree, n_eval)
     effective_half = min(half_threshold, n_eval)
+
+    # 2026-05-27: tiered conviction tiers REQUIRE the absolute count of
+    # signals — not min(threshold, n_eval) — otherwise a 1-of-1 evaluated
+    # would satisfy "5+ agree" and trigger super_confluence on a single
+    # signal. The whole point of the tier is that MANY independent
+    # signals agreeing is more informative; we can't lower the bar when
+    # only a few were evaluated.
+    if enable_tiered and n_agree >= super_threshold:
+        return True, min(super_mult, size_cap), (
+            f"super_confluence: {n_agree}/{n_eval} agree "
+            f"({','.join(result.agreements)}) — mult {min(super_mult, size_cap):.2f}x"
+        )
+    if enable_tiered and n_agree >= strong_threshold:
+        return True, min(strong_mult, size_cap), (
+            f"strong_confluence: {n_agree}/{n_eval} agree "
+            f"({','.join(result.agreements)}) — mult {min(strong_mult, size_cap):.2f}x"
+        )
     if n_agree >= effective_min:
         return True, 1.0, (
             f"full_confluence: {n_agree}/{n_eval} agree "

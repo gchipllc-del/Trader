@@ -121,6 +121,20 @@ stock_params:
   # both live and backtest since the agent fails gracefully (returns
   # NEUTRAL = "no opinion") when no Finnhub key or no data.
   enable_fundamentals: true
+  # 2026-05-27: Tiered conviction sizing — press harder when more of
+  # the 6 confluence signals agree. Defaults below:
+  #   3-4 agree → 1.0x  (full_confluence, base size)
+  #   5 agree   → 1.5x  (strong_confluence)
+  #   6 agree   → 1.75x (super_confluence; capped at conviction_size_cap)
+  # All multipliers stack on Kelly's recommended size — they don't override
+  # the upstream max_position_pct cap, so a 1.75x scale on a 0.10 Kelly
+  # recommendation still clips at 0.30 portfolio max.
+  enable_tiered_sizing: true
+  confluence_strong_size: 5
+  confluence_super_size: 6
+  conviction_size_strong: 1.5
+  conviction_size_super: 1.75
+  conviction_size_cap: 1.75
   # 2026-05-27: Time-of-day filter — skip entries in the first/last
   # 30 min of trading (9:30-10:00 ET and 15:30-16:00 ET). Opening
   # and closing auction noise produces the most false breakouts.
