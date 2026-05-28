@@ -416,6 +416,75 @@ def check_state_reconciliation(broker_client) -> list[AuditAlert]:
     return alerts
 
 
+# ── Trade-history append helper (2026-05-28) ──────────────────────────
+# Self-audit auto-reconcile closes positions in positions.json but
+# historically didn't write to trade_history.json. As a result the
+# dashboard, Hermes goal scorer, postmortem, and calibration all
+# silently missed auto-reconciled real sells (the matched_broker_sell
+# path). Backfill script: scripts/backfill_trade_history.py
+# This helper makes future closes durable across the same path
+# stock_engine.execute_stock_sell already uses.
+
+_TRADE_HISTORY_PATH = Path(__file__).parent.parent / "data" / "trade_history.json"
+
+
+def _append_to_trade_history(entry: dict) -> None:
+    """Append a closed-trade record to data/trade_history.json with
+    file-locking and dedup-by-(ticker, entry, exit). Safe to call
+    repeatedly with the same entry — won't double-record.
+    """
+    import json
+    import fcntl
+    try:
+        # Load existing
+        history: list[dict] = []
+        if _TRADE_HISTORY_PATH.exists():
+            try:
+                with open(_TRADE_HISTORY_PATH, "r") as f:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                    try:
+                        history = json.load(f)
+                    finally:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except (json.JSONDecodeError, OSError):
+                history = []
+        # Dedup by (ticker, entry_price, exit_price) — 2-decimal precision
+        # because the same broker fill can appear at different precisions
+        # across code paths (positions.json stored at 4dp, broker reports
+        # at 2dp). 2dp catches all real duplicates without false positives.
+        new_key = (
+            entry.get("ticker"),
+            round(float(entry.get("entry_price", 0) or 0), 2),
+            round(float(entry.get("exit_price", 0) or 0), 2),
+        )
+        for existing in history:
+            existing_key = (
+                existing.get("ticker"),
+                round(float(existing.get("entry_price", 0) or 0), 2),
+                round(float(existing.get("exit_price", 0) or 0), 2),
+            )
+            if existing_key == new_key:
+                return  # already recorded
+        history.append(entry)
+        # Atomic-write via temp + os.replace
+        import os
+        tmp = _TRADE_HISTORY_PATH.with_suffix(".json.tmp")
+        with open(tmp, "w") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                json.dump(history, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        os.replace(tmp, _TRADE_HISTORY_PATH)
+    except Exception as e:
+        # Never let history write block auto-reconcile
+        log_event("self_audit", "trade_history_write_failed",
+                  {"error": str(e)[:200], "ticker": entry.get("ticker")},
+                  result="degraded")
+
+
 def auto_reconcile_phantom_positions(
     broker_client,
     alerts: list[AuditAlert],
@@ -700,6 +769,29 @@ def auto_reconcile_phantom_positions(
                 canonical["realized_pnl"] = round((exit_price - entry) * qty, 2)
                 reconciled += 1
                 tickers.append(ticker)
+                # 2026-05-28: ALSO append to trade_history.json so the
+                # dashboard, Hermes goal scorer, postmortem, and
+                # calibration all see this real close. Earlier they
+                # were missing every auto-reconciled sell because only
+                # stock_engine.execute_stock_sell writes to history.
+                # Dedupe by (ticker, entry, exit) to skip duplicates
+                # from older audit-cycle replays.
+                _append_to_trade_history({
+                    "ticker": ticker,
+                    "type": "stock",
+                    "side": "sell",
+                    "shares": int(qty),
+                    "entry_price": round(entry, 4),
+                    "exit_price": round(exit_price, 4),
+                    "realized_pnl": canonical["realized_pnl"],
+                    "pnl_pct": round((exit_price - entry) / entry, 4) if entry > 0 else 0.0,
+                    "composite_score": canonical.get("composite_score", 0),
+                    "close_reason": "auto_reconcile_broker_sold",
+                    "opened_at": canonical.get("opened_at", ""),
+                    "completed_at": canonical["closed_at"],
+                    "hold_duration": "auto_reconciled",
+                    "source": "self_audit_auto_reconcile",
+                })
                 log_event("self_audit", "auto_reconciled", {
                     "ticker": ticker,
                     "entry_price": entry,
