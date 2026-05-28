@@ -103,7 +103,7 @@ stock_params:
   markov_min_signal: 0.05
   pead_min_score: 0.15
   bull_bear_margin: 2
-  enable_pead: true              # off for backtest (per-sim-date earnings
+  enable_pead: false             # off for backtest (per-sim-date earnings
                                  # cache not built yet); ENABLE IN LIVE
   enable_markov: true
   enable_bull_bear: false        # off for backtest (live-only agents);
