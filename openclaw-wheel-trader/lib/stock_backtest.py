@@ -180,19 +180,51 @@ def _score_candidate(
     #
     # The cron's existing momentum / composite scoring runs UNCHANGED
     # afterward — Turtle is a quality gate, not a replacement.
+    # entry_kind tracks which strategy fired ("breakout" | "dipbuy").
+    # Stop / target are overridden later if entry_kind == "dipbuy".
+    entry_kind: str | None = None
+    dipbuy_data: dict | None = None
     if params.get("require_turtle_entry", False):
         regime_window = params.get("turtle_regime_window", 200)
         breakout_window = params.get("turtle_breakout_window", 40)
         if len(closes) <= max(regime_window, breakout_window):
             return None
         sma_n = float(pd.Series(closes).rolling(regime_window).mean().iloc[-1])
-        if pd.isna(sma_n) or current_price <= sma_n:
-            return None  # bear regime
+        long_regime = not pd.isna(sma_n) and current_price > sma_n
         prior_high = float(
             pd.Series(closes[:-1]).rolling(breakout_window).max().iloc[-1]
         )
-        if pd.isna(prior_high) or current_price <= prior_high:
-            return None  # no breakout
+        breakout_up = not pd.isna(prior_high) and current_price > prior_high
+        turtle_passed = long_regime and breakout_up
+
+        if turtle_passed:
+            entry_kind = "breakout"
+        else:
+            # 2026-05-27: dip-buy MEAN-REVERSION fallback (mirror of
+            # stock_engine.score_stock_buy). Try dipbuy on the same bar
+            # if Turtle didn't fire. Mutually exclusive with Turtle
+            # (a bar can't both break a 40-bar high AND be RSI≤30).
+            if params.get("enable_dipbuy", True):
+                try:
+                    from lib.dipbuy_signal import dipbuy_signal
+                    highs_l = daily_slice["high"].astype(float).tolist()
+                    lows_l = daily_slice["low"].astype(float).tolist()
+                    vols_l = (daily_slice["volume"].astype(float).tolist()
+                              if "volume" in daily_slice.columns else None)
+                    closes_l = closes.tolist() if hasattr(closes, "tolist") else list(closes)
+                    dip = dipbuy_signal(
+                        closes_l, highs_l, lows_l, vols_l,
+                        rsi_threshold=float(params.get("dipbuy_rsi_threshold", 30)),
+                        ma_touch_pct=float(params.get("dipbuy_ma_touch_pct", 0.02)),
+                        regime_window=regime_window,
+                    )
+                    if dip["fire"]:
+                        entry_kind = "dipbuy"
+                        dipbuy_data = dip
+                except Exception:
+                    pass
+            if entry_kind is None:
+                return None
 
     # ── Volume confirmation gate (2026-05-27) ──────────────────────────
     # Mirror of stock_engine.score_stock_buy volume check. Turtle breakouts
@@ -298,6 +330,16 @@ def _score_candidate(
     else:
         target_price = current_price * (1 + target_pct)
 
+    # 2026-05-27: dip-buy stop/target override (mirror of stock_engine).
+    # Mean-reversion entries inside a pullback need a wider ATR-based
+    # stop and don't aim at the (above-price) resistance zone — they
+    # aim 1.5R above current. This OVERRIDES the breakout-style stop
+    # and target_price set above for the single trade.
+    if entry_kind == "dipbuy" and dipbuy_data is not None:
+        stop_pct = float(dipbuy_data["stop_pct"])
+        target_pct_override = float(dipbuy_data["target_pct"])
+        target_price = current_price * (1 + target_pct_override)
+
     # ── Optional enrichment signals (Tier S — all cached on first call) ──
     kronos_data = None
     news_data = None
@@ -381,6 +423,7 @@ def _score_candidate(
 
     return {
         "ticker": ticker,
+        "entry_kind": entry_kind or "breakout",   # NEW — breakout | dipbuy
         "current_price": current_price,
         "composite_score": composite,
         "trend_score": trend_score,
