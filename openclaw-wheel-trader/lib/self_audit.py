@@ -459,6 +459,108 @@ def auto_reconcile_phantom_positions(
     from lib.positions_store import mutate_positions
     from datetime import datetime as _dt, timezone as _tz, timedelta as _td
 
+    # ── DRIFT CONFIRMATION COUNTER (2026-05-28) ───────────────────────
+    # The 15-min grace window (added earlier today) cut zombie auto-
+    # reconciles from ~300/day to ~80/day but couldn't stop the loop
+    # for positions opened > 15 min ago. Root cause: Alpaca's
+    # get_positions() flaps between qty=0 and qty=N on the same
+    # ticker every few minutes due to broker-side eventual consistency.
+    #
+    # New defense: require the SAME drift to be observed across N
+    # CONSECUTIVE audit cycles before acting. If broker flaps back to
+    # the expected state at any point in between, the counter resets.
+    # Persisted to data/audit_drift_counts.json so it survives between
+    # cron invocations.
+    #
+    # Empirically tuned: N=3 means a drift needs to persist for ~15
+    # minutes (3 × 5-min audit cycle) before action. Genuine broker
+    # transitions (real sells, real assignments) settle within that
+    # window; flapping does not.
+    from pathlib import Path as _Path
+    import json as _json
+    DRIFT_COUNTER_PATH = _Path(__file__).parent.parent / "data" / "audit_drift_counts.json"
+    CONFIRMATION_THRESHOLD = 3
+
+    def _load_drift_counts() -> dict:
+        try:
+            return _json.loads(DRIFT_COUNTER_PATH.read_text())
+        except Exception:
+            return {}
+
+    def _save_drift_counts(counts: dict) -> None:
+        try:
+            DRIFT_COUNTER_PATH.parent.mkdir(parents=True, exist_ok=True)
+            DRIFT_COUNTER_PATH.write_text(_json.dumps(counts, indent=2))
+        except Exception:
+            pass  # never block the audit on a state-file write
+
+    drift_counts = _load_drift_counts()
+    # Bump counters for drifts seen this cycle
+    phantom_tickers = {str(a.evidence.get("ticker", "")).upper()
+                       for a in phantom_alerts}
+    broker_only_tickers_set = {str(a.evidence.get("symbol", "")).upper()
+                               for a in broker_only_alerts}
+    confirmed_phantom: set[str] = set()
+    confirmed_broker_only: set[str] = set()
+    for sym in phantom_tickers:
+        key = f"phantom:{sym}"
+        drift_counts[key] = int(drift_counts.get(key, 0)) + 1
+        # Reset the OPPOSITE direction if we now see a phantom — broker
+        # truly says 0 right now, so any pending "broker has it" claim
+        # was stale.
+        drift_counts.pop(f"broker_only:{sym}", None)
+        if drift_counts[key] >= CONFIRMATION_THRESHOLD:
+            confirmed_phantom.add(sym)
+    for sym in broker_only_tickers_set:
+        key = f"broker_only:{sym}"
+        drift_counts[key] = int(drift_counts.get(key, 0)) + 1
+        drift_counts.pop(f"phantom:{sym}", None)
+        if drift_counts[key] >= CONFIRMATION_THRESHOLD:
+            confirmed_broker_only.add(sym)
+    # Decay counters for any ticker NOT in this cycle's drift list —
+    # the drift has resolved itself, no action needed.
+    seen_keys = ({f"phantom:{s}" for s in phantom_tickers}
+                 | {f"broker_only:{s}" for s in broker_only_tickers_set})
+    drift_counts = {k: v for k, v in drift_counts.items()
+                    if k in seen_keys}
+    _save_drift_counts(drift_counts)
+
+    # Replace the original alerts with only the CONFIRMED drifts.
+    # Audit-log the deferred ones so we have visibility.
+    deferred_phantom = [a for a in phantom_alerts
+                        if str(a.evidence.get("ticker", "")).upper()
+                           not in confirmed_phantom]
+    deferred_broker_only = [a for a in broker_only_alerts
+                            if str(a.evidence.get("symbol", "")).upper()
+                               not in confirmed_broker_only]
+    for a in deferred_phantom:
+        sym = str(a.evidence.get("ticker", "")).upper()
+        log_event("self_audit", "drift_pending_confirmation", {
+            "code": "STATE_DRIFT_BROKER", "ticker": sym,
+            "count": drift_counts.get(f"phantom:{sym}", 0),
+            "threshold": CONFIRMATION_THRESHOLD,
+            "reason": "waiting_for_drift_to_persist_across_cycles",
+        })
+    for a in deferred_broker_only:
+        sym = str(a.evidence.get("symbol", "")).upper()
+        log_event("self_audit", "drift_pending_confirmation", {
+            "code": "STATE_DRIFT_LOCAL", "symbol": sym,
+            "count": drift_counts.get(f"broker_only:{sym}", 0),
+            "threshold": CONFIRMATION_THRESHOLD,
+            "reason": "waiting_for_drift_to_persist_across_cycles",
+        })
+    phantom_alerts = [a for a in phantom_alerts
+                      if str(a.evidence.get("ticker", "")).upper()
+                         in confirmed_phantom]
+    broker_only_alerts = [a for a in broker_only_alerts
+                          if str(a.evidence.get("symbol", "")).upper()
+                             in confirmed_broker_only]
+    if not phantom_alerts and not broker_only_alerts:
+        return {"reconciled": 0, "no_sell_found": 0,
+                "backfilled": 0, "tickers": [],
+                "deferred_phantom": len(deferred_phantom),
+                "deferred_broker_only": len(deferred_broker_only)}
+
     reconciled = 0
     no_sell = 0
     tickers: list[str] = []
