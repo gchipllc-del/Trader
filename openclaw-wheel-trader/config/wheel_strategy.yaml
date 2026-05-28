@@ -149,6 +149,17 @@ stock_params:
   enable_volume_confirmation: true
   volume_confirmation_window: 20
   volume_confirmation_multiplier: 1.0
+  # 2026-05-27: DIP-BUY mean-reversion sleeve (lib/dipbuy_signal). When
+  # Turtle's breakout gate doesn't fire, try mean-reversion on the same
+  # bar — buy oversold pullbacks WITHIN an uptrend (close > 200-MA AND
+  # RSI ≤ rsi_threshold). The two are mutually exclusive (a bar can't
+  # simultaneously break a 40-bar high AND be RSI<30), so no double-
+  # counting risk. Dipbuy entries use ATR-based stops (wider than
+  # Turtle's flat 3.5%) and 1.5× R:R targets, overriding the normal
+  # zone-snap/percentage logic for that single trade.
+  enable_dipbuy: true
+  dipbuy_rsi_threshold: 30
+  dipbuy_ma_touch_pct: 0.02
   max_position_pct: 0.3
   min_position_pct: 0.1
   max_trades_per_scan: 3

@@ -187,6 +187,12 @@ def score_stock_buy(
     #   - close > SMA(turtle_regime_window)  — trend up
     #   - close > prior turtle_breakout_window-bar high — breakout
     # Veto is silent (return None) and audit-logged for forensics.
+    # entry_kind tracks WHICH strategy fired: "breakout" (Turtle), "dipbuy"
+    # (mean-reversion fallback), or None if Turtle is disabled and no other
+    # gate runs. The downstream stop/target overrides depend on this kind.
+    entry_kind: str | None = None
+    dipbuy_override: dict | None = None
+
     if stock_cfg.get("require_turtle_entry", False):
         try:
             from lib.turtle_signal import classify_regime, donchian_break
@@ -200,19 +206,60 @@ def score_stock_buy(
                 })
                 return None
             regime = classify_regime(closes, regime_window)
-            if regime != "long":
-                log_event("stock_engine", "turtle_veto_regime", {
-                    "ticker": ticker, "regime": regime,
-                    "reason": "not_long_regime_close_below_200sma",
-                })
-                return None
             breakout = donchian_break(closes, breakout_window)
-            if breakout != "breakout_up":
-                log_event("stock_engine", "turtle_veto_breakout", {
-                    "ticker": ticker, "breakout": breakout,
-                    "reason": f"no_donchian_breakout_up_({breakout_window}bar)",
-                })
-                return None
+            turtle_passed = (regime == "long" and breakout == "breakout_up")
+
+            if turtle_passed:
+                entry_kind = "breakout"
+            else:
+                # 2026-05-27: dip-buy MEAN-REVERSION fallback
+                # If Turtle didn't fire (not a breakout) try dip-buy on the
+                # SAME bar. The two are mutually exclusive — a bar can't
+                # both break a 40-bar high AND be oversold at the same time.
+                # Runs only when enable_dipbuy=true (default ON).
+                # On a hit, overrides stop/target with dipbuy's ATR-based
+                # levels (wider stop, R:R=1.5).
+                if stock_cfg.get("enable_dipbuy", True):
+                    try:
+                        from lib.dipbuy_signal import dipbuy_signal
+                        highs = daily_df["high"].astype(float).tolist()
+                        lows = daily_df["low"].astype(float).tolist()
+                        vols = (daily_df["volume"].astype(float).tolist()
+                                if "volume" in daily_df.columns else None)
+                        dip = dipbuy_signal(
+                            closes, highs, lows, vols,
+                            rsi_threshold=float(stock_cfg.get("dipbuy_rsi_threshold", 30)),
+                            ma_touch_pct=float(stock_cfg.get("dipbuy_ma_touch_pct", 0.02)),
+                            regime_window=regime_window,
+                        )
+                        if dip["fire"]:
+                            entry_kind = "dipbuy"
+                            dipbuy_override = dip
+                            log_event("stock_engine", "dipbuy_setup", {
+                                "ticker": ticker, "kind": dip["kind"],
+                                "rsi": round(dip["rsi"], 1),
+                                "distance_to_200ma": round(dip["distance_to_200ma"], 4),
+                                "stop_pct": round(dip["stop_pct"], 4),
+                                "target_pct": round(dip["target_pct"], 4),
+                            })
+                    except Exception as e:
+                        log_event("stock_engine", "dipbuy_filter_error", {
+                            "ticker": ticker, "error": str(e)[:200],
+                        }, result="degraded")
+
+                # If neither breakout nor dipbuy fired, veto with reason
+                if entry_kind is None:
+                    if regime != "long":
+                        log_event("stock_engine", "turtle_veto_regime", {
+                            "ticker": ticker, "regime": regime,
+                            "reason": "not_long_regime_and_no_dipbuy_setup",
+                        })
+                    else:
+                        log_event("stock_engine", "turtle_veto_breakout", {
+                            "ticker": ticker, "breakout": breakout,
+                            "reason": f"no_breakout_({breakout_window}bar)_no_dipbuy_setup",
+                        })
+                    return None
         except Exception as e:
             log_event("stock_engine", "turtle_filter_error", {
                 "ticker": ticker, "error": str(e)[:200],
@@ -367,9 +414,21 @@ def score_stock_buy(
     else:
         actual_stop_pct = stop_loss_pct
 
+    # ─── Dip-buy stop/target override ─────────────────────────────────
+    # For dipbuy entries, use ATR-based stop and 1.5×stop target rather
+    # than zone-snap. Mean-reversion entries inside pullbacks need wider
+    # stops to weather the rest of the dip; resistance-zone targets are
+    # also less reliable because the move came from BELOW the zone, not
+    # toward it. Stick with the dipbuy_signal's recommendations.
+    if entry_kind == "dipbuy" and dipbuy_override is not None:
+        actual_stop_pct = float(dipbuy_override["stop_pct"])
+        target_pct_override = float(dipbuy_override["target_pct"])
+        target_price = current_price * (1 + target_pct_override)
+
     return {
         "ticker": ticker,
         "trade_type": "stock_buy",
+        "entry_kind": entry_kind or "breakout",   # NEW — breakout | dipbuy
         "current_price": round(current_price, 2),
         "shares": shares,
         "position_value": round(current_price * shares, 2),
