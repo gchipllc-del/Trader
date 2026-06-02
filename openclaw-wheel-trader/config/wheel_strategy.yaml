@@ -45,7 +45,7 @@ stock_params:
   # is the classic Dennis System-1 — more sensitive to shorter-term
   # breakouts. Regime filter (200-MA) still enforced — bot still won't
   # buy in downtrends, just catches breakouts earlier in uptrends.
-  require_turtle_entry: true
+  require_turtle_entry: false
   turtle_regime_window: 200
   turtle_breakout_window: 20
   min_composite_score: 4
@@ -60,7 +60,7 @@ stock_params:
   # stop) and PLTR stopped at -3.8% (would have stopped earlier under
   # old stop too, slightly less harm). Reverting until require_turtle_entry
   # is enforced in stock_engine.py — then we can re-tighten safely.
-  stop_loss_pct: 0.03
+  stop_loss_pct: 0.035
   # 2026-05-27 (PM): REVERTED the earlier 0.10 → 0.15 promotion after a
   # second look at the backtest. The "wider_target" variant won in v1
   # backtest only because the backtest always used current_price × (1 +
@@ -205,7 +205,8 @@ tickers_crypto:
   - ETH/USD
   - SOL/USD
 crypto_params:
-  enabled: true
+  # DECOMMISSIONED 2026-05-29: Alpaca crypto sleeve cut, launchd jobs removed.
+  enabled: false
   min_trend_score: 7
   min_rsi: 42
   max_rsi: 62
