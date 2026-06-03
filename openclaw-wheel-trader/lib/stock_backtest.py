@@ -310,10 +310,48 @@ def _score_candidate(
 
     composite = trend_score + level_score + signal_score + momentum_score
     min_score = params.get("min_composite_score", 7)
+
+    # 2026-05-30: parity-fix with lib/stock_engine.score_stock_buy.
+    # Previously the backtest only checked composite >= min_score, which
+    # let through high-composite candidates with NO candlestick signal
+    # AND in downtrends. Live engine requires BOTH:
+    #   - weekly_trend.direction != "downtrend"
+    #   - has_signal (signal_score >= 1) OR has_strong_momentum
+    # Without these the backtest fires 6x more trades than live, most of
+    # them in adverse setups. This was the cause of the -27% backtest
+    # result on the reverted config — backtest was punishing live for
+    # trades live wouldn't take.
+    momentum_only_min = params.get("momentum_only_min_score", 3)
+    has_signal = signal_score >= 1
+    has_strong_momentum = momentum_score >= momentum_only_min
+    allow_momentum_only = params.get("allow_momentum_only", True)
+
+    # Downtrend detection — live uses lib/trend.multi_timeframe_analysis;
+    # we approximate with the same MA-stack rule the live trend module
+    # uses internally: price < MA20 < MA50 → confirmed downtrend.
+    not_downtrend = True
+    try:
+        wma20 = pd.Series(closes).rolling(20).mean().iloc[-1]
+        wma50 = pd.Series(closes).rolling(50).mean().iloc[-1] if len(closes) >= 50 else wma20
+        if current_price < wma20 and current_price < wma50 and wma20 < wma50:
+            not_downtrend = False
+    except Exception:
+        pass
+
+    if not not_downtrend:
+        return None  # live wouldn't trade in a downtrend, neither should backtest
+
     if composite < min_score:
         # Allow momentum-only path when score is decent on momentum alone
-        if not (params.get("allow_momentum_only", True)
-                and momentum_score >= params.get("momentum_only_min_score", 3)):
+        if not (allow_momentum_only and has_strong_momentum):
+            return None
+
+    # Even at composite >= min_score, live requires has_signal OR strong momentum
+    if allow_momentum_only:
+        if not (has_signal or has_strong_momentum):
+            return None
+    else:
+        if not has_signal:
             return None
 
     # Confluence gate moved to AFTER bayesian_data computation below so
