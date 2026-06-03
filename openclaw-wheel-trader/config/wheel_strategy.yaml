@@ -48,7 +48,7 @@ stock_params:
   require_turtle_entry: false
   turtle_regime_window: 200
   turtle_breakout_window: 20
-  min_composite_score: 4
+  min_composite_score: 5
   momentum_only_min_score: 2
   # 2026-05-27: REVERTED to original wider stops after live divergence
   # found. The tighter_stop variant was promoted on 2026-05-26 based on
@@ -93,7 +93,7 @@ stock_params:
   # 2026-05-26: Confluence filter (lib/confluence_filter). Require
   # multiple independent signals to agree before firing. Each
   # confirmer adds 3-7pp WR on average. Target: 65-72% WR.
-  require_confluence: true
+  require_confluence: false
   confluence_min_agree: 3        # full-size if 3-of-3 evaluated agree
   confluence_half_size: 2        # half-size at 2-of-3
   # 2026-05-26: thresholds reverted after the tightening pass made WR
@@ -117,13 +117,13 @@ stock_params:
   # Pattern from hopit-ai/india-trade-cli (Vibe Trading), adapted to
   # our rule-based agents. Set to false to fall back to legacy raw-
   # score comparison gated by bull_bear_margin.
-  enable_debate: true
+  enable_debate: false
   # 2026-05-27: Fundamentals Analyst — reads Finnhub balance-sheet
   # metrics (ROE, PE, D/E, current ratio, beta). Orthogonal to all
   # other confluence signals which read price/news. Defaults ON in
   # both live and backtest since the agent fails gracefully (returns
   # NEUTRAL = "no opinion") when no Finnhub key or no data.
-  enable_fundamentals: true
+  enable_fundamentals: false
   # 2026-05-27: Tiered conviction sizing — press harder when more of
   # the 6 confluence signals agree. Defaults below:
   #   3-4 agree → 1.0x  (full_confluence, base size)
@@ -132,7 +132,7 @@ stock_params:
   # All multipliers stack on Kelly's recommended size — they don't override
   # the upstream max_position_pct cap, so a 1.75x scale on a 0.10 Kelly
   # recommendation still clips at 0.30 portfolio max.
-  enable_tiered_sizing: true
+  enable_tiered_sizing: false
   confluence_strong_size: 5
   confluence_super_size: 6
   conviction_size_strong: 1.5
@@ -143,13 +143,13 @@ stock_params:
   # and closing auction noise produces the most false breakouts.
   # Active window after filter: 10:00 ET — 15:30 ET.
   # LIVE ONLY (backtest bypasses since it runs at sim-date close).
-  enable_time_of_day_filter: true
+  enable_time_of_day_filter: false
   # 2026-05-27: Volume confirmation — require today's bar volume to
   # be >= multiplier × N-day average. Filters Turtle breakouts on
   # dead tape (no demand behind the move → no follow-through). Set
   # multiplier 1.0 for "above average", 1.5 for "true volume thrust".
   # Applies in BOTH live and backtest.
-  enable_volume_confirmation: true
+  enable_volume_confirmation: false
   volume_confirmation_window: 20
   volume_confirmation_multiplier: 1.0
   # 2026-05-27: DIP-BUY mean-reversion sleeve (lib/dipbuy_signal). When
@@ -160,7 +160,7 @@ stock_params:
   # counting risk. Dipbuy entries use ATR-based stops (wider than
   # Turtle's flat 3.5%) and 1.5× R:R targets, overriding the normal
   # zone-snap/percentage logic for that single trade.
-  enable_dipbuy: true
+  enable_dipbuy: false
   dipbuy_rsi_threshold: 30
   dipbuy_ma_touch_pct: 0.02
   max_position_pct: 0.3
