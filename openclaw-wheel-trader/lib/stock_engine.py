@@ -55,8 +55,13 @@ def mutate_positions():
     return _store_mutate(POSITIONS_PATH)
 
 # Phase thresholds
-PHASE_2_THRESHOLD = 5000   # Start selling CSPs on cheap stocks
-PHASE_3_THRESHOLD = 10000  # Full Wheel on bigger tickers
+PHASE_2_THRESHOLD = 1500   # 2026-05-30: lowered from 5000 to enable wheel
+                           # at current bankroll. CSPs on cheap stocks
+                           # (NIO, GRAB, NU) now allowed. Collateral risk
+                           # per trade ranges 33-67% of bankroll — wheel
+                           # only fires on the cheapest names where
+                           # strike × 100 < cash.
+PHASE_3_THRESHOLD = 10000  # Full Wheel on bigger tickers — unchanged
 
 
 def _load_settings() -> dict:

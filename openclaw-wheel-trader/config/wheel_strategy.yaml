@@ -45,7 +45,7 @@ stock_params:
   # is the classic Dennis System-1 — more sensitive to shorter-term
   # breakouts. Regime filter (200-MA) still enforced — bot still won't
   # buy in downtrends, just catches breakouts earlier in uptrends.
-  require_turtle_entry: false
+  require_turtle_entry: true
   turtle_regime_window: 200
   turtle_breakout_window: 20
   min_composite_score: 5
