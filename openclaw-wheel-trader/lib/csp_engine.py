@@ -78,7 +78,16 @@ def scan_for_csps(
     quant_scores = screen_universe(daily_data, exclude_avoid=True)
     quant_approved = {s.ticker for s in quant_scores if s.verdict in ("STRONG", "OK")}
 
-    for ticker in config.get("tickers", []):
+    # 2026-05-30: was iterating config["tickers"] (the SHORT expensive
+    # list — AAPL, MSFT, NVDA, etc.). At $1,500 bankroll none of those
+    # CSPs are affordable, so the whole CSP scan was a silent no-op.
+    # Switched to iterating the actual options_chains keys — those are
+    # the tickers main.py just fetched data for, which during Phase 2
+    # are tickers_phase1 (NIO, GRAB, NU, AAL, etc.) — the cheap names
+    # we CAN sell puts on. The CSP scoring still applies the standard
+    # delta/DTE/OI/spread/score filters per option.
+    csp_universe = list(options_chains.keys()) or config.get("tickers", [])
+    for ticker in csp_universe:
         if ticker not in daily_data or ticker not in options_chains:
             continue
         if ticker not in quant_approved:
@@ -120,6 +129,33 @@ def scan_for_csps(
                         "expiration": candidate.expiration,
                     })
                     continue
+                # 2026-05-30: AFFORDABILITY pre-filter. The CSP collateral
+                # (strike × 100) must fit within max_position_pct of the
+                # current bankroll. Without this, the ranker often surfaces
+                # high-score but unaffordable candidates (e.g. F $15P at
+                # $1,500 collateral on a $1,507 account → 99% — gets
+                # vetoed by risk_agent and the next-best candidate never
+                # gets tried because max_trades=1.
+                try:
+                    portfolio = float(client.get_account().get("portfolio_value", 0) or 0)
+                    if portfolio > 0:
+                        # mirror risk_agent's position_max read
+                        import yaml as _y
+                        from pathlib import Path as _P
+                        with open(_P(__file__).resolve().parent.parent / "config" / "settings.yaml") as _f:
+                            _s = _y.safe_load(_f) or {}
+                        _max_pos = float(_s.get("circuit_breakers", {}).get("max_position_pct", 0.50))
+                        max_collateral = portfolio * max(_max_pos, 0.50)
+                        coll = candidate.strike * 100
+                        if coll > max_collateral:
+                            log_event("csp_engine", "skip_unaffordable", {
+                                "ticker": ticker, "strike": candidate.strike,
+                                "collateral": coll, "max_allowed": round(max_collateral, 2),
+                                "portfolio": portfolio,
+                            })
+                            continue
+                except Exception:
+                    pass  # if affordability check fails, defer to risk_agent
                 candidates.append(candidate)
 
     return rank_candidates(candidates)

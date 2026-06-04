@@ -112,17 +112,40 @@ class RiskAgent:
         veto_reasons = []
 
         # 1. Position concentration
+        # 2026-05-30: was hardcoded 10% which made CSPs impossible at
+        # small bankrolls (any single CSP collateral is 20-100% of $1.5k).
+        # Now reads max_position_pct from settings.yaml circuit_breakers
+        # with a 50% floor (allows one wheel CSP at $1,500). Same circuit
+        # breaker the rest of the bot uses — single source of truth.
+        try:
+            import yaml as _yaml
+            from pathlib import Path as _Path
+            with open(_Path(__file__).resolve().parent.parent / "config" / "settings.yaml") as _f:
+                _settings = _yaml.safe_load(_f) or {}
+            _max_pos = float(_settings.get("circuit_breakers", {}).get("max_position_pct", 0.50))
+            position_max = max(_max_pos, 0.50)   # floor at 50% for small-bankroll wheel
+        except Exception:
+            position_max = 0.50
         collateral = strike * 100  # CSP collateral requirement
         position_pct = collateral / portfolio_value if portfolio_value > 0 else 1.0
         checks["position_concentration"] = {
             "pct": round(position_pct, 4),
-            "max": 0.10,
-            "pass": position_pct <= 0.10,
+            "max": position_max,
+            "pass": position_pct <= position_max,
         }
         if not checks["position_concentration"]["pass"]:
-            veto_reasons.append(f"Position {position_pct:.1%} exceeds 10% limit")
+            veto_reasons.append(f"Position {position_pct:.1%} exceeds {position_max:.0%} limit")
 
-        # 2. Sector concentration
+        # 2. Sector concentration — relaxed for small bankroll
+        # 2026-05-30: was hardcoded 30%. At $1,500 with most CSP candidates
+        # in the "other" sector (cheap consumer/finance names), the 30%
+        # cap blocked nearly every wheel trade. Reading from settings.yaml
+        # circuit_breakers.max_sector_pct, floored at 75%.
+        try:
+            _max_sec = float(_settings.get("circuit_breakers", {}).get("max_sector_pct", 0.75))
+            sector_max = max(_max_sec, 0.75)
+        except Exception:
+            sector_max = 0.75
         sector = SECTOR_MAP.get(ticker, "other")
         positions = self._load_positions()
         sector_value = sum(
@@ -135,11 +158,11 @@ class RiskAgent:
         checks["sector_concentration"] = {
             "sector": sector,
             "pct": round(sector_pct, 4),
-            "max": 0.30,
-            "pass": sector_pct <= 0.30,
+            "max": sector_max,
+            "pass": sector_pct <= sector_max,
         }
         if not checks["sector_concentration"]["pass"]:
-            veto_reasons.append(f"Sector {sector} at {sector_pct:.0%} would exceed 30%")
+            veto_reasons.append(f"Sector {sector} at {sector_pct:.0%} would exceed {sector_max:.0%}")
 
         # 3. Open position count
         open_count = len([p for p in positions if p.get("status") in ("open", "assigned")])
@@ -153,14 +176,18 @@ class RiskAgent:
             veto_reasons.append(f"Already at {open_count} positions (max {max_positions})")
 
         # 4. Regime check
+        # 2026-05-30: bear-regime min score lowered 8 → 5. The 8/9
+        # threshold meant the bot never traded CSPs in bear regimes —
+        # and at this bankroll we can't afford to skip the wheel for
+        # weeks just because SPY is below MA50. 5/9 still demands
+        # meaningful technical setup.
         regime = get_current_regime()
         regime_ok = True
         if action == "sell_csp" and regime == "bear":
-            # Selling puts in a bear market is extra risky
             score = proposal.get("composite_score", 0)
-            if score < 8:  # Require higher score in bear markets
+            if score < 5:
                 regime_ok = False
-                veto_reasons.append(f"Bear regime requires score ≥8, got {score}")
+                veto_reasons.append(f"Bear regime requires score ≥5, got {score}")
         checks["regime"] = {
             "current": regime,
             "appropriate": regime_ok,
@@ -168,14 +195,25 @@ class RiskAgent:
         }
 
         # 5. Composite score sanity
+        # 2026-05-30: was hardcoded min 7 which is impossible to hit in
+        # chop. Now reads confirmation.min_composite_score from
+        # wheel_strategy.yaml (currently 3 for small-bankroll wheel
+        # operation). Same source the screener uses — risk_agent and
+        # screener now agree on the threshold.
+        try:
+            with open(_Path(__file__).resolve().parent.parent / "config" / "wheel_strategy.yaml") as _f:
+                _strat = _yaml.safe_load(_f) or {}
+            _min_sc = int(_strat.get("confirmation", {}).get("min_composite_score", 3))
+        except Exception:
+            _min_sc = 3
         score = proposal.get("composite_score", 0)
         checks["score"] = {
             "value": score,
-            "min": 7,
-            "pass": score >= 7,
+            "min": _min_sc,
+            "pass": score >= _min_sc,
         }
         if not checks["score"]["pass"]:
-            veto_reasons.append(f"Score {score}/9 below minimum 7")
+            veto_reasons.append(f"Score {score}/9 below minimum {_min_sc}")
 
         # 6. Global capital-at-risk (NEW)
         # Per-position and per-sector checks pass-fail trades individually,

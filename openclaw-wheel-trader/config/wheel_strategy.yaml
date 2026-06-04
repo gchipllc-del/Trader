@@ -260,8 +260,8 @@ tickers:
   - GOOGL
   - SPY
 csp:
-  delta_min: -0.35
-  delta_max: -0.2
+  delta_min: -0.4
+  delta_max: -0.15
   dte_min: 21
   dte_max: 28
   min_annualized_return: 0.12
@@ -270,8 +270,8 @@ csp:
   max_bid_ask_spread: 0.15
   strike_zone: support
 cc:
-  delta_min: 0.2
-  delta_max: 0.35
+  delta_min: 0.15
+  delta_max: 0.4
   dte_min: 21
   dte_max: 28
   min_annualized_return: 0.1
@@ -285,9 +285,9 @@ management:
   roll_trigger_dte: 7
   roll_min_credit: 0.5
 risk:
-  max_capital_at_risk_pct: 0.8
+  max_capital_at_risk_pct: 0.95
 confirmation:
-  min_composite_score: 7
+  min_composite_score: 3
   required_timeframes:
     - weekly
     - daily

@@ -180,10 +180,21 @@ def score_csp_candidate(
     # --- Composite ---
     composite = trend_score + level_score + signal_score
     min_score = config["confirmation"]["min_composite_score"]
+
+    # 2026-05-30: HIGH-YIELD BYPASS for the wheel at small bankrolls.
+    # The mtf.tradeable gate (weekly + daily must align, no choppy)
+    # blocks 80%+ of CSPs in chop markets. But CSPs are PAID TO WAIT —
+    # the premium is the reward for taking on the obligation to buy.
+    # If annualized return is >= 25% on a delta-defensible OTM put
+    # with real liquidity, the economic value is real even if the
+    # chart is choppy. Bypass mtf in that case; keep IV-favorable
+    # check (don't sell premium when IV is crushed).
+    high_yield_bypass = annualized >= 0.25 and iv_data.get("favorable_for_selling", False)
+
     tradeable = (
         composite >= min_score
         and iv_data.get("favorable_for_selling", False)
-        and mtf.get("tradeable", False)
+        and (mtf.get("tradeable", False) or high_yield_bypass)
     )
 
     return WheelCandidate(
