@@ -55,12 +55,14 @@ def mutate_positions():
     return _store_mutate(POSITIONS_PATH)
 
 # Phase thresholds
-PHASE_2_THRESHOLD = 1500   # 2026-05-30: lowered from 5000 to enable wheel
-                           # at current bankroll. CSPs on cheap stocks
-                           # (NIO, GRAB, NU) now allowed. Collateral risk
-                           # per trade ranges 33-67% of bankroll — wheel
-                           # only fires on the cheapest names where
-                           # strike × 100 < cash.
+PHASE_2_THRESHOLD = 1000   # 2026-06-05: lowered 1500 → 1000 after equity
+                           # briefly dipped to $1,499.53 ($0.47 below the
+                           # 1500 trigger) and bot reverted to Phase 1 —
+                           # wheel went silent for the day. As long as
+                           # equity is above the hard floor ($1,400) the
+                           # wheel should keep running; affordability
+                           # filter inside scan_for_csps still drops
+                           # individual unfit candidates.
 PHASE_3_THRESHOLD = 10000  # Full Wheel on bigger tickers — unchanged
 
 

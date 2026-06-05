@@ -403,8 +403,19 @@ def run_csp_scan_and_execute(
         log_event("csp_engine", "daily_pnl_baseline_missing",
                   {}, result="degraded")
 
+    # 2026-06-05: was `candidates[:max_trades]` — pre-slicing meant if the
+    # top-ranked candidate got vetoed by compliance (earnings filter, etc),
+    # the bot never tried the #2 candidate even when it was perfectly
+    # tradeable. With NIO #1 blocked daily by upcoming earnings, the bot
+    # was effectively wheel-paralyzed. Now we iterate ALL ranked
+    # candidates and break only when max_trades have actually executed.
+    # Caps inspection at min(len(candidates), max_trades * 5) so a
+    # systemic broker failure can't run away through 50 candidates.
     executed = []
-    for candidate in candidates[:max_trades]:
+    inspection_cap = min(len(candidates), max(max_trades * 5, 10))
+    for candidate in candidates[:inspection_cap]:
+        if len(executed) >= max_trades:
+            break
         result = execute_csp(
             candidate=candidate,
             client=client,
@@ -415,5 +426,9 @@ def run_csp_scan_and_execute(
         if result:
             executed.append(result)
 
-    log_event("csp_engine", "scan_complete", {"executed": len(executed)})
+    log_event("csp_engine", "scan_complete", {
+        "executed": len(executed),
+        "candidates_inspected": min(len(candidates), inspection_cap),
+        "candidates_total": len(candidates),
+    })
     return executed
