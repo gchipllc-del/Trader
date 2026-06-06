@@ -1653,12 +1653,33 @@ def check_stock_exits(
     # at position creation when the ticker is on `core_holdings` in
     # wheel_strategy.yaml. We log the skip once per scan so operators can
     # see them but the monitor doesn't propose an exit.
-    core_skipped = [p for p in stock_positions if p.get("hold_forever")]
+    #
+    # 2026-06-05: BELT-AND-SUSPENDERS — also exempt by YAML core_holdings
+    # list directly, not just the hold_forever flag. Reason: positions
+    # backfilled by self_audit from broker fills don't always get the
+    # flag stamped. If MSFT (core holding) appears in positions.json
+    # without hold_forever=true for any reason, the YAML check still
+    # protects it. Single point of truth → no exit possible.
+    _core_set = {
+        str(t).upper()
+        for t in (_load_strategy().get("core_holdings") or [])
+    }
+    core_skipped = [
+        p for p in stock_positions
+        if p.get("hold_forever") or str(p.get("ticker", "")).upper() in _core_set
+    ]
     if core_skipped:
         log_event("stock_engine", "core_holdings_skipped_from_exit",
                   {"tickers": [p.get("ticker") for p in core_skipped],
-                   "count": len(core_skipped)}, result="success")
-    stock_positions = [p for p in stock_positions if not p.get("hold_forever")]
+                   "count": len(core_skipped),
+                   "by_flag": sum(1 for p in core_skipped if p.get("hold_forever")),
+                   "by_yaml": sum(1 for p in core_skipped if str(p.get("ticker", "")).upper() in _core_set and not p.get("hold_forever"))},
+                  result="success")
+    stock_positions = [
+        p for p in stock_positions
+        if not p.get("hold_forever")
+        and str(p.get("ticker", "")).upper() not in _core_set
+    ]
 
     if not stock_positions:
         return []

@@ -32,7 +32,7 @@ circuit_breakers:
   # Must be >= the highest per-asset cap (wheel_strategy.yaml stock_params /
   # crypto_params .max_position_pct). If you raise either of those, raise
   # this too — otherwise the breaker silently caps below the strategy.
-  max_position_pct: 0.5         # 30% of portfolio per position (concentrated growth mode)
+  max_position_pct: 0.2         # 30% of portfolio per position (concentrated growth mode)
   auto_trim_buffer_pct: 0.02    # Auto-trim when position > max + buffer (so 32%) — prevents oversize drift
   max_sector_pct: 0.75          # 50% of portfolio per sector (allow conviction bets)
   max_open_orders: 8            # More concurrent orders for growth
@@ -73,7 +73,7 @@ hermes:
 # Controls whether Hermes auto-applies tuned params or just proposes them.
 # "live" = apply automatically to wheel_strategy.yaml + this file.
 # "shadow" = log proposals only; human approves manually.
-hermes_mode: review
+hermes_mode: live
 
 # --- Market-Regime Entry Filter (added 2026-05-23) ---
 # Gates NEW positions when SPY downtrend OR VIX stressed; existing
