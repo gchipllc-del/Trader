@@ -130,8 +130,24 @@ def step2_validate(
     current_daily_pnl: float,
     current_open_orders: int,
     last_loss_time: datetime | None = None,
-    min_composite_score: int = 7,
+    min_composite_score: int | None = None,
 ) -> bool:
+    # 2026-06-08: was hardcoded 7 — same restriction as risk_agent + the
+    # confirmation YAML key. THIRD copy of the same gate. With the
+    # confirmation min_composite_score lowered to 3 for small-bankroll
+    # wheel operation, this gate was silently re-imposing the 7 floor
+    # and blocking every CSP (NIO scored 3 today, would have fired
+    # without this gate). Now reads from wheel_strategy.yaml so all
+    # three gates stay synchronized.
+    if min_composite_score is None:
+        try:
+            import yaml as _y
+            from pathlib import Path as _P
+            with open(_P(__file__).resolve().parent.parent / "config" / "wheel_strategy.yaml") as _f:
+                _s = _y.safe_load(_f) or {}
+            min_composite_score = int(_s.get("confirmation", {}).get("min_composite_score", 3))
+        except Exception:
+            min_composite_score = 3
     """
     Step 2: VALIDATE — Run circuit breakers and score check.
     Raises on failure. Returns True on pass.
