@@ -628,8 +628,12 @@ def cmd_scan():
         # Phase 2+: CSP scanning
         if phase >= 2 and chains:
             print(f"\n  --- CSP Scan ({len(chains)} chains) ---")
+            # 2026-06-08: max_trades 1 → 3 for the $5k/yr roadmap. Allows
+            # the bot to diversify across NIO + GRAB + AAL/CLF on the same
+            # scan instead of locking into one ticker. Affordability
+            # filter + risk_agent caps still enforce per-trade limits.
             csp_results = run_csp_scan_and_execute(
-                client, daily, weekly, chains, iv, max_trades=1,
+                client, daily, weekly, chains, iv, max_trades=3,
             )
             if csp_results:
                 for r in csp_results:
