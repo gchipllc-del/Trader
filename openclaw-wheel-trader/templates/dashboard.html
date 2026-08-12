@@ -3,6 +3,11 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#0f0f23">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Wheel Trader">
 <title>OpenClaw Wheel Trader</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
@@ -69,6 +74,31 @@ tr:hover { background: #22224e; }
 
 /* Chart */
 .chart-container { position: relative; height: 200px; }
+
+/* Mobile (phone) support */
+/* min-width: 0 lets cards shrink below their content's natural width, so wide
+   tables scroll inside .table-scroll instead of stretching the whole page. */
+.grid > .card { min-width: 0; }
+.table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.table-scroll table { min-width: 560px; }
+#hermes-body, #markov-body { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+@media (max-width: 640px) {
+  .container { padding: 8px; }
+  .header { padding: 14px; }
+  .header-stats { gap: 10px 20px; }
+  .stat-value { font-size: 18px; }
+  .card { padding: 12px; }
+  .card h2 { overflow-wrap: anywhere; }
+  .grid { gap: 12px; }
+  .breaker-label { width: 88px; }
+  .breaker-value { width: 60px; }
+  .events-log { max-height: 240px; }
+  .footer button { padding: 10px 18px; }
+  .markov-controls { float: none !important; display: block; margin-top: 6px; }
+  .markov-controls input { padding: 6px !important; }
+  .markov-controls button { padding: 6px 12px !important; }
+}
 </style>
 </head>
 <body>
@@ -100,31 +130,31 @@ tr:hover { background: #22224e; }
     <!-- Positions -->
     <div class="card full-width">
       <h2>Positions</h2>
-      <table><thead><tr>
+      <div class="table-scroll"><table><thead><tr>
         <th>Ticker</th><th>Type</th><th class="right">Shares</th><th class="right">Entry</th>
         <th class="right">Current</th><th class="right">P/L $</th><th class="right">P/L %</th>
         <th class="right">Target</th><th class="right">Stop</th><th class="center">Score</th>
-      </tr></thead><tbody id="positions-body"><tr><td colspan="10" class="dim">Loading...</td></tr></tbody></table>
+      </tr></thead><tbody id="positions-body"><tr><td colspan="10" class="dim">Loading...</td></tr></tbody></table></div>
     </div>
 
     <!-- All Bots — Open Trades (cross-bot) -->
     <div class="card full-width">
       <h2>All Bots — Open Trades <span id="all-bots-totals" class="dim" style="font-weight:400;font-size:0.85em"></span></h2>
-      <table><thead><tr>
+      <div class="table-scroll"><table><thead><tr>
         <th>Bot</th><th>ID / Symbol</th><th>Side</th>
         <th class="right">Size</th><th class="right">Entry</th>
         <th class="right">Mark</th><th class="right">P/L</th>
         <th class="right">Age</th>
-      </tr></thead><tbody id="all-bots-body"><tr><td colspan="8" class="dim">Loading...</td></tr></tbody></table>
+      </tr></thead><tbody id="all-bots-body"><tr><td colspan="8" class="dim">Loading...</td></tr></tbody></table></div>
     </div>
 
     <!-- Quant Scores -->
     <div class="card">
       <h2>Quant Scores <span id="quant-spinner" class="spinner"></span></h2>
-      <table><thead><tr>
+      <div class="table-scroll"><table><thead><tr>
         <th>#</th><th>Ticker</th><th class="right">Price</th><th class="right">1Y Ret</th>
         <th class="right">MaxDD</th><th class="right">Sharpe</th><th class="right">Score</th><th class="center">Verdict</th>
-      </tr></thead><tbody id="quant-body"><tr><td colspan="8" class="dim">Loading...</td></tr></tbody></table>
+      </tr></thead><tbody id="quant-body"><tr><td colspan="8" class="dim">Loading...</td></tr></tbody></table></div>
     </div>
 
     <!-- Circuit Breakers -->
@@ -173,7 +203,7 @@ tr:hover { background: #22224e; }
     <div class="card full-width">
       <h2>Markov Regime
         &nbsp; <span id="markov-summary" class="dim" style="font-size:13px"></span>
-        <span style="float:right;font-size:11px">
+        <span class="markov-controls" style="float:right;font-size:11px">
           <input id="markov-ticker" value="SPY"
                  style="width:60px;background:#0f0f23;color:#e0e0e0;border:1px solid #3a2a6e;padding:2px 4px;font-family:inherit"/>
           <button onclick="refreshMarkov(true)"

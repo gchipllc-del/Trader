@@ -148,16 +148,17 @@ def cmd_baseline(amount: float | None = None, show: bool = False):
     print(f"  Set at:         {result['set_at']}")
 
 
-def cmd_dashboard(port: int = 5051):
+def cmd_dashboard(port: int = 5051, host: str = "127.0.0.1"):
     """Start the web dashboard server.
 
     Default port 5051 avoids collision with sibling polybot project (port 5050).
+    Default bind is localhost-only; for phone access see docs/MOBILE_ACCESS.md.
     """
     from lib.dashboard_web import run_dashboard
-    print(f"  Traderbot Dashboard: http://localhost:{port}")
+    print(f"  Traderbot Dashboard: http://{'localhost' if host == '127.0.0.1' else host}:{port}")
     print("  (Polybot uses 5050; traderbot uses 5051 to avoid conflict.)")
     print("  Press Ctrl+C to stop.\n")
-    run_dashboard(port=port)
+    run_dashboard(port=port, host=host)
 
 
 def cmd_pairs_scan():
@@ -2481,6 +2482,9 @@ def main():
                         help="wheel-reset: required to actually liquidate (dry-run otherwise)")
     parser.add_argument("--port", type=int, default=5051,
                         help="Dashboard web server port (default 5051; polybot uses 5050)")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="Dashboard bind address (default 127.0.0.1 = this Mac only). "
+                             "Prefer `tailscale serve` for phone access; see docs/MOBILE_ACCESS.md")
     parser.add_argument("--full", action="store_true", help="Include quant scores in status output")
     parser.add_argument("--dry-run", action="store_true", help="Hermes: analyze only, don't change params")
     parser.add_argument("--lookback", type=int, default=14, help="Hermes: days of trade history to analyze")
@@ -2579,7 +2583,7 @@ def main():
     elif args.command == "migrate":
         cmd_migrate()
     elif args.command == "dashboard":
-        cmd_dashboard(args.port)
+        cmd_dashboard(args.port, args.host)
     elif args.command == "hermes":
         cmd_hermes(dry_run=args.dry_run, lookback=args.lookback)
     elif args.command == "pdt":

@@ -8,6 +8,10 @@ silently steal the port from the other.
 Usage:
   python main.py dashboard
   python main.py dashboard --port 8080
+  python main.py dashboard --host 0.0.0.0   # LAN/Tailscale expose (no auth — trusted networks only)
+
+Phone access: docs/MOBILE_ACCESS.md (recommended path is `tailscale serve`,
+which needs no --host change).
 """
 
 from pathlib import Path
@@ -99,12 +103,18 @@ def api_hermes():
     return jsonify(get_hermes_state())
 
 
-def run_dashboard(port: int = 5051):
+def run_dashboard(port: int = 5051, host: str = "127.0.0.1"):
     """Start the dashboard web server.
 
     Fails fast with a helpful message if the port is already bound (e.g. polybot
     on 5050, or a stale traderbot dashboard on 5051), so the two projects can't
     silently step on each other.
+
+    Binds to 127.0.0.1 by default so the dashboard is reachable only from this
+    machine. For phone access prefer `tailscale serve`, which proxies to the
+    localhost bind — no non-default host needed (docs/MOBILE_ACCESS.md). A
+    non-localhost host exposes the dashboard, unauthenticated, to whatever
+    network that interface is on.
     """
     import errno
     import socket
@@ -112,10 +122,10 @@ def run_dashboard(port: int = 5051):
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
     try:
-        probe.bind(("127.0.0.1", port))
+        probe.bind((host, port))
     except OSError as exc:
         if exc.errno in (errno.EADDRINUSE, errno.EACCES):
-            print(f"ERROR: Port {port} is already in use on 127.0.0.1.")
+            print(f"ERROR: Port {port} is already in use on {host}.")
             print(f"       Another dashboard may already be running "
                   f"(polybot uses 5050, traderbot uses 5051).")
             print(f"       Check with:  lsof -i :{port}")
@@ -125,5 +135,11 @@ def run_dashboard(port: int = 5051):
     finally:
         probe.close()
 
-    print(f"Traderbot Dashboard: http://localhost:{port}")
-    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        print("WARNING: Dashboard bound to a non-localhost address with NO authentication.")
+        print("         Anyone who can reach that network interface can view portfolio data.")
+        print("         Prefer `tailscale serve` (keeps the localhost-only bind);")
+        print("         see docs/MOBILE_ACCESS.md.")
+
+    print(f"Traderbot Dashboard: http://{'localhost' if host == '127.0.0.1' else host}:{port}")
+    app.run(host=host, port=port, debug=False, threaded=True)
