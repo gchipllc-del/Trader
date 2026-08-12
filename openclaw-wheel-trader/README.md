@@ -245,6 +245,9 @@ Dark trading terminal UI at `http://localhost:5051` with:
 - P/L chart (Chart.js)
 - Auto-refresh every 30 seconds
 
+Mobile-responsive — to view it on your phone (Tailscale serve, tailnet IP, or
+LAN via `--host`), see [docs/MOBILE_ACCESS.md](docs/MOBILE_ACCESS.md).
+
 ### Terminal Dashboard
 Rich-library colored output via `python main.py status`:
 - Portfolio header panel
